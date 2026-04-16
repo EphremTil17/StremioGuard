@@ -1,0 +1,13 @@
+[Unit]
+Description=Guard Stremio behind NordVPN
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ephrem/projects/streamio
+ExecStart=/home/ephrem/projects/streamio/bin/stremio-vpn up --watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,14 @@
+services:
+  stremio:
+    image: tsaridas/stremio-docker:latest
+    container_name: stremio-server
+    restart: "no"
+    shm_size: '2gb'
+    environment:
+      - NO_CORS=1
+      - AUTO_SERVER_URL=1
+    ports:
+      - "6776:8080"
+      - "11470:11470"
+    volumes:
+      - ./stremio-data:/root/.stremio-server
