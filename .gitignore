@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# uv local cache
+.uv-cache/
+
+# Local configuration and leak-check state
+.codex
+.env
+.env.*
+.vpn-guard.home-ip
+
+# Stremio runtime/container data
+stremio-data/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
