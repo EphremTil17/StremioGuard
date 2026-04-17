@@ -2,16 +2,24 @@
 name = "streamio-vpn-guard"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "loguru>=0.7.3",
+    "typer>=0.24.2",
+]
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.409",
     "pytest>=9.0.3",
     "ruff>=0.15.12",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
 
 [tool.ruff]
 line-length = 100

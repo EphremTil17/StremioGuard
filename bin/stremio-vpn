@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import argparse
+import ipaddress
 import os
 import re
 import shutil
@@ -13,12 +13,37 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Callable, Iterable, Protocol
+
+import typer
+from loguru import logger
 
 
-IP_RE = re.compile(r"^[0-9a-fA-F:.]+$")
 CONNECTED_RE = re.compile(r"^Status:\s+Connected\b", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_public_ip(text: str) -> str | None:
+    """Return a normalized IP if `text` is a single valid IPv4/IPv6 address, else None."""
+    candidate = text.strip()
+    if not candidate:
+        return None
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+app = typer.Typer(help="Guard Stremio behind the WSL NordVPN CLI.", no_args_is_help=True)
+
+logger.remove()
+if os.environ.get("STREAMIO_BACKGROUND") != "1":
+    logger.add(
+        sys.stdout,
+        format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | "
+        "<cyan>stremio-vpn</cyan> | <level>{message}</level>",
+        level="INFO",
+        colorize=sys.stdout.isatty(),
+    )
 
 
 class Runner(Protocol):
@@ -62,13 +87,21 @@ class Config:
     vpn_wait_seconds: int
     watch_interval_seconds: int
     public_ip_timeout_seconds: int
+    reconnect_attempts: int
+    reconnect_backoff_seconds: int
     home_ip_file: Path
     expected_vpn_ip: str | None
     ip_check_urls: tuple[str, ...]
+    install_missing: bool
+    run_id: str
+    log_file: Path | None
+    log_session: bool
 
     @classmethod
     def from_env(cls) -> "Config":
         root_dir = Path(__file__).resolve().parent.parent
+        run_id = os.environ.get("STREAMIO_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_file = os.environ.get("STREAMIO_LOG_FILE")
         return cls(
             root_dir=root_dir,
             compose_file=Path(os.environ.get("COMPOSE_FILE", root_dir / "docker-compose.yml")),
@@ -77,10 +110,16 @@ class Config:
             nordvpn_group=os.environ.get("NORDVPN_GROUP", "p2p"),
             nordvpn_country=os.environ.get("NORDVPN_COUNTRY", "united_states"),
             vpn_wait_seconds=int(os.environ.get("VPN_WAIT_SECONDS", "60")),
-            watch_interval_seconds=int(os.environ.get("WATCH_INTERVAL_SECONDS", "15")),
+            watch_interval_seconds=int(os.environ.get("WATCH_INTERVAL_SECONDS", "10")),
             public_ip_timeout_seconds=int(os.environ.get("PUBLIC_IP_TIMEOUT_SECONDS", "8")),
+            reconnect_attempts=int(os.environ.get("RECONNECT_ATTEMPTS", "5")),
+            reconnect_backoff_seconds=int(os.environ.get("RECONNECT_BACKOFF_SECONDS", "5")),
             home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".vpn-guard.home-ip")),
             expected_vpn_ip=os.environ.get("EXPECTED_VPN_IP") or None,
+            install_missing=os.environ.get("INSTALL_MISSING_DEPS", "0") in {"1", "true", "yes"},
+            run_id=run_id,
+            log_file=Path(log_file) if log_file else None,
+            log_session=os.environ.get("STREAMIO_LOG_SESSION", "1") != "0",
             ip_check_urls=tuple(
                 url.strip()
                 for url in os.environ.get(
@@ -96,23 +135,94 @@ class VpnGuard:
     def __init__(self, config: Config, runner: Runner | None = None) -> None:
         self.config = config
         self.runner = runner or SubprocessRunner()
+        self.started_at = time.monotonic()
+        self.last_public_ip: str | None = None
+        self.vpn_drop_count = 0
+        self.public_ip_failure_count = 0
+        self.recovery_attempt_count = 0
+        if self.config.log_session:
+            self.log_session_start()
+
+    def elapsed_seconds(self) -> int:
+        return int(time.monotonic() - self.started_at)
+
+    def log_session_start(self) -> None:
+        self.log(
+            "Session metadata "
+            f"run_id={self.config.run_id} "
+            f"service={self.config.service_name} "
+            f"container={self.config.container_name} "
+            f"watch_interval_seconds={self.config.watch_interval_seconds} "
+            f"reconnect_attempts={self.config.reconnect_attempts} "
+            f"reconnect_backoff_seconds={self.config.reconnect_backoff_seconds}"
+        )
 
     def log(self, message: str) -> None:
-        print(f"[stremio-vpn] {message}", flush=True)
+        logger.info(message)
+
+    def warn(self, message: str) -> None:
+        logger.warning(message)
+
+    def success(self, message: str) -> None:
+        logger.success(message)
+
+    def log_lines(self, text: str) -> None:
+        for line in text.splitlines() or [""]:
+            logger.info(line)
 
     def require_commands(self, commands: Iterable[str] = ("nordvpn", "docker")) -> None:
         missing = [command for command in commands if shutil.which(command) is None]
         if missing:
-            raise RuntimeError(f"Missing required command(s): {', '.join(missing)}")
+            if self.config.install_missing:
+                self.install_missing_commands(missing)
+                missing = [command for command in commands if shutil.which(command) is None]
+            if missing:
+                raise RuntimeError(
+                    f"Missing required command(s): {', '.join(missing)}\n"
+                    f"{self.install_hint(missing)}"
+                )
 
         result = self.runner.run(["docker", "compose", "version"], check=False)
         if result.returncode != 0:
             raise RuntimeError("Docker Compose plugin is not available.")
 
-    def compose(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def install_missing_commands(self, missing: list[str]) -> None:
+        if not shutil.which("apt"):
+            self.warn("Automatic dependency installation is only supported on apt-based Linux.")
+            return
+
+        packages = []
+        if "docker" in missing:
+            packages.append("docker.io")
+        if "nordvpn" in missing:
+            self.warn("NordVPN CLI installation is not automated; install it from NordVPN first.")
+        if not packages:
+            return
+
+        self.log(f"Installing missing package(s): {', '.join(packages)}")
+        self.runner.run(["sudo", "apt", "update"], check=True, capture=False)
+        self.runner.run(["sudo", "apt", "install", "-y", *packages], check=True, capture=False)
+
+    def install_hint(self, missing: list[str]) -> str:
+        hints = []
+        if "docker" in missing:
+            hints.append("Install Docker with Compose support inside WSL, then retry.")
+        if "nordvpn" in missing:
+            hints.append("Install and log in to the NordVPN Linux CLI inside WSL, then retry.")
+        if not hints:
+            return "Install the missing command(s), then retry."
+        return " ".join(hints)
+
+    def compose(
+        self,
+        *args: str,
+        check: bool = True,
+        capture: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         return self.runner.run(
             ["docker", "compose", "-f", str(self.config.compose_file), *args],
             check=check,
+            capture=capture,
         )
 
     def nord_status(self) -> str:
@@ -161,30 +271,37 @@ class VpnGuard:
                     request,
                     timeout=self.config.public_ip_timeout_seconds,
                 ) as response:
-                    ip = response.read(128).decode("utf-8", errors="replace").strip()
+                    body = response.read(128).decode("utf-8", errors="replace")
             except (OSError, urllib.error.URLError, TimeoutError):
                 continue
 
-            if IP_RE.match(ip):
+            ip = parse_public_ip(body)
+            if ip:
                 return ip
         return None
 
     def public_ip_safe(self) -> bool:
         ip = self.public_ip()
         if not ip:
-            self.log("Could not determine public IP.")
+            self.public_ip_failure_count += 1
+            self.warn("Could not determine public IP.")
             return False
 
         self.log(f"Observed public IP: {ip}")
+        if self.last_public_ip and self.last_public_ip != ip:
+            self.log(f"Public IP changed from {self.last_public_ip} to {ip}.")
+        self.last_public_ip = ip
 
         if self.config.expected_vpn_ip and ip != self.config.expected_vpn_ip:
-            self.log(f"Public IP does not match EXPECTED_VPN_IP={self.config.expected_vpn_ip}.")
+            self.public_ip_failure_count += 1
+            self.warn(f"Public IP does not match EXPECTED_VPN_IP={self.config.expected_vpn_ip}.")
             return False
 
         if self.config.home_ip_file.exists():
             home_ip = self.config.home_ip_file.read_text(encoding="utf-8").strip()
             if home_ip and ip == home_ip:
-                self.log(f"Public IP matches saved home IP baseline ({home_ip}); possible leak.")
+                self.public_ip_failure_count += 1
+                self.warn(f"Public IP matches saved home IP baseline ({home_ip}); possible leak.")
                 return False
 
         return True
@@ -195,15 +312,91 @@ class VpnGuard:
         if not self.public_ip_safe():
             raise RuntimeError("Public IP check failed; refusing to run blind.")
 
+    def ensure_data_dir(self) -> None:
+        data_dir = self.config.root_dir / "stremio-data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.log(f"Using Stremio data directory: {data_dir}")
+
+    def compose_instance_exists(self) -> bool:
+        result = self.runner.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(self.config.compose_file),
+                "ps",
+                "-a",
+                "-q",
+                self.config.service_name,
+            ],
+            check=False,
+        )
+        return bool((result.stdout or "").strip())
+
     def stop_stremio(self) -> None:
         self.log(f"Stopping {self.config.service_name}.")
         self.compose("stop", self.config.service_name, check=False)
+        self.success(f"{self.config.service_name} is stopped.")
+
+    def recover_vpn(self) -> bool:
+        for attempt in range(1, self.config.reconnect_attempts + 1):
+            self.recovery_attempt_count += 1
+            self.log(
+                f"VPN recovery attempt {attempt}/{self.config.reconnect_attempts}: "
+                f"nordvpn connect --group {self.config.nordvpn_group} {self.config.nordvpn_country}"
+            )
+            try:
+                self.connect_vpn()
+            except RuntimeError as error:
+                self.warn(str(error))
+            else:
+                if self.public_ip_safe():
+                    self.success("VPN recovered and public IP safety checks passed.")
+                    return True
+                self.warn("VPN connected but public IP safety checks failed.")
+
+            if attempt < self.config.reconnect_attempts:
+                self.log(f"Waiting {self.config.reconnect_backoff_seconds}s before retry.")
+                time.sleep(self.config.reconnect_backoff_seconds)
+
+        self.warn("VPN recovery failed; leaving Stremio stopped.")
+        return False
+
+    def verify_after_up(self) -> None:
+        """Re-check VPN safety immediately after `compose up`. Stops Stremio if it dropped."""
+        if self.nord_is_connected() and self.public_ip_safe():
+            return
+        self.warn("VPN safety check failed immediately after starting Stremio; stopping container.")
+        self.stop_stremio()
+        raise RuntimeError("VPN dropped or public IP unsafe between preflight and container start.")
+
+    def setup_stremio(self, *, reset: bool = True) -> None:
+        self.preflight()
+        self.ensure_data_dir()
+        if reset:
+            self.log("Resetting Compose instance without deleting stremio-data.")
+            self.compose("down", "--remove-orphans", check=False, capture=False)
+        self.log(f"Running: docker compose -f {self.config.compose_file} build {self.config.service_name}")
+        self.compose("build", self.config.service_name, capture=False)
+        self.log(f"Starting {self.config.service_name}.")
+        self.log(f"Running: docker compose -f {self.config.compose_file} up -d {self.config.service_name}")
+        self.compose("up", "-d", self.config.service_name, capture=False)
+        self.verify_after_up()
+        self.success("Stremio is running behind the verified WSL NordVPN route.")
 
     def start_stremio(self) -> None:
+        if not self.compose_instance_exists():
+            self.log("No Compose instance found; running first-time setup.")
+            self.setup_stremio(reset=False)
+            return
+
         self.preflight()
+        self.ensure_data_dir()
         self.log(f"Starting {self.config.service_name}.")
-        self.compose("up", "-d", self.config.service_name)
-        self.log("Started. Keep this process running with '--watch' for continuous guarding.")
+        self.log(f"Running: docker compose -f {self.config.compose_file} up -d {self.config.service_name}")
+        self.compose("up", "-d", self.config.service_name, capture=False)
+        self.verify_after_up()
+        self.success("Stremio is running behind the verified WSL NordVPN route.")
 
     def container_running(self) -> bool:
         result = self.runner.run(
@@ -212,24 +405,22 @@ class VpnGuard:
         )
         return result.returncode == 0 and (result.stdout or "").strip() == "true"
 
-    def watch_stremio(self) -> None:
+    def watch_stremio(self, *, auto_start: bool = False) -> None:
         self.require_commands()
         self.log(
             f"Watching NordVPN and {self.config.container_name} "
             f"every {self.config.watch_interval_seconds}s."
         )
         while True:
-            self.watch_once()
+            self.watch_once(auto_start=auto_start)
             time.sleep(self.config.watch_interval_seconds)
 
-    def watch_once(self) -> None:
+    def watch_once(self, *, auto_start: bool = False) -> None:
         if not self.nord_is_connected():
             self.log("VPN disconnected. Stopping Stremio before attempting reconnect.")
+            self.vpn_drop_count += 1
             self.stop_stremio()
-            try:
-                self.connect_vpn()
-            except RuntimeError as error:
-                self.log(str(error))
+            if not self.recover_vpn():
                 return
 
         if not self.nord_is_connected():
@@ -238,19 +429,30 @@ class VpnGuard:
         if not self.public_ip_safe():
             self.log("Public IP check failed. Stopping Stremio.")
             self.stop_stremio()
-            return
+            if not self.recover_vpn():
+                return
 
-        if not self.container_running():
+        if auto_start and not self.container_running():
             self.log("VPN is safe and container is not running; starting Stremio.")
-            self.compose("up", "-d", self.config.service_name)
+            self.compose("up", "-d", self.config.service_name, capture=False)
+        elif not self.container_running():
+            self.warn("VPN is safe, but Stremio is not running.")
+        else:
+            self.log(
+                "Watchdog health check passed "
+                f"uptime_seconds={self.elapsed_seconds()} "
+                f"vpn_drops={self.vpn_drop_count} "
+                f"public_ip_failures={self.public_ip_failure_count} "
+                f"recovery_attempts={self.recovery_attempt_count}"
+            )
 
     def show_status(self) -> None:
         self.require_commands()
-        print("--- NordVPN ---")
-        print(self.nord_status().rstrip())
-        print("--- Public IP ---")
-        print(self.public_ip() or "unavailable")
-        print("--- Container ---")
+        logger.info("--- NordVPN ---")
+        self.log_lines(self.nord_status().rstrip())
+        logger.info("--- Public IP ---")
+        logger.info(self.public_ip() or "unavailable")
+        logger.info("--- Container ---")
         result = self.runner.run(
             [
                 "docker",
@@ -262,63 +464,108 @@ class VpnGuard:
             ],
             check=False,
         )
-        print((result.stdout or "").rstrip())
+        self.log_lines((result.stdout or "").rstrip())
 
     def record_home_ip(self) -> None:
+        if self.nord_is_connected():
+            raise RuntimeError(
+                "NordVPN reports connected; refusing to record a VPN IP as the home baseline. "
+                "Disconnect NordVPN first (`nordvpn disconnect`), then rerun."
+            )
+
         ip = self.public_ip()
         if not ip:
             raise RuntimeError("Could not determine public IP.")
 
+        if self.config.expected_vpn_ip and ip == self.config.expected_vpn_ip:
+            raise RuntimeError(
+                f"Observed IP {ip} matches EXPECTED_VPN_IP; refusing to save it as the home "
+                "baseline. Disconnect NordVPN and rerun."
+            )
+
+        if self.config.home_ip_file.exists():
+            previous = self.config.home_ip_file.read_text(encoding="utf-8").strip()
+            if previous and previous != ip:
+                self.warn(f"Overwriting existing home IP baseline {previous} with {ip}.")
+
         self.config.home_ip_file.write_text(f"{ip}\n", encoding="utf-8")
         self.log(f"Saved {ip} to {self.config.home_ip_file}.")
-        self.log("Only do this while NordVPN is disconnected and you are on your normal home connection.")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Guard Stremio behind the WSL NordVPN CLI.")
-    subparsers = parser.add_subparsers(dest="command")
-
-    up = subparsers.add_parser("up", help="Connect VPN, verify safety, and start Stremio")
-    up.add_argument("--watch", action="store_true", help="Keep guarding after startup")
-
-    subparsers.add_parser("watch", help="Guard a running or stopped Stremio container")
-    subparsers.add_parser("down", help="Stop Stremio")
-    subparsers.add_parser("status", help="Show VPN, public IP, and container status")
-    subparsers.add_parser("record-home-ip", help="Save current public IP as leak-detection baseline")
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    guard = VpnGuard(Config.from_env())
-
+def run_command(action: Callable[[VpnGuard], None]) -> None:
+    config = Config.from_env()
+    configure_file_logging(config)
+    guard = VpnGuard(config)
     try:
-        if args.command == "up":
-            guard.start_stremio()
-            if args.watch:
-                guard.watch_stremio()
-        elif args.command == "watch":
-            guard.watch_stremio()
-        elif args.command == "down":
-            guard.require_commands()
-            guard.stop_stremio()
-        elif args.command == "status":
-            guard.show_status()
-        elif args.command == "record-home-ip":
-            guard.record_home_ip()
-        else:
-            parser.print_help()
+        action(guard)
     except KeyboardInterrupt:
-        print()
-        guard.log("Interrupted.")
-        return 130
+        logger.info("Interrupted.")
+        raise typer.Exit(130) from None
     except RuntimeError as error:
-        print(f"[stremio-vpn] ERROR: {error}", file=sys.stderr)
-        return 1
+        logger.error(str(error))
+        raise typer.Exit(1) from error
 
-    return 0
+
+def configure_file_logging(config: Config) -> None:
+    if not config.log_file:
+        return
+
+    config.log_file.parent.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        config.log_file,
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | stremio-vpn | {message}",
+        level="INFO",
+        rotation="10 MB",
+        retention="30 days",
+        enqueue=True,
+    )
+    logger.info(f"Writing run log to {config.log_file}")
+
+
+@app.command(hidden=True)
+def reset() -> None:
+    """Reset/build/start the Compose instance safely."""
+    run_command(lambda guard: guard.setup_stremio(reset=True))
+
+
+@app.command()
+def start() -> None:
+    """Initialize if needed and start Stremio."""
+    run_command(lambda guard: guard.start_stremio())
+
+
+@app.command(hidden=True)
+def watchdog() -> None:
+    """Run the watchdog loop and auto-start Stremio when VPN is safe."""
+    run_command(lambda guard: guard.watch_stremio(auto_start=True))
+
+
+def _stop_action(guard: VpnGuard) -> None:
+    guard.require_commands()
+    guard.stop_stremio()
+
+
+@app.command()
+def stop() -> None:
+    """Stop Stremio."""
+    run_command(_stop_action)
+
+
+@app.command()
+def status() -> None:
+    """Show VPN, public IP, and container status."""
+    run_command(lambda guard: guard.show_status())
+
+
+@app.command("record-home-ip")
+def record_home_ip() -> None:
+    """Save current public IP as leak-detection baseline."""
+    run_command(lambda guard: guard.record_home_ip())
+
+
+def main() -> None:
+    app()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

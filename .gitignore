@@ -12,7 +12,12 @@ __pycache__/
 .codex
 .env
 .env.*
+.streamio-watchdog.log
+.streamio-watchdog.pid
 .vpn-guard.home-ip
+
+# Runtime logs
+logs/*.log
 
 # Stremio runtime/container data
 stremio-data/
@@ -20,3 +25,4 @@ stremio-data/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+CLAUDE.md
