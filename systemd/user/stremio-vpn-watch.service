@@ -4,8 +4,8 @@ After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/ephrem/projects/streamio
-ExecStart=/home/ephrem/projects/streamio/bin/stremio-vpn up --watch
+WorkingDirectory=%h/projects/streamio
+ExecStart=%h/.local/bin/uv --cache-dir %h/projects/streamio/.uv-cache run python %h/projects/streamio/bin/stremio-vpn watchdog
 Restart=always
 RestartSec=10
 
