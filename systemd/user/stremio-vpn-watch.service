@@ -1,5 +1,5 @@
 [Unit]
-Description=Guard Stremio behind NordVPN
+Description=Guard Stremio behind the gluetun VPN container
 After=default.target
 
 [Service]
