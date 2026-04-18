@@ -1,14 +1,30 @@
 services:
-  stremio:
-    image: tsaridas/stremio-docker:latest
-    container_name: stremio-server
-    restart: "no"
-    shm_size: '2gb'
-    environment:
-      - NO_CORS=1
-      - AUTO_SERVER_URL=1
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file: .env
     ports:
       - "6776:8080"
       - "11470:11470"
     volumes:
+      - ./gluetun-data:/gluetun
+
+  stremio:
+    image: tsaridas/stremio-docker:latest
+    container_name: stremio-server
+    restart: "no"
+    shm_size: "2gb"
+    environment:
+      - NO_CORS=1
+      - AUTO_SERVER_URL=1
+    volumes:
       - ./stremio-data:/root/.stremio-server
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
