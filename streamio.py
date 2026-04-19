@@ -17,7 +17,10 @@ from typing import NoReturn
 import typer
 from loguru import logger
 
-APP = typer.Typer(help="Start and guard Stremio behind NordVPN.", no_args_is_help=False)
+APP = typer.Typer(
+    help="Start and guard Stremio behind the gluetun VPN container.",
+    no_args_is_help=False,
+)
 
 ROOT_DIR = Path(__file__).resolve().parent
 GUARD = ROOT_DIR / "bin" / "stremio-vpn"
