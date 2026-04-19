@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-"""NordVPN-aware supervisor for the Stremio Docker Compose service."""
+"""Gluetun-aware verifier for the Stremio Docker Compose service."""
 
 from __future__ import annotations
 
 import ipaddress
 import os
-import re
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable, Protocol
+from typing import Protocol
 
 import typer
 from loguru import logger
-
-
-CONNECTED_RE = re.compile(r"^Status:\s+Connected\b", re.IGNORECASE | re.MULTILINE)
 
 
 def parse_public_ip(text: str) -> str | None:
@@ -33,7 +30,9 @@ def parse_public_ip(text: str) -> str | None:
         return str(ipaddress.ip_address(candidate))
     except ValueError:
         return None
-app = typer.Typer(help="Guard Stremio behind the WSL NordVPN CLI.", no_args_is_help=True)
+
+
+app = typer.Typer(help="Guard Stremio behind the gluetun VPN container.", no_args_is_help=True)
 
 logger.remove()
 if os.environ.get("STREAMIO_BACKGROUND") != "1":
@@ -54,8 +53,7 @@ class Runner(Protocol):
         check: bool = False,
         capture: bool = True,
         timeout: float | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        ...
+    ) -> subprocess.CompletedProcess[str]: ...
 
 
 class SubprocessRunner:
@@ -82,13 +80,10 @@ class Config:
     compose_file: Path
     service_name: str
     container_name: str
-    nordvpn_group: str
-    nordvpn_country: str
-    vpn_wait_seconds: int
+    gluetun_container_name: str
+    gluetun_healthy_timeout_seconds: int
     watch_interval_seconds: int
     public_ip_timeout_seconds: int
-    reconnect_attempts: int
-    reconnect_backoff_seconds: int
     home_ip_file: Path
     expected_vpn_ip: str | None
     ip_check_urls: tuple[str, ...]
@@ -98,7 +93,7 @@ class Config:
     log_session: bool
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         root_dir = Path(__file__).resolve().parent.parent
         run_id = os.environ.get("STREAMIO_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
         log_file = os.environ.get("STREAMIO_LOG_FILE")
@@ -107,13 +102,12 @@ class Config:
             compose_file=Path(os.environ.get("COMPOSE_FILE", root_dir / "docker-compose.yml")),
             service_name=os.environ.get("SERVICE_NAME", "stremio"),
             container_name=os.environ.get("CONTAINER_NAME", "stremio-server"),
-            nordvpn_group=os.environ.get("NORDVPN_GROUP", "p2p"),
-            nordvpn_country=os.environ.get("NORDVPN_COUNTRY", "united_states"),
-            vpn_wait_seconds=int(os.environ.get("VPN_WAIT_SECONDS", "60")),
+            gluetun_container_name=os.environ.get("GLUETUN_CONTAINER_NAME", "gluetun"),
+            gluetun_healthy_timeout_seconds=int(
+                os.environ.get("GLUETUN_HEALTHY_TIMEOUT_SECONDS", "60")
+            ),
             watch_interval_seconds=int(os.environ.get("WATCH_INTERVAL_SECONDS", "10")),
             public_ip_timeout_seconds=int(os.environ.get("PUBLIC_IP_TIMEOUT_SECONDS", "8")),
-            reconnect_attempts=int(os.environ.get("RECONNECT_ATTEMPTS", "5")),
-            reconnect_backoff_seconds=int(os.environ.get("RECONNECT_BACKOFF_SECONDS", "5")),
             home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".vpn-guard.home-ip")),
             expected_vpn_ip=os.environ.get("EXPECTED_VPN_IP") or None,
             install_missing=os.environ.get("INSTALL_MISSING_DEPS", "0") in {"1", "true", "yes"},
@@ -131,7 +125,7 @@ class Config:
         )
 
 
-class VpnGuard:
+class GluetunGuard:
     def __init__(self, config: Config, runner: Runner | None = None) -> None:
         self.config = config
         self.runner = runner or SubprocessRunner()
@@ -139,7 +133,6 @@ class VpnGuard:
         self.last_public_ip: str | None = None
         self.vpn_drop_count = 0
         self.public_ip_failure_count = 0
-        self.recovery_attempt_count = 0
         if self.config.log_session:
             self.log_session_start()
 
@@ -152,9 +145,8 @@ class VpnGuard:
             f"run_id={self.config.run_id} "
             f"service={self.config.service_name} "
             f"container={self.config.container_name} "
-            f"watch_interval_seconds={self.config.watch_interval_seconds} "
-            f"reconnect_attempts={self.config.reconnect_attempts} "
-            f"reconnect_backoff_seconds={self.config.reconnect_backoff_seconds}"
+            f"gluetun_container={self.config.gluetun_container_name} "
+            f"watch_interval_seconds={self.config.watch_interval_seconds}"
         )
 
     def log(self, message: str) -> None:
@@ -170,7 +162,7 @@ class VpnGuard:
         for line in text.splitlines() or [""]:
             logger.info(line)
 
-    def require_commands(self, commands: Iterable[str] = ("nordvpn", "docker")) -> None:
+    def require_commands(self, commands: Iterable[str] = ("docker",)) -> None:
         missing = [command for command in commands if shutil.which(command) is None]
         if missing:
             if self.config.install_missing:
@@ -194,8 +186,6 @@ class VpnGuard:
         packages = []
         if "docker" in missing:
             packages.append("docker.io")
-        if "nordvpn" in missing:
-            self.warn("NordVPN CLI installation is not automated; install it from NordVPN first.")
         if not packages:
             return
 
@@ -207,8 +197,6 @@ class VpnGuard:
         hints = []
         if "docker" in missing:
             hints.append("Install Docker with Compose support inside WSL, then retry.")
-        if "nordvpn" in missing:
-            hints.append("Install and log in to the NordVPN Linux CLI inside WSL, then retry.")
         if not hints:
             return "Install the missing command(s), then retry."
         return " ".join(hints)
@@ -225,42 +213,28 @@ class VpnGuard:
             capture=capture,
         )
 
-    def nord_status(self) -> str:
-        result = self.runner.run(["nordvpn", "status"], check=False)
-        return f"{result.stdout or ''}{result.stderr or ''}"
+    def gluetun_healthy(self) -> bool:
+        result = self.runner.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.State.Health.Status}}",
+                self.config.gluetun_container_name,
+            ],
+            check=False,
+        )
+        return result.returncode == 0 and (result.stdout or "").strip() == "healthy"
 
-    def nord_is_connected(self) -> bool:
-        return CONNECTED_RE.search(self.nord_status()) is not None
-
-    def connect_vpn(self) -> None:
-        if self.nord_is_connected():
-            self.log("NordVPN is already connected.")
-        else:
-            self.log(
-                "NordVPN is disconnected; connecting with: "
-                f"nordvpn connect --group {self.config.nordvpn_group} {self.config.nordvpn_country}"
-            )
-            self.runner.run(
-                [
-                    "nordvpn",
-                    "connect",
-                    "--group",
-                    self.config.nordvpn_group,
-                    self.config.nordvpn_country,
-                ],
-                check=False,
-            )
-
-        deadline = time.monotonic() + self.config.vpn_wait_seconds
+    def wait_for_gluetun_healthy(self) -> None:
+        deadline = time.monotonic() + self.config.gluetun_healthy_timeout_seconds
         while time.monotonic() < deadline:
-            if self.nord_is_connected():
-                self.log("NordVPN reports connected.")
+            if self.gluetun_healthy():
+                self.log("Gluetun is healthy.")
                 return
             time.sleep(2)
-
         raise RuntimeError(
-            f"NordVPN did not become connected within {self.config.vpn_wait_seconds}s.\n"
-            f"{self.nord_status()}"
+            f"Gluetun did not become healthy within {self.config.gluetun_healthy_timeout_seconds}s."
         )
 
     def public_ip(self) -> str | None:
@@ -280,11 +254,33 @@ class VpnGuard:
                 return ip
         return None
 
+    def public_ip_via_gluetun(self) -> str | None:
+        for url in self.config.ip_check_urls:
+            result = self.runner.run(
+                [
+                    "docker",
+                    "exec",
+                    self.config.gluetun_container_name,
+                    "wget",
+                    "-qO-",
+                    "--timeout",
+                    str(self.config.public_ip_timeout_seconds),
+                    url,
+                ],
+                check=False,
+                timeout=self.config.public_ip_timeout_seconds + 2,
+            )
+            if result.returncode == 0:
+                ip = parse_public_ip(result.stdout or "")
+                if ip:
+                    return ip
+        return None
+
     def public_ip_safe(self) -> bool:
-        ip = self.public_ip()
+        ip = self.public_ip_via_gluetun()
         if not ip:
             self.public_ip_failure_count += 1
-            self.warn("Could not determine public IP.")
+            self.warn("Could not determine public IP via gluetun.")
             return False
 
         self.log(f"Observed public IP: {ip}")
@@ -308,9 +304,17 @@ class VpnGuard:
 
     def preflight(self) -> None:
         self.require_commands()
-        self.connect_vpn()
+        env_file = self.config.root_dir / ".env"
+        if not env_file.exists():
+            raise RuntimeError(
+                f".env not found at {env_file}. Copy .env.example to .env and populate "
+                "WIREGUARD_PRIVATE_KEY (see README.md → First-time setup)."
+            )
+        self.log(f"Ensuring {self.config.gluetun_container_name} is running.")
+        self.compose("up", "-d", self.config.gluetun_container_name, capture=False)
+        self.wait_for_gluetun_healthy()
         if not self.public_ip_safe():
-            raise RuntimeError("Public IP check failed; refusing to run blind.")
+            raise RuntimeError("Public IP check failed via gluetun; refusing to start Stremio.")
 
     def ensure_data_dir(self) -> None:
         data_dir = self.config.root_dir / "stremio-data"
@@ -338,51 +342,24 @@ class VpnGuard:
         self.compose("stop", self.config.service_name, check=False)
         self.success(f"{self.config.service_name} is stopped.")
 
-    def recover_vpn(self) -> bool:
-        for attempt in range(1, self.config.reconnect_attempts + 1):
-            self.recovery_attempt_count += 1
-            self.log(
-                f"VPN recovery attempt {attempt}/{self.config.reconnect_attempts}: "
-                f"nordvpn connect --group {self.config.nordvpn_group} {self.config.nordvpn_country}"
-            )
-            try:
-                self.connect_vpn()
-            except RuntimeError as error:
-                self.warn(str(error))
-            else:
-                if self.public_ip_safe():
-                    self.success("VPN recovered and public IP safety checks passed.")
-                    return True
-                self.warn("VPN connected but public IP safety checks failed.")
-
-            if attempt < self.config.reconnect_attempts:
-                self.log(f"Waiting {self.config.reconnect_backoff_seconds}s before retry.")
-                time.sleep(self.config.reconnect_backoff_seconds)
-
-        self.warn("VPN recovery failed; leaving Stremio stopped.")
-        return False
-
-    def verify_after_up(self) -> None:
-        """Re-check VPN safety immediately after `compose up`. Stops Stremio if it dropped."""
-        if self.nord_is_connected() and self.public_ip_safe():
-            return
-        self.warn("VPN safety check failed immediately after starting Stremio; stopping container.")
-        self.stop_stremio()
-        raise RuntimeError("VPN dropped or public IP unsafe between preflight and container start.")
-
     def setup_stremio(self, *, reset: bool = True) -> None:
-        self.preflight()
         self.ensure_data_dir()
         if reset:
             self.log("Resetting Compose instance without deleting stremio-data.")
             self.compose("down", "--remove-orphans", check=False, capture=False)
-        self.log(f"Running: docker compose -f {self.config.compose_file} build {self.config.service_name}")
+        self.preflight()
+        self.log(
+            f"Running: docker compose -f {self.config.compose_file} "
+            f"build {self.config.service_name}"
+        )
         self.compose("build", self.config.service_name, capture=False)
         self.log(f"Starting {self.config.service_name}.")
-        self.log(f"Running: docker compose -f {self.config.compose_file} up -d {self.config.service_name}")
+        self.log(
+            f"Running: docker compose -f {self.config.compose_file} "
+            f"up -d {self.config.service_name}"
+        )
         self.compose("up", "-d", self.config.service_name, capture=False)
-        self.verify_after_up()
-        self.success("Stremio is running behind the verified WSL NordVPN route.")
+        self.success("Stremio is running behind gluetun.")
 
     def start_stremio(self) -> None:
         if not self.compose_instance_exists():
@@ -390,13 +367,15 @@ class VpnGuard:
             self.setup_stremio(reset=False)
             return
 
-        self.preflight()
         self.ensure_data_dir()
+        self.preflight()
         self.log(f"Starting {self.config.service_name}.")
-        self.log(f"Running: docker compose -f {self.config.compose_file} up -d {self.config.service_name}")
+        self.log(
+            f"Running: docker compose -f {self.config.compose_file} "
+            f"up -d {self.config.service_name}"
+        )
         self.compose("up", "-d", self.config.service_name, capture=False)
-        self.verify_after_up()
-        self.success("Stremio is running behind the verified WSL NordVPN route.")
+        self.success("Stremio is running behind gluetun.")
 
     def container_running(self) -> bool:
         result = self.runner.run(
@@ -408,7 +387,7 @@ class VpnGuard:
     def watch_stremio(self, *, auto_start: bool = False) -> None:
         self.require_commands()
         self.log(
-            f"Watching NordVPN and {self.config.container_name} "
+            f"Watching gluetun and {self.config.container_name} "
             f"every {self.config.watch_interval_seconds}s."
         )
         while True:
@@ -416,42 +395,36 @@ class VpnGuard:
             time.sleep(self.config.watch_interval_seconds)
 
     def watch_once(self, *, auto_start: bool = False) -> None:
-        if not self.nord_is_connected():
-            self.log("VPN disconnected. Stopping Stremio before attempting reconnect.")
+        if not self.gluetun_healthy():
+            self.warn("Gluetun is not healthy. Stopping Stremio.")
             self.vpn_drop_count += 1
             self.stop_stremio()
-            if not self.recover_vpn():
-                return
-
-        if not self.nord_is_connected():
             return
 
         if not self.public_ip_safe():
-            self.log("Public IP check failed. Stopping Stremio.")
+            self.warn("Public IP check failed. Stopping Stremio.")
             self.stop_stremio()
-            if not self.recover_vpn():
-                return
+            return
 
         if auto_start and not self.container_running():
-            self.log("VPN is safe and container is not running; starting Stremio.")
+            self.log("Gluetun healthy; starting Stremio.")
             self.compose("up", "-d", self.config.service_name, capture=False)
         elif not self.container_running():
-            self.warn("VPN is safe, but Stremio is not running.")
+            self.warn("Gluetun healthy but Stremio is not running.")
         else:
             self.log(
                 "Watchdog health check passed "
                 f"uptime_seconds={self.elapsed_seconds()} "
                 f"vpn_drops={self.vpn_drop_count} "
-                f"public_ip_failures={self.public_ip_failure_count} "
-                f"recovery_attempts={self.recovery_attempt_count}"
+                f"public_ip_failures={self.public_ip_failure_count}"
             )
 
     def show_status(self) -> None:
         self.require_commands()
-        logger.info("--- NordVPN ---")
-        self.log_lines(self.nord_status().rstrip())
-        logger.info("--- Public IP ---")
-        logger.info(self.public_ip() or "unavailable")
+        logger.info("--- Gluetun ---")
+        logger.info("healthy" if self.gluetun_healthy() else "not healthy / not running")
+        logger.info("--- Public IP (via gluetun) ---")
+        logger.info(self.public_ip_via_gluetun() or "unavailable")
         logger.info("--- Container ---")
         result = self.runner.run(
             [
@@ -467,10 +440,10 @@ class VpnGuard:
         self.log_lines((result.stdout or "").rstrip())
 
     def record_home_ip(self) -> None:
-        if self.nord_is_connected():
+        if self.gluetun_healthy():
             raise RuntimeError(
-                "NordVPN reports connected; refusing to record a VPN IP as the home baseline. "
-                "Disconnect NordVPN first (`nordvpn disconnect`), then rerun."
+                "Gluetun is healthy; refusing to record a VPN IP as the home baseline. "
+                "Stop gluetun first (`docker compose stop gluetun`), then rerun."
             )
 
         ip = self.public_ip()
@@ -480,7 +453,7 @@ class VpnGuard:
         if self.config.expected_vpn_ip and ip == self.config.expected_vpn_ip:
             raise RuntimeError(
                 f"Observed IP {ip} matches EXPECTED_VPN_IP; refusing to save it as the home "
-                "baseline. Disconnect NordVPN and rerun."
+                "baseline. Disconnect any active VPN and rerun."
             )
 
         if self.config.home_ip_file.exists():
@@ -492,10 +465,10 @@ class VpnGuard:
         self.log(f"Saved {ip} to {self.config.home_ip_file}.")
 
 
-def run_command(action: Callable[[VpnGuard], None]) -> None:
+def run_command(action: Callable[[GluetunGuard], None]) -> None:
     config = Config.from_env()
     configure_file_logging(config)
-    guard = VpnGuard(config)
+    guard = GluetunGuard(config)
     try:
         action(guard)
     except KeyboardInterrupt:
@@ -536,11 +509,11 @@ def start() -> None:
 
 @app.command(hidden=True)
 def watchdog() -> None:
-    """Run the watchdog loop and auto-start Stremio when VPN is safe."""
+    """Run the watchdog loop and auto-start Stremio when gluetun is healthy."""
     run_command(lambda guard: guard.watch_stremio(auto_start=True))
 
 
-def _stop_action(guard: VpnGuard) -> None:
+def _stop_action(guard: GluetunGuard) -> None:
     guard.require_commands()
     guard.stop_stremio()
 
@@ -553,7 +526,7 @@ def stop() -> None:
 
 @app.command()
 def status() -> None:
-    """Show VPN, public IP, and container status."""
+    """Show gluetun, public IP, and container status."""
     run_command(lambda guard: guard.show_status())
 
 
