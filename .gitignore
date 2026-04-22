@@ -8,14 +8,14 @@ __pycache__/
 # uv local cache
 .uv-cache/
 
-# Local configuration and leak-check state
+# Local configuration
 .codex
 .env
 .env.*
 !.env.example
-.streamio-watchdog.log
-.streamio-watchdog.pid
-.vpn-guard.home-ip
+
+# Runtime state (pidfile, leak-check baseline)
+.streamio/
 
 # Runtime logs
 logs/*.log

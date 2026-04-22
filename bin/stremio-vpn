@@ -108,7 +108,7 @@ class Config:
             ),
             watch_interval_seconds=int(os.environ.get("WATCH_INTERVAL_SECONDS", "10")),
             public_ip_timeout_seconds=int(os.environ.get("PUBLIC_IP_TIMEOUT_SECONDS", "8")),
-            home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".vpn-guard.home-ip")),
+            home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".streamio" / "home-ip")),
             expected_vpn_ip=os.environ.get("EXPECTED_VPN_IP") or None,
             install_missing=os.environ.get("INSTALL_MISSING_DEPS", "0") in {"1", "true", "yes"},
             run_id=run_id,
@@ -307,8 +307,9 @@ class GluetunGuard:
         env_file = self.config.root_dir / ".env"
         if not env_file.exists():
             raise RuntimeError(
-                f".env not found at {env_file}. Copy .env.example to .env and populate "
-                "WIREGUARD_PRIVATE_KEY (see README.md → First-time setup)."
+                f".env not found at {env_file}. Run `./streamio init` for guided "
+                "first-time setup, or copy .env.example to .env and populate "
+                "WIREGUARD_PRIVATE_KEY manually (see README.md → First-time setup)."
             )
         self.log(f"Ensuring {self.config.gluetun_container_name} is running.")
         self.compose("up", "-d", self.config.gluetun_container_name, capture=False)
@@ -461,6 +462,7 @@ class GluetunGuard:
             if previous and previous != ip:
                 self.warn(f"Overwriting existing home IP baseline {previous} with {ip}.")
 
+        self.config.home_ip_file.parent.mkdir(parents=True, exist_ok=True)
         self.config.home_ip_file.write_text(f"{ip}\n", encoding="utf-8")
         self.log(f"Saved {ip} to {self.config.home_ip_file}.")
 

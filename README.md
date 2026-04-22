@@ -25,15 +25,28 @@ The default `.env.example` ships with **NordVPN WireGuard** (NordLynx). Switchin
 
 ## First-time setup
 
-Copy the template and populate `.env`:
+Run the guided initializer:
+
+```bash
+./streamio init
+```
+
+This creates `.env` from `.env.example` if needed, drives `nordvpn set technology nordlynx && nordvpn connect`, captures the WireGuard private key via `sudo wg show nordlynx private-key` (sudo prompts on the TTY), runs `nordvpn disconnect`, writes the key into `.env`, and chains into `./streamio start`. Re-running `init` is idempotent: a populated `WIREGUARD_PRIVATE_KEY` skips the extraction step.
+
+Prerequisites the initializer does **not** install for you:
+
+- The NordVPN Linux CLI must be installed and logged in (the modern OAuth/browser-callback flow works). `init` will print a clear pointer if either check fails.
+- `wireguard-tools` must be installed so `wg show` is callable: `sudo apt install wireguard-tools` (or your distro's equivalent).
+- WSL2 needs `/dev/net/tun`. Modern WSL2 kernels (≥5.6) include it by default. Verify with `ls /dev/net/tun`; if missing, `sudo modprobe tun` enables it for the session.
+
+After `init` succeeds, the host-level NordVPN CLI is no longer needed at runtime; gluetun handles the tunnel itself.
+
+### Manual fallback
+
+If you'd rather skip the guided flow, the equivalent manual steps:
 
 ```bash
 cp .env.example .env
-```
-
-Then extract a NordVPN WireGuard private key. Prerequisite: the NordVPN Linux CLI must be installed and logged in (the modern OAuth/browser-callback flow works), and the `wireguard-tools` package needs to be available so `wg show` is callable.
-
-```bash
 sudo apt install wireguard-tools
 nordvpn set technology nordlynx
 nordvpn connect
@@ -41,9 +54,7 @@ sudo wg show nordlynx private-key
 nordvpn disconnect
 ```
 
-Paste the printed key into `.env` as `WIREGUARD_PRIVATE_KEY=...` and save. After this, the host-level NordVPN CLI is no longer needed at runtime; gluetun handles the tunnel itself.
-
-WSL2 also needs `/dev/net/tun` available. Modern WSL2 kernels (≥5.6) include it by default. Verify with `ls /dev/net/tun`; if missing, `sudo modprobe tun` enables it for the session.
+Paste the printed key into `.env` as `WIREGUARD_PRIVATE_KEY=...`.
 
 ## First run
 
@@ -93,6 +104,7 @@ The Stremio service uses `restart: "no"` so Docker does not revive it before the
 Useful commands:
 
 ```bash
+./streamio init
 ./streamio start
 ./streamio restart
 ./streamio stop
@@ -105,7 +117,7 @@ Useful commands:
 
 `start` initializes automatically if no Compose instance exists, starts Stremio, launches the watchdog in the background, and returns to the shell.
 
-Each `./streamio start` creates a host-side run log under `logs/`, named like `logs/streamio-20260424-221500.log`. The startup command and background watchdog share that file, so one run captures gluetun health checks, public IP observations, container lifecycle events, drops, and watchdog ticks. Use `./streamio logs` to tail the latest run log. The background watchdog writes its PID to `.streamio-watchdog.pid`. `./streamio stop` stops the watchdog before stopping Stremio so it will not immediately restart the container.
+Each `./streamio start` creates a host-side run log under `logs/`, named like `logs/streamio-20260424-221500.log`. The startup command and background watchdog share that file, so one run captures gluetun health checks, public IP observations, container lifecycle events, drops, and watchdog ticks. Use `./streamio logs` to tail the latest run log. The background watchdog writes its PID to `.streamio/watchdog.pid`. `./streamio stop` stops the watchdog before stopping Stremio so it will not immediately restart the container.
 
 The watchdog polls gluetun health and the egress IP every 10 seconds by default. Tune with `WATCH_INTERVAL_SECONDS=5 ./streamio start` for faster checks, or a larger value for less polling. After changing the interval, restart with `./streamio stop` and `./streamio start`.
 
@@ -121,7 +133,7 @@ For an extra check, while gluetun is stopped (or has not been brought up yet) an
 ./streamio record-home-ip
 ```
 
-This saves your non-VPN public IP to `.vpn-guard.home-ip`. Later, the guard refuses to run Stremio if the egress IP observed via gluetun matches that baseline. The command refuses to run while gluetun is healthy, since that would record a VPN IP as home.
+This saves your non-VPN public IP to `.streamio/home-ip`. Later, the guard refuses to run Stremio if the egress IP observed via gluetun matches that baseline. The command refuses to run while gluetun is healthy, since that would record a VPN IP as home.
 
 If your VPN endpoint has a stable IP, you can make the check stricter:
 
