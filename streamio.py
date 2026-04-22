@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -25,8 +26,13 @@ APP = typer.Typer(
 ROOT_DIR = Path(__file__).resolve().parent
 GUARD = ROOT_DIR / "bin" / "stremio-vpn"
 LOG_DIR = ROOT_DIR / "logs"
-PID_FILE = ROOT_DIR / ".streamio-watchdog.pid"
+STATE_DIR = ROOT_DIR / ".streamio"
+PID_FILE = STATE_DIR / "watchdog.pid"
 UV_CACHE = ROOT_DIR / ".uv-cache"
+ENV_FILE = ROOT_DIR / ".env"
+ENV_EXAMPLE = ROOT_DIR / ".env.example"
+WIREGUARD_KEY_PLACEHOLDER = "<paste-key-here>"
+WIREGUARD_KEY_LINE = re.compile(r"^WIREGUARD_PRIVATE_KEY=.*$", re.MULTILINE)
 
 logger.remove()
 logger.add(
@@ -133,6 +139,7 @@ def watchdog_pid() -> int | None:
 def start_watchdog(context: RunContext) -> None:
     require_uv()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     pid = watchdog_pid()
     if pid:
@@ -208,11 +215,177 @@ def latest_log() -> Path | None:
     return logs[0] if logs else None
 
 
+def env_needs_init(env_path: Path = ENV_FILE) -> bool:
+    """Return True when .env is missing or WIREGUARD_PRIVATE_KEY is unpopulated."""
+    if not env_path.exists():
+        return True
+    content = env_path.read_text(encoding="utf-8")
+    match = WIREGUARD_KEY_LINE.search(content)
+    if not match:
+        return True
+    value = match.group(0).split("=", 1)[1].strip()
+    return value in {"", WIREGUARD_KEY_PLACEHOLDER}
+
+
+def write_wireguard_key(env_path: Path, key: str) -> None:
+    """Replace WIREGUARD_PRIVATE_KEY=... in env_path with the given key."""
+    content = env_path.read_text(encoding="utf-8")
+    new_line = f"WIREGUARD_PRIVATE_KEY={key}"
+    if WIREGUARD_KEY_LINE.search(content):
+        content = WIREGUARD_KEY_LINE.sub(new_line, content, count=1)
+    else:
+        content = content.rstrip("\n") + f"\n{new_line}\n"
+    env_path.write_text(content, encoding="utf-8")
+
+
+def is_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _check_nordvpn_ready() -> None:
+    if not shutil.which("nordvpn"):
+        fail(
+            "nordvpn CLI not found. Install it from https://nordvpn.com/download/linux/, "
+            "then run `nordvpn login` and re-run `./streamio init`."
+        )
+    result = subprocess.run(["nordvpn", "account"], capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() or "(no output)"
+        fail(
+            f"`nordvpn account` exited {result.returncode}. If you are not logged in, "
+            f"run `nordvpn login` and follow the OAuth callback.\n  output: {detail}"
+        )
+
+
+def _run_nordvpn_streaming(cmd: list[str], *, check: bool = True) -> int:
+    """Run a nordvpn command, streaming each output line through loguru."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.rstrip()
+        if not line:
+            continue
+        level = "WARNING" if "already set" in line.lower() else "INFO"
+        logger.log(level, f"nordvpn: {line}")
+    rc = proc.wait()
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
+    return rc
+
+
+def _extract_wireguard_key() -> str:
+    """Drive nordvpn nordlynx connect, capture the WG key, then disconnect."""
+    if not shutil.which("wg"):
+        fail(
+            "wg (wireguard-tools) not found. Run `sudo apt install wireguard-tools` "
+            "(or your distro's equivalent) and retry."
+        )
+
+    _check_nordvpn_ready()
+
+    logger.info("Setting NordVPN technology to nordlynx (WireGuard).")
+    _run_nordvpn_streaming(["nordvpn", "set", "technology", "nordlynx"])
+
+    logger.info("Connecting to NordVPN. This temporarily routes your host through the VPN.")
+    _run_nordvpn_streaming(["nordvpn", "connect"])
+
+    try:
+        logger.info("Reading WireGuard private key (sudo will prompt).")
+        result = subprocess.run(
+            ["sudo", "wg", "show", "nordlynx", "private-key"],
+            capture_output=True,
+            text=True,
+        )
+        key = (result.stdout or "").strip()
+        if result.returncode != 0 or not key:
+            logger.warning("Auto-extraction failed. Run this in another terminal and paste below:")
+            logger.warning("    sudo wg show nordlynx private-key")
+            key = typer.prompt("WireGuard private key").strip()
+    finally:
+        logger.info("Disconnecting NordVPN.")
+        _run_nordvpn_streaming(["nordvpn", "disconnect"], check=False)
+
+    if not key:
+        fail("No WireGuard key captured; aborting.")
+    return key
+
+
 @APP.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
     """Start Stremio when no command is provided."""
     if ctx.invoked_subcommand is None:
+        if env_needs_init():
+            if is_interactive():
+                logger.info(".env not configured; running first-time setup.")
+                init()
+                return
+            fail(".env missing or WIREGUARD_PRIVATE_KEY unpopulated. Run `./streamio init`.")
         start()
+
+
+def _prompt_provider() -> str:
+    """Ask which VPN provider to use. Returns 'nordvpn' or 'other'."""
+    typer.echo("")
+    typer.echo("VPN provider:")
+    typer.echo("  1) NordVPN  (automated WireGuard key extraction)")
+    typer.echo("  2) Other    (manual setup — you edit .env yourself)")
+    choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
+    if choice in {"1", "nordvpn"}:
+        return "nordvpn"
+    return "other"
+
+
+def _read_env_provider(env_path: Path) -> str:
+    match = re.search(
+        r"^VPN_SERVICE_PROVIDER=(.*)$", env_path.read_text(encoding="utf-8"), re.MULTILINE
+    )
+    return match.group(1).strip().lower() if match else ""
+
+
+def _print_manual_setup_pointer() -> None:
+    logger.info("Manual setup selected. Next steps:")
+    typer.echo("  1. Open .env in your editor.")
+    typer.echo("  2. Set VPN_SERVICE_PROVIDER to your gluetun-supported provider")
+    typer.echo("     (mullvad, protonvpn, surfshark, expressvpn, etc.).")
+    typer.echo("  3. Set VPN_TYPE (wireguard or openvpn) and the relevant credentials.")
+    typer.echo("  4. Reference: https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers")
+    typer.echo("  5. Run `./streamio start` once .env is populated.")
+
+
+@APP.command()
+def init() -> None:
+    """First-time setup: create .env, extract WireGuard key, then start."""
+    if not is_interactive():
+        fail("`init` needs an interactive terminal (stdin/stdout must be a TTY).")
+
+    if not ENV_FILE.exists():
+        if not ENV_EXAMPLE.exists():
+            fail(f"{ENV_EXAMPLE.name} not found; cannot bootstrap .env.")
+        shutil.copy(ENV_EXAMPLE, ENV_FILE)
+        logger.success(f"Created {ENV_FILE.name} from {ENV_EXAMPLE.name}.")
+    else:
+        logger.info(f"{ENV_FILE.name} already exists.")
+
+    if not env_needs_init(ENV_FILE):
+        logger.info("WIREGUARD_PRIVATE_KEY already set; skipping extraction.")
+        logger.info("Setup complete. Starting Stremio.")
+        start()
+        return
+
+    untouched_template = ENV_EXAMPLE.exists() and ENV_FILE.read_bytes() == ENV_EXAMPLE.read_bytes()
+    provider = _prompt_provider() if untouched_template else _read_env_provider(ENV_FILE)
+    if provider == "nordvpn":
+        logger.info("WIREGUARD_PRIVATE_KEY is unpopulated. Walking through extraction.")
+        key = _extract_wireguard_key()
+        write_wireguard_key(ENV_FILE, key)
+        logger.success(f"Wrote WireGuard key into {ENV_FILE.name}.")
+        logger.info("Setup complete. Starting Stremio.")
+        start()
+        return
+
+    _print_manual_setup_pointer()
 
 
 @APP.command()

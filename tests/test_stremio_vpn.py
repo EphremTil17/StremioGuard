@@ -19,6 +19,16 @@ assert SPEC.loader
 sys.modules["stremio_vpn"] = stremio_vpn
 SPEC.loader.exec_module(stremio_vpn)
 
+STREAMIO_PATH = Path(__file__).resolve().parents[1] / "streamio.py"
+STREAMIO_LOADER = importlib.machinery.SourceFileLoader("streamio_app", str(STREAMIO_PATH))
+STREAMIO_SPEC = importlib.util.spec_from_loader("streamio_app", STREAMIO_LOADER)
+if STREAMIO_SPEC is None:
+    raise RuntimeError(f"Could not load module spec for {STREAMIO_PATH}")
+streamio = importlib.util.module_from_spec(STREAMIO_SPEC)
+assert STREAMIO_SPEC.loader
+sys.modules["streamio_app"] = streamio
+STREAMIO_SPEC.loader.exec_module(streamio)
+
 
 GLUETUN_HEALTH_INSPECT = (
     "docker",
@@ -75,6 +85,8 @@ def completed(
 
 
 def make_config(tmp_path: Path, **overrides):
+    state_dir = tmp_path / ".streamio"
+    state_dir.mkdir(parents=True, exist_ok=True)
     values = {
         "root_dir": tmp_path,
         "compose_file": tmp_path / "docker-compose.yml",
@@ -84,7 +96,7 @@ def make_config(tmp_path: Path, **overrides):
         "gluetun_healthy_timeout_seconds": 1,
         "watch_interval_seconds": 1,
         "public_ip_timeout_seconds": 1,
-        "home_ip_file": tmp_path / ".vpn-guard.home-ip",
+        "home_ip_file": state_dir / "home-ip",
         "expected_vpn_ip": None,
         "ip_check_urls": ("https://example.test/ip",),
         "install_missing": False,
@@ -333,6 +345,63 @@ class GluetunGuardTests(unittest.TestCase):
                 guard.config.home_ip_file.read_text(encoding="utf-8").strip(),
                 "198.51.100.10",
             )
+
+
+class StreamioInitHelpersTests(unittest.TestCase):
+    def test_env_needs_init_when_file_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertTrue(streamio.env_needs_init(Path(directory) / ".env"))
+
+    def test_env_needs_init_when_placeholder_present(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\nWIREGUARD_PRIVATE_KEY=<paste-key-here>\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(streamio.env_needs_init(env))
+
+    def test_env_needs_init_when_value_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("WIREGUARD_PRIVATE_KEY=\n", encoding="utf-8")
+            self.assertTrue(streamio.env_needs_init(env))
+
+    def test_env_needs_init_false_when_key_populated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "WIREGUARD_PRIVATE_KEY=aGVsbG8td29ybGQ=\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(streamio.env_needs_init(env))
+
+    def test_write_wireguard_key_replaces_line_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\n"
+                "WIREGUARD_PRIVATE_KEY=<paste-key-here>\n"
+                "TZ=America/Chicago\n",
+                encoding="utf-8",
+            )
+            streamio.write_wireguard_key(env, "secret-key")
+            content = env.read_text(encoding="utf-8")
+
+            self.assertIn("WIREGUARD_PRIVATE_KEY=secret-key", content)
+            self.assertNotIn("<paste-key-here>", content)
+            self.assertIn("VPN_SERVICE_PROVIDER=nordvpn", content)
+            self.assertIn("TZ=America/Chicago", content)
+
+    def test_write_wireguard_key_appends_when_line_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("VPN_SERVICE_PROVIDER=nordvpn\n", encoding="utf-8")
+            streamio.write_wireguard_key(env, "fallback-key")
+            content = env.read_text(encoding="utf-8")
+
+            self.assertIn("VPN_SERVICE_PROVIDER=nordvpn", content)
+            self.assertIn("WIREGUARD_PRIVATE_KEY=fallback-key", content)
 
 
 if __name__ == "__main__":
