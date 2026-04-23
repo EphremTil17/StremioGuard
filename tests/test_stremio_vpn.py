@@ -95,6 +95,7 @@ def make_config(tmp_path: Path, **overrides):
         "gluetun_container_name": "gluetun",
         "gluetun_healthy_timeout_seconds": 1,
         "watch_interval_seconds": 1,
+        "watchdog_log_interval_seconds": 300,
         "public_ip_timeout_seconds": 1,
         "home_ip_file": state_dir / "home-ip",
         "expected_vpn_ip": None,
@@ -269,6 +270,48 @@ class GluetunGuardTests(unittest.TestCase):
             compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
             self.assertIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
 
+    def test_watch_once_does_not_log_healthy_tick_before_summary_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "log") as log_mock,
+            ):
+                guard.watch_once(auto_start=True)
+
+            log_messages = [call.args[0] for call in log_mock.call_args_list]
+            self.assertFalse(any("Watchdog summary" in message for message in log_messages))
+
+    def test_watch_once_logs_summary_after_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = stremio_vpn.GluetunGuard(
+                make_config(tmp_path, watchdog_log_interval_seconds=5),
+                runner,
+            )
+            guard.last_public_ip = "203.0.113.20"
+            guard.summary_started_at = 10.0
+
+            with (
+                mock.patch.object(stremio_vpn.time, "monotonic", return_value=16.0),
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "log") as log_mock,
+            ):
+                guard.watch_once(auto_start=True)
+
+            log_messages = [call.args[0] for call in log_mock.call_args_list]
+            self.assertTrue(any("Watchdog summary" in message for message in log_messages))
+            self.assertEqual(guard.checks_since_summary, 0)
+            self.assertEqual(guard.summary_started_at, 16.0)
+
     def test_wait_for_gluetun_healthy_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
@@ -402,6 +445,42 @@ class StreamioInitHelpersTests(unittest.TestCase):
 
             self.assertIn("VPN_SERVICE_PROVIDER=nordvpn", content)
             self.assertIn("WIREGUARD_PRIVATE_KEY=fallback-key", content)
+
+    def test_write_env_setting_replaces_existing_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("STREMIO_APPLY_PATCHES=1\nTZ=America/Chicago\n", encoding="utf-8")
+
+            streamio.write_env_setting(env, "STREMIO_APPLY_PATCHES", "0")
+
+            content = env.read_text(encoding="utf-8")
+            self.assertIn("STREMIO_APPLY_PATCHES=0", content)
+            self.assertIn("TZ=America/Chicago", content)
+
+    def test_env_file_value_reads_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("STREMIO_SKIP_HW_PROBE=0\n", encoding="utf-8")
+
+            self.assertEqual(streamio.env_file_value(env, "STREMIO_SKIP_HW_PROBE"), "0")
+
+    def test_env_flag_enabled_uses_default_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+
+            self.assertTrue(streamio.env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env))
+            self.assertFalse(
+                streamio.env_flag_enabled("STREMIO_APPLY_PATCHES", False, env_path=env)
+            )
+
+    def test_env_flag_enabled_reads_falsey_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("STREMIO_APPLY_PATCHES=0\n", encoding="utf-8")
+
+            self.assertFalse(
+                streamio.env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env)
+            )
 
 
 if __name__ == "__main__":

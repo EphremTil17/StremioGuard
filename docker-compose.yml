@@ -9,19 +9,29 @@ services:
       - /dev/net/tun:/dev/net/tun
     env_file: .env
     ports:
-      - "6776:8080"
       - "11470:11470"
     volumes:
       - ./gluetun-data:/gluetun
 
   stremio:
-    image: tsaridas/stremio-docker:latest
+    build:
+      context: .
+      dockerfile: docker/stremio/Dockerfile
+      args:
+        STREMIO_APPLY_PATCHES: ${STREMIO_APPLY_PATCHES:-1}
+    image: streamio-stremio:local
     container_name: stremio-server
     restart: "no"
     shm_size: "2gb"
     environment:
       - NO_CORS=1
       - AUTO_SERVER_URL=1
+      - CASTING_DISABLED=${CASTING_DISABLED:-}
+      - FFMPEG_BIN=/usr/bin/ffmpeg
+      - FFPROBE_BIN=/usr/bin/ffprobe
+      - STREMIO_SKIP_HW_PROBE=${STREMIO_SKIP_HW_PROBE:-1}
+      - EXTERNAL_BASE_URL=${EXTERNAL_BASE_URL:-https://streamio.ephremst.com}
+      - INTERNAL_MEDIA_BASE_URL=${INTERNAL_MEDIA_BASE_URL:-http://127.0.0.1:11470}
     volumes:
       - ./stremio-data:/root/.stremio-server
     network_mode: "service:gluetun"
