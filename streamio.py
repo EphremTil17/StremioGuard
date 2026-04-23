@@ -33,6 +33,7 @@ ENV_FILE = ROOT_DIR / ".env"
 ENV_EXAMPLE = ROOT_DIR / ".env.example"
 WIREGUARD_KEY_PLACEHOLDER = "<paste-key-here>"
 WIREGUARD_KEY_LINE = re.compile(r"^WIREGUARD_PRIVATE_KEY=.*$", re.MULTILINE)
+ENV_LINE_TEMPLATE = r"^{key}=.*$"
 
 logger.remove()
 logger.add(
@@ -229,13 +230,90 @@ def env_needs_init(env_path: Path = ENV_FILE) -> bool:
 
 def write_wireguard_key(env_path: Path, key: str) -> None:
     """Replace WIREGUARD_PRIVATE_KEY=... in env_path with the given key."""
+    write_env_setting(env_path, "WIREGUARD_PRIVATE_KEY", key)
+
+
+def write_env_setting(env_path: Path, key: str, value: str) -> None:
+    """Replace KEY=... in env_path with the given value, or append it if missing."""
     content = env_path.read_text(encoding="utf-8")
-    new_line = f"WIREGUARD_PRIVATE_KEY={key}"
-    if WIREGUARD_KEY_LINE.search(content):
-        content = WIREGUARD_KEY_LINE.sub(new_line, content, count=1)
+    pattern = re.compile(ENV_LINE_TEMPLATE.format(key=re.escape(key)), re.MULTILINE)
+    new_line = f"{key}={value}"
+    if pattern.search(content):
+        content = pattern.sub(new_line, content, count=1)
     else:
         content = content.rstrip("\n") + f"\n{new_line}\n"
     env_path.write_text(content, encoding="utf-8")
+
+
+def env_file_value(env_path: Path, key: str) -> str | None:
+    if not env_path.exists():
+        return None
+    pattern = re.compile(ENV_LINE_TEMPLATE.format(key=re.escape(key)), re.MULTILINE)
+    match = pattern.search(env_path.read_text(encoding="utf-8"))
+    if not match:
+        return None
+    return match.group(0).split("=", 1)[1].strip()
+
+
+def env_flag_enabled(key: str, default: bool, *, env_path: Path = ENV_FILE) -> bool:
+    value = env_file_value(env_path, key)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _prompt_yes_no(message: str, *, default: bool) -> bool:
+    return typer.confirm(message, default=default)
+
+
+def _configure_optional_stremio_settings(env_path: Path) -> None:
+    logger.info("Optional Stremio tweaks:")
+    apply_patches = _prompt_yes_no(
+        "Enable the Streamio compatibility patch bundle?",
+        default=True,
+    )
+    write_env_setting(env_path, "STREMIO_APPLY_PATCHES", "1" if apply_patches else "0")
+    if not apply_patches:
+        logger.warning(
+            "Compatibility patch bundle disabled. This restores upstream behavior and may "
+            "break HTTPS reverse-proxy redirects, internal self-probe rewriting, and the "
+            "casting endpoint stub."
+        )
+
+    skip_hw_probe = _prompt_yes_no(
+        "Skip repeated hardware probe checks to keep reconnect logs quieter?",
+        default=True,
+    )
+    write_env_setting(env_path, "STREMIO_SKIP_HW_PROBE", "1" if skip_hw_probe else "0")
+    if skip_hw_probe:
+        logger.info("Hardware probe skip enabled for quieter /device-info reconnect logs.")
+    elif apply_patches:
+        logger.warning(
+            "Hardware probe skip disabled. Stremio may re-run qsv/nvenc/vaapi checks on "
+            "reconnect and produce noisy logs."
+        )
+    else:
+        logger.warning(
+            "Hardware probe skip disabled and compatibility patches are off, so upstream "
+            "hardware probing behavior will be used in full."
+        )
+
+
+def _warn_for_optional_stremio_settings() -> None:
+    patches_enabled = env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=ENV_FILE)
+    skip_hw_probe_enabled = env_flag_enabled("STREMIO_SKIP_HW_PROBE", True, env_path=ENV_FILE)
+
+    if not patches_enabled:
+        logger.warning(
+            "STREMIO_APPLY_PATCHES=0. Running the upstream Stremio image behavior without "
+            "the local compatibility fixes. Use `./streamio restart` after changing this "
+            "setting so Docker rebuilds the image."
+        )
+    elif not skip_hw_probe_enabled:
+        logger.warning(
+            "STREMIO_SKIP_HW_PROBE=0. /device-info may re-run hardware probe checks and "
+            "add noisy reconnect logs."
+        )
 
 
 def is_interactive() -> bool:
@@ -375,6 +453,8 @@ def init() -> None:
         return
 
     untouched_template = ENV_EXAMPLE.exists() and ENV_FILE.read_bytes() == ENV_EXAMPLE.read_bytes()
+    if untouched_template:
+        _configure_optional_stremio_settings(ENV_FILE)
     provider = _prompt_provider() if untouched_template else _read_env_provider(ENV_FILE)
     if provider == "nordvpn":
         logger.info("WIREGUARD_PRIVATE_KEY is unpopulated. Walking through extraction.")
@@ -391,6 +471,7 @@ def init() -> None:
 @APP.command()
 def start() -> None:
     """Initialize if needed, start Stremio, and launch the watchdog."""
+    _warn_for_optional_stremio_settings()
     context = RunContext.create()
     run_guard("start", context=context)
     start_watchdog(context)
@@ -399,6 +480,7 @@ def start() -> None:
 @APP.command()
 def restart() -> None:
     """Reset/build/start Stremio and relaunch the watchdog."""
+    _warn_for_optional_stremio_settings()
     context = RunContext.create()
     stop_watchdog()
     run_guard("reset", context=context)

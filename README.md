@@ -31,7 +31,7 @@ Run the guided initializer:
 ./streamio init
 ```
 
-This creates `.env` from `.env.example` if needed, drives `nordvpn set technology nordlynx && nordvpn connect`, captures the WireGuard private key via `sudo wg show nordlynx private-key` (sudo prompts on the TTY), runs `nordvpn disconnect`, writes the key into `.env`, and chains into `./streamio start`. Re-running `init` is idempotent: a populated `WIREGUARD_PRIVATE_KEY` skips the extraction step.
+This creates `.env` from `.env.example` if needed, offers a couple of optional Stremio toggles up front, drives `nordvpn set technology nordlynx && nordvpn connect`, captures the WireGuard private key via `sudo wg show nordlynx private-key` (sudo prompts on the TTY), runs `nordvpn disconnect`, writes the key into `.env`, and chains into `./streamio start`. Re-running `init` is idempotent: a populated `WIREGUARD_PRIVATE_KEY` skips the extraction step.
 
 Prerequisites the initializer does **not** install for you:
 
@@ -89,19 +89,26 @@ Use the root wrapper as the normal entry point:
 ./streamio
 ```
 
-With no arguments, `./streamio` behaves like `./streamio start`. It:
+With no arguments, `./streamio` behaves like `./streamio start`.
 
-1. checks that `uv`, `docker`, and `docker compose` are available;
-2. confirms `.env` exists;
-3. brings up the `gluetun` container and waits for its healthcheck to report healthy;
-4. probes the public IP from inside gluetun's network namespace and refuses to start if it matches the home-IP baseline or `EXPECTED_VPN_IP` mismatches;
-5. detects an empty Compose instance and runs first-time setup automatically;
-6. starts Stremio (which inherits gluetun's network namespace);
-7. launches a background watchdog and returns to the shell.
+### What `./streamio` does
 
-The Stremio service uses `restart: "no"` so Docker does not revive it before the verifier has run. Gluetun uses `restart: unless-stopped` so it auto-recovers across host reboots and transient handshake failures.
+1. Checks that `uv`, `docker`, and `docker compose` are available.
+2. Confirms `.env` exists and is populated.
+3. Starts `gluetun` and waits for its healthcheck to pass.
+4. Probes the public IP from inside gluetun's network namespace.
+5. Refuses to continue if the VPN looks unsafe:
+   - the IP matches your saved home-IP baseline, or
+   - `EXPECTED_VPN_IP` is set and does not match.
+6. Starts Stremio inside gluetun's network namespace.
+7. Launches the background watchdog and returns to the shell.
 
-Useful commands:
+### Container restart policy
+
+- `stremio` uses `restart: "no"` so Docker does not revive it before the verifier has run.
+- `gluetun` uses `restart: unless-stopped` so it can recover across host reboots and transient handshake failures.
+
+### Useful commands
 
 ```bash
 ./streamio init
@@ -113,17 +120,69 @@ Useful commands:
 ./streamio check
 ```
 
-`restart` is the reset/build/start flow. It runs `docker compose down --remove-orphans`, brings gluetun back up, then `docker compose build stremio` and `docker compose up -d stremio`. It does not delete `stremio-data/` or `gluetun-data/`.
+Command guide:
 
-`start` initializes automatically if no Compose instance exists, starts Stremio, launches the watchdog in the background, and returns to the shell.
+- `./streamio init`
+  Guided first-time setup. Creates `.env` from `.env.example` when needed, collects optional Stremio settings, extracts the NordVPN WireGuard key, writes it into `.env`, and then starts the stack.
 
-Each `./streamio start` creates a host-side run log under `logs/`, named like `logs/streamio-20260424-221500.log`. The startup command and background watchdog share that file, so one run captures gluetun health checks, public IP observations, container lifecycle events, drops, and watchdog ticks. Use `./streamio logs` to tail the latest run log. The background watchdog writes its PID to `.streamio/watchdog.pid`. `./streamio stop` stops the watchdog before stopping Stremio so it will not immediately restart the container.
+- `./streamio start`
+  Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then launches the watchdog in the background and returns to the shell.
 
-The watchdog polls gluetun health and the egress IP every 10 seconds by default. Tune with `WATCH_INTERVAL_SECONDS=5 ./streamio start` for faster checks, or a larger value for less polling. After changing the interval, restart with `./streamio stop` and `./streamio start`.
+- `./streamio restart`
+  Reset/build/start flow. Runs `docker compose down --remove-orphans`, brings gluetun back up, rebuilds the local Stremio image, and starts Stremio again. It does not delete `stremio-data/` or `gluetun-data/`.
 
-On a bad signal — gluetun unhealthy or egress IP unsafe — the watchdog fails closed: it stops Stremio and waits for the next tick. There is no manual reconnect loop, because gluetun's `restart: unless-stopped` policy reconnects WireGuard on its own; the watchdog simply re-checks each tick and starts Stremio back up once gluetun reports healthy and the IP check passes again.
+- `./streamio stop`
+  Stops the watchdog first, then stops Stremio, so the background guard does not immediately start it back up again.
 
-The wrapper runs the Python guard through `uv`, so Typer, Loguru, and the rest of the Python environment come from `uv.lock` instead of global `pip` packages. It performs best-effort dependency setup on apt-based WSL systems and can attempt to install `uv` and Docker if missing. Set `INSTALL_MISSING_DEPS=0` to disable automatic package installation attempts.
+- `./streamio status`
+  Shows gluetun health, the current public IP as seen from inside gluetun, and the Stremio container status.
+
+- `./streamio logs`
+  Tails the latest host-side run log.
+
+- `./streamio check`
+  Runs the local development checks for the Python tooling in this repo.
+
+### Logging and watchdog behavior
+
+Each `./streamio start` creates a host-side run log under `logs/`, named like `logs/streamio-20260424-221500.log`. The startup command and background watchdog share that file, so one run captures gluetun health checks, public IP observations, container lifecycle events, drops, and periodic watchdog summaries.
+
+Use `./streamio logs` to tail the latest run log. The background watchdog writes its PID to `.streamio/watchdog.pid`. `./streamio stop` stops the watchdog before stopping Stremio so it will not immediately restart the container.
+
+The watchdog polls gluetun health and the egress IP every 10 seconds by default. Tune with `WATCH_INTERVAL_SECONDS=5 ./streamio start` for faster checks, or a larger value for less polling.
+
+Log summaries are decoupled from the poll cadence and default to every 5 minutes. Tune them with `WATCHDOG_LOG_INTERVAL_SECONDS=300 ./streamio start`. After changing either interval, restart with `./streamio stop` and `./streamio start`.
+
+On a bad signal, the watchdog fails closed:
+
+- gluetun unhealthy
+- public IP check unsafe
+
+In either case, it stops Stremio and waits for the next tick. There is no manual reconnect loop: gluetun's `restart: unless-stopped` policy reconnects WireGuard on its own, and the watchdog starts Stremio again once gluetun reports healthy and the IP check passes.
+
+### Stremio patch layer
+
+The local Stremio image is built from `tsaridas/stremio-docker:latest` with a small patch layer.
+
+- `STREMIO_APPLY_PATCHES=1`
+  Keeps the compatibility fixes enabled. Turning it off restores upstream image behavior and removes the HTTPS redirect fix, local self-probe rewrite, favicon guard, and `/casting` stub.
+
+- `STREMIO_SKIP_HW_PROBE=1`
+  Prevents repeated `/device-info` requests from re-running noisy `qsv`, `nvenc`, and `vaapi` self-tests on every reconnect.
+
+- `EXTERNAL_BASE_URL=https://your-public-domain`
+  Keeps browser redirects and client-facing links on your public HTTPS origin.
+
+- `INTERNAL_MEDIA_BASE_URL=http://127.0.0.1:11470`
+  Keeps ffprobe and HLS self-references on loopback instead of probing back out through Cloudflare or another reverse proxy.
+
+If you change `STREMIO_APPLY_PATCHES` after the image has already been built, run `./streamio restart` so Docker rebuilds the image with the new build arg.
+
+### Python runtime
+
+The wrapper runs the Python guard through `uv`, so Typer, Loguru, and the rest of the Python environment come from `uv.lock` instead of global `pip` packages.
+
+It performs best-effort dependency setup on apt-based WSL systems and can attempt to install `uv` and Docker if missing. Set `INSTALL_MISSING_DEPS=0` to disable automatic package installation attempts.
 
 ## Leak baseline
 

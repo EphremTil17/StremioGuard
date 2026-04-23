@@ -83,6 +83,7 @@ class Config:
     gluetun_container_name: str
     gluetun_healthy_timeout_seconds: int
     watch_interval_seconds: int
+    watchdog_log_interval_seconds: int
     public_ip_timeout_seconds: int
     home_ip_file: Path
     expected_vpn_ip: str | None
@@ -107,6 +108,9 @@ class Config:
                 os.environ.get("GLUETUN_HEALTHY_TIMEOUT_SECONDS", "60")
             ),
             watch_interval_seconds=int(os.environ.get("WATCH_INTERVAL_SECONDS", "10")),
+            watchdog_log_interval_seconds=int(
+                os.environ.get("WATCHDOG_LOG_INTERVAL_SECONDS", "300")
+            ),
             public_ip_timeout_seconds=int(os.environ.get("PUBLIC_IP_TIMEOUT_SECONDS", "8")),
             home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".streamio" / "home-ip")),
             expected_vpn_ip=os.environ.get("EXPECTED_VPN_IP") or None,
@@ -130,9 +134,15 @@ class GluetunGuard:
         self.config = config
         self.runner = runner or SubprocessRunner()
         self.started_at = time.monotonic()
+        self.summary_started_at = self.started_at
         self.last_public_ip: str | None = None
         self.vpn_drop_count = 0
         self.public_ip_failure_count = 0
+        self.checks_since_summary = 0
+        self.auto_starts_since_summary = 0
+        self.container_missing_since_summary = 0
+        self.vpn_drops_since_summary = 0
+        self.public_ip_failures_since_summary = 0
         if self.config.log_session:
             self.log_session_start()
 
@@ -146,7 +156,8 @@ class GluetunGuard:
             f"service={self.config.service_name} "
             f"container={self.config.container_name} "
             f"gluetun_container={self.config.gluetun_container_name} "
-            f"watch_interval_seconds={self.config.watch_interval_seconds}"
+            f"watch_interval_seconds={self.config.watch_interval_seconds} "
+            f"watchdog_log_interval_seconds={self.config.watchdog_log_interval_seconds}"
         )
 
     def log(self, message: str) -> None:
@@ -276,20 +287,23 @@ class GluetunGuard:
                     return ip
         return None
 
-    def public_ip_safe(self) -> bool:
+    def public_ip_safe(self, *, log_observation: bool = False) -> bool:
         ip = self.public_ip_via_gluetun()
         if not ip:
             self.public_ip_failure_count += 1
+            self.public_ip_failures_since_summary += 1
             self.warn("Could not determine public IP via gluetun.")
             return False
 
-        self.log(f"Observed public IP: {ip}")
-        if self.last_public_ip and self.last_public_ip != ip:
+        if log_observation:
+            self.log(f"Observed public IP: {ip}")
+        elif self.last_public_ip and self.last_public_ip != ip:
             self.log(f"Public IP changed from {self.last_public_ip} to {ip}.")
         self.last_public_ip = ip
 
         if self.config.expected_vpn_ip and ip != self.config.expected_vpn_ip:
             self.public_ip_failure_count += 1
+            self.public_ip_failures_since_summary += 1
             self.warn(f"Public IP does not match EXPECTED_VPN_IP={self.config.expected_vpn_ip}.")
             return False
 
@@ -297,6 +311,7 @@ class GluetunGuard:
             home_ip = self.config.home_ip_file.read_text(encoding="utf-8").strip()
             if home_ip and ip == home_ip:
                 self.public_ip_failure_count += 1
+                self.public_ip_failures_since_summary += 1
                 self.warn(f"Public IP matches saved home IP baseline ({home_ip}); possible leak.")
                 return False
 
@@ -314,7 +329,7 @@ class GluetunGuard:
         self.log(f"Ensuring {self.config.gluetun_container_name} is running.")
         self.compose("up", "-d", self.config.gluetun_container_name, capture=False)
         self.wait_for_gluetun_healthy()
-        if not self.public_ip_safe():
+        if not self.public_ip_safe(log_observation=True):
             raise RuntimeError("Public IP check failed via gluetun; refusing to start Stremio.")
 
     def ensure_data_dir(self) -> None:
@@ -396,29 +411,55 @@ class GluetunGuard:
             time.sleep(self.config.watch_interval_seconds)
 
     def watch_once(self, *, auto_start: bool = False) -> None:
+        self.checks_since_summary += 1
         if not self.gluetun_healthy():
             self.warn("Gluetun is not healthy. Stopping Stremio.")
             self.vpn_drop_count += 1
+            self.vpn_drops_since_summary += 1
             self.stop_stremio()
+            self.maybe_log_watchdog_summary()
             return
 
         if not self.public_ip_safe():
             self.warn("Public IP check failed. Stopping Stremio.")
             self.stop_stremio()
+            self.maybe_log_watchdog_summary()
             return
 
         if auto_start and not self.container_running():
             self.log("Gluetun healthy; starting Stremio.")
+            self.auto_starts_since_summary += 1
             self.compose("up", "-d", self.config.service_name, capture=False)
         elif not self.container_running():
             self.warn("Gluetun healthy but Stremio is not running.")
-        else:
-            self.log(
-                "Watchdog health check passed "
-                f"uptime_seconds={self.elapsed_seconds()} "
-                f"vpn_drops={self.vpn_drop_count} "
-                f"public_ip_failures={self.public_ip_failure_count}"
-            )
+            self.container_missing_since_summary += 1
+
+        self.maybe_log_watchdog_summary()
+
+    def maybe_log_watchdog_summary(self) -> None:
+        now = time.monotonic()
+        interval = self.config.watchdog_log_interval_seconds
+        if interval > 0 and now - self.summary_started_at < interval:
+            return
+
+        summary_seconds = int(now - self.summary_started_at)
+        self.log(
+            "Watchdog summary "
+            f"window_seconds={summary_seconds} "
+            f"checks={self.checks_since_summary} "
+            f"last_public_ip={self.last_public_ip or 'unavailable'} "
+            f"auto_starts={self.auto_starts_since_summary} "
+            f"container_missing={self.container_missing_since_summary} "
+            f"vpn_drops={self.vpn_drops_since_summary} "
+            f"public_ip_failures={self.public_ip_failures_since_summary} "
+            f"uptime_seconds={self.elapsed_seconds()}"
+        )
+        self.summary_started_at = now
+        self.checks_since_summary = 0
+        self.auto_starts_since_summary = 0
+        self.container_missing_since_summary = 0
+        self.vpn_drops_since_summary = 0
+        self.public_ip_failures_since_summary = 0
 
     def show_status(self) -> None:
         self.require_commands()
