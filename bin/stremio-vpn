@@ -35,7 +35,7 @@ def parse_public_ip(text: str) -> str | None:
 app = typer.Typer(help="Guard Stremio behind the gluetun VPN container.", no_args_is_help=True)
 
 logger.remove()
-if os.environ.get("STREAMIO_BACKGROUND") != "1":
+if os.environ.get("STREMIO_BACKGROUND") != "1":
     logger.add(
         sys.stdout,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | "
@@ -96,8 +96,8 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         root_dir = Path(__file__).resolve().parent.parent
-        run_id = os.environ.get("STREAMIO_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_file = os.environ.get("STREAMIO_LOG_FILE")
+        run_id = os.environ.get("STREMIO_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_file = os.environ.get("STREMIO_LOG_FILE")
         return cls(
             root_dir=root_dir,
             compose_file=Path(os.environ.get("COMPOSE_FILE", root_dir / "docker-compose.yml")),
@@ -112,12 +112,12 @@ class Config:
                 os.environ.get("WATCHDOG_LOG_INTERVAL_SECONDS", "300")
             ),
             public_ip_timeout_seconds=int(os.environ.get("PUBLIC_IP_TIMEOUT_SECONDS", "8")),
-            home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".streamio" / "home-ip")),
+            home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".stremio" / "home-ip")),
             expected_vpn_ip=os.environ.get("EXPECTED_VPN_IP") or None,
             install_missing=os.environ.get("INSTALL_MISSING_DEPS", "0") in {"1", "true", "yes"},
             run_id=run_id,
             log_file=Path(log_file) if log_file else None,
-            log_session=os.environ.get("STREAMIO_LOG_SESSION", "1") != "0",
+            log_session=os.environ.get("STREMIO_LOG_SESSION", "1") != "0",
             ip_check_urls=tuple(
                 url.strip()
                 for url in os.environ.get(
@@ -322,7 +322,7 @@ class GluetunGuard:
         env_file = self.config.root_dir / ".env"
         if not env_file.exists():
             raise RuntimeError(
-                f".env not found at {env_file}. Run `./streamio init` for guided "
+                f".env not found at {env_file}. Run `./stremio init` for guided "
                 "first-time setup, or copy .env.example to .env and populate "
                 "WIREGUARD_PRIVATE_KEY manually (see README.md → First-time setup)."
             )

@@ -19,7 +19,7 @@ services:
       dockerfile: docker/stremio/Dockerfile
       args:
         STREMIO_APPLY_PATCHES: ${STREMIO_APPLY_PATCHES:-1}
-    image: streamio-stremio:local
+    image: stremioguard-stremio:local
     container_name: stremio-server
     restart: "no"
     shm_size: "2gb"
@@ -30,7 +30,7 @@ services:
       - FFMPEG_BIN=/usr/bin/ffmpeg
       - FFPROBE_BIN=/usr/bin/ffprobe
       - STREMIO_SKIP_HW_PROBE=${STREMIO_SKIP_HW_PROBE:-1}
-      - EXTERNAL_BASE_URL=${EXTERNAL_BASE_URL:-https://streamio.ephremst.com}
+      - EXTERNAL_BASE_URL=${EXTERNAL_BASE_URL:-https://stremio.example.com}
       - INTERNAL_MEDIA_BASE_URL=${INTERNAL_MEDIA_BASE_URL:-http://127.0.0.1:11470}
     volumes:
       - ./stremio-data:/root/.stremio-server

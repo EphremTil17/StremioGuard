@@ -1,16 +1,29 @@
 #!/usr/bin/env node
 
+// Patches against the bundled, minified server.js shipped inside
+// tsaridas/stremio-docker. Anchors are literal substrings of webpack output,
+// so they are sensitive to upstream rebuilds. The base image is pinned by
+// digest in Dockerfile to keep these stable; bumping the digest may require
+// re-deriving anchors.
+//
+// Patches are split into two tiers with different failure semantics:
+//
+//   ESSENTIAL — required for playback through the external proxy. A missing
+//   anchor here is a hard build failure: shipping without these silently
+//   breaks mobile playback (mediaURL self-fetch loop, redirect host mismatch).
+//
+//   COSMETIC — UX polish only (log noise, favicon 404s, casting nag). A
+//   missing anchor here logs a warning and continues. Worst case after
+//   upstream drift: noisier logs / casting nag returns until anchors are
+//   refreshed. Playback is unaffected.
+
 const fs = require("fs");
 
 const path = "/srv/stremio-server/server.js";
 let source = fs.readFileSync(path, "utf8");
 
-const replacements = [
-  {
-    name: "skip noisy hardware probe",
-    from: "hwAccelProfiler(port, onHardwareAcceleration);",
-    to: "if (process.env.STREMIO_SKIP_HW_PROBE) { onHardwareAcceleration([]); } else { hwAccelProfiler(port, onHardwareAcceleration); }",
-  },
+// --- ESSENTIAL: load-bearing for playback through external proxy ---------
+const ESSENTIAL_PATCHES = [
   {
     name: "inject media url normalizer",
     from: "const router = new Router, converters = new Map;",
@@ -35,6 +48,15 @@ const replacements = [
     name: "force external streaming server url on redirect",
     from: 'var serverUrl = encodeURIComponent(protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
     to: 'var configuredServerUrl = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, ""), serverUrl = encodeURIComponent(configuredServerUrl || protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
+  },
+];
+
+// --- COSMETIC: UX polish, safe to drop on upstream drift ------------------
+const COSMETIC_PATCHES = [
+  {
+    name: "skip noisy hardware probe",
+    from: "hwAccelProfiler(port, onHardwareAcceleration);",
+    to: "if (process.env.STREMIO_SKIP_HW_PROBE) { onHardwareAcceleration([]); } else { hwAccelProfiler(port, onHardwareAcceleration); }",
   },
   {
     name: "ignore favicon path lookups",
@@ -61,11 +83,19 @@ const replacements = [
   },
 ];
 
-for (const replacement of replacements) {
-  if (!source.includes(replacement.from)) {
-    throw new Error(`Patch anchor not found: ${replacement.name}`);
+function applyPatch(patch, { required }) {
+  if (!source.includes(patch.from)) {
+    const msg = `Patch anchor not found: ${patch.name}`;
+    if (required) {
+      throw new Error(msg);
+    }
+    console.warn(`[patch-server] WARN: ${msg} (cosmetic, skipping)`);
+    return;
   }
-  source = source.replace(replacement.from, replacement.to);
+  source = source.replace(patch.from, patch.to);
 }
+
+for (const patch of ESSENTIAL_PATCHES) applyPatch(patch, { required: true });
+for (const patch of COSMETIC_PATCHES) applyPatch(patch, { required: false });
 
 fs.writeFileSync(path, source);

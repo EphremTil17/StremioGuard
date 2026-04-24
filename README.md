@@ -1,4 +1,4 @@
-# Streamio VPN Guard
+# Stremio VPN Guard
 
 This folder runs Stremio through Docker Compose, behind a [gluetun](https://github.com/qdm12/gluetun) container that owns the network namespace Stremio runs inside. A small Python verifier sits on top as a defense-in-depth watchdog.
 
@@ -28,10 +28,10 @@ The default `.env.example` ships with **NordVPN WireGuard** (NordLynx). Switchin
 Run the guided initializer:
 
 ```bash
-./streamio init
+./stremio init
 ```
 
-This creates `.env` from `.env.example` if needed, offers a couple of optional Stremio toggles up front, drives `nordvpn set technology nordlynx && nordvpn connect`, captures the WireGuard private key via `sudo wg show nordlynx private-key` (sudo prompts on the TTY), runs `nordvpn disconnect`, writes the key into `.env`, and chains into `./streamio start`. Re-running `init` is idempotent: a populated `WIREGUARD_PRIVATE_KEY` skips the extraction step.
+This creates `.env` from `.env.example` if needed, offers a couple of optional Stremio toggles up front, drives `nordvpn set technology nordlynx && nordvpn connect`, captures the WireGuard private key via `sudo wg show nordlynx private-key` (sudo prompts on the TTY), runs `nordvpn disconnect`, writes the key into `.env`, and chains into `./stremio start`. Re-running `init` is idempotent: a populated `WIREGUARD_PRIVATE_KEY` skips the extraction step.
 
 Prerequisites the initializer does **not** install for you:
 
@@ -61,7 +61,7 @@ Paste the printed key into `.env` as `WIREGUARD_PRIVATE_KEY=...`.
 From this directory:
 
 ```bash
-./streamio
+./stremio
 ```
 
 The wrapper runs the Python orchestrator through `uv`, creates the project environment from `uv.lock`, ensures `gluetun` is healthy, verifies the egress IP, starts Stremio, and launches the background watchdog.
@@ -76,9 +76,9 @@ Minimum host requirements:
 Useful first-run checks:
 
 ```bash
-./streamio status
-./streamio logs
-./streamio stop
+./stremio status
+./stremio logs
+./stremio stop
 ```
 
 ## Recommended workflow
@@ -86,12 +86,12 @@ Useful first-run checks:
 Use the root wrapper as the normal entry point:
 
 ```bash
-./streamio
+./stremio
 ```
 
-With no arguments, `./streamio` behaves like `./streamio start`.
+With no arguments, `./stremio` behaves like `./stremio start`.
 
-### What `./streamio` does
+### What `./stremio` does
 
 1. Checks that `uv`, `docker`, and `docker compose` are available.
 2. Confirms `.env` exists and is populated.
@@ -111,47 +111,47 @@ With no arguments, `./streamio` behaves like `./streamio start`.
 ### Useful commands
 
 ```bash
-./streamio init
-./streamio start
-./streamio restart
-./streamio stop
-./streamio status
-./streamio logs
-./streamio check
+./stremio init
+./stremio start
+./stremio restart
+./stremio stop
+./stremio status
+./stremio logs
+./stremio check
 ```
 
 Command guide:
 
-- `./streamio init`
+- `./stremio init`
   Guided first-time setup. Creates `.env` from `.env.example` when needed, collects optional Stremio settings, extracts the NordVPN WireGuard key, writes it into `.env`, and then starts the stack.
 
-- `./streamio start`
+- `./stremio start`
   Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then launches the watchdog in the background and returns to the shell.
 
-- `./streamio restart`
+- `./stremio restart`
   Reset/build/start flow. Runs `docker compose down --remove-orphans`, brings gluetun back up, rebuilds the local Stremio image, and starts Stremio again. It does not delete `stremio-data/` or `gluetun-data/`.
 
-- `./streamio stop`
+- `./stremio stop`
   Stops the watchdog first, then stops Stremio, so the background guard does not immediately start it back up again.
 
-- `./streamio status`
+- `./stremio status`
   Shows gluetun health, the current public IP as seen from inside gluetun, and the Stremio container status.
 
-- `./streamio logs`
+- `./stremio logs`
   Tails the latest host-side run log.
 
-- `./streamio check`
+- `./stremio check`
   Runs the local development checks for the Python tooling in this repo.
 
 ### Logging and watchdog behavior
 
-Each `./streamio start` creates a host-side run log under `logs/`, named like `logs/streamio-20260424-221500.log`. The startup command and background watchdog share that file, so one run captures gluetun health checks, public IP observations, container lifecycle events, drops, and periodic watchdog summaries.
+Each `./stremio start` creates a host-side run log under `logs/`, named like `logs/stremio-20260424-221500.log`. The startup command and background watchdog share that file, so one run captures gluetun health checks, public IP observations, container lifecycle events, drops, and periodic watchdog summaries.
 
-Use `./streamio logs` to tail the latest run log. The background watchdog writes its PID to `.streamio/watchdog.pid`. `./streamio stop` stops the watchdog before stopping Stremio so it will not immediately restart the container.
+Use `./stremio logs` to tail the latest run log. The background watchdog writes its PID to `.stremio/watchdog.pid`. `./stremio stop` stops the watchdog before stopping Stremio so it will not immediately restart the container.
 
-The watchdog polls gluetun health and the egress IP every 10 seconds by default. Tune with `WATCH_INTERVAL_SECONDS=5 ./streamio start` for faster checks, or a larger value for less polling.
+The watchdog polls gluetun health and the egress IP every 10 seconds by default. Tune with `WATCH_INTERVAL_SECONDS=5 ./stremio start` for faster checks, or a larger value for less polling.
 
-Log summaries are decoupled from the poll cadence and default to every 5 minutes. Tune them with `WATCHDOG_LOG_INTERVAL_SECONDS=300 ./streamio start`. After changing either interval, restart with `./streamio stop` and `./streamio start`.
+Log summaries are decoupled from the poll cadence and default to every 5 minutes. Tune them with `WATCHDOG_LOG_INTERVAL_SECONDS=300 ./stremio start`. After changing either interval, restart with `./stremio stop` and `./stremio start`.
 
 On a bad signal, the watchdog fails closed:
 
@@ -162,7 +162,7 @@ In either case, it stops Stremio and waits for the next tick. There is no manual
 
 ### Stremio patch layer
 
-The local Stremio image is built from `tsaridas/stremio-docker:latest` with a small patch layer.
+The local Stremio image is built from a digest-pinned `tsaridas/stremio-docker` base image with a small patch layer.
 
 - `STREMIO_APPLY_PATCHES=1`
   Keeps the compatibility fixes enabled. Turning it off restores upstream image behavior and removes the HTTPS redirect fix, local self-probe rewrite, favicon guard, and `/casting` stub.
@@ -176,7 +176,7 @@ The local Stremio image is built from `tsaridas/stremio-docker:latest` with a sm
 - `INTERNAL_MEDIA_BASE_URL=http://127.0.0.1:11470`
   Keeps ffprobe and HLS self-references on loopback instead of probing back out through Cloudflare or another reverse proxy.
 
-If you change `STREMIO_APPLY_PATCHES` after the image has already been built, run `./streamio restart` so Docker rebuilds the image with the new build arg.
+If you change `STREMIO_APPLY_PATCHES` after the image has already been built, run `./stremio restart` so Docker rebuilds the image with the new build arg.
 
 ### Python runtime
 
@@ -189,20 +189,20 @@ It performs best-effort dependency setup on apt-based WSL systems and can attemp
 For an extra check, while gluetun is stopped (or has not been brought up yet) and you are on your normal home connection, run:
 
 ```bash
-./streamio record-home-ip
+./stremio record-home-ip
 ```
 
-This saves your non-VPN public IP to `.streamio/home-ip`. Later, the guard refuses to run Stremio if the egress IP observed via gluetun matches that baseline. The command refuses to run while gluetun is healthy, since that would record a VPN IP as home.
+This saves your non-VPN public IP to `.stremio/home-ip`. Later, the guard refuses to run Stremio if the egress IP observed via gluetun matches that baseline. The command refuses to run while gluetun is healthy, since that would record a VPN IP as home.
 
 If your VPN endpoint has a stable IP, you can make the check stricter:
 
 ```bash
-EXPECTED_VPN_IP=1.2.3.4 ./streamio start
+EXPECTED_VPN_IP=1.2.3.4 ./stremio start
 ```
 
 ## Start automatically
 
-The included user service can make this feel native. It assumes the repo lives at `~/projects/streamio` (uses systemd's `%h` substitution); if it lives elsewhere, edit `WorkingDirectory` and `ExecStart` paths in the copied unit before enabling.
+The included user service can make this feel native. It assumes the repo lives at `~/projects/stremio` (uses systemd's `%h` substitution); if it lives elsewhere, edit `WorkingDirectory` and `ExecStart` paths in the copied unit before enabling.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -227,7 +227,7 @@ uv run pytest
 uv run ruff check
 uv run ruff format --check
 uv run pyright
-./streamio check
+./stremio check
 ```
 
 ## Security notes
