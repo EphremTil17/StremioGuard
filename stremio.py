@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Public Streamio orchestration CLI."""
+"""Public Stremio orchestration CLI."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ APP = typer.Typer(
 ROOT_DIR = Path(__file__).resolve().parent
 GUARD = ROOT_DIR / "bin" / "stremio-vpn"
 LOG_DIR = ROOT_DIR / "logs"
-STATE_DIR = ROOT_DIR / ".streamio"
+STATE_DIR = ROOT_DIR / ".stremio"
 PID_FILE = STATE_DIR / "watchdog.pid"
 UV_CACHE = ROOT_DIR / ".uv-cache"
 ENV_FILE = ROOT_DIR / ".env"
@@ -39,7 +39,7 @@ logger.remove()
 logger.add(
     sys.stdout,
     format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | "
-    "<cyan>streamio</cyan> | <level>{message}</level>",
+    "<cyan>stremio</cyan> | <level>{message}</level>",
     level="INFO",
     colorize=sys.stdout.isatty(),
 )
@@ -52,22 +52,22 @@ class RunContext:
 
     @classmethod
     def create(cls) -> RunContext:
-        run_id = os.environ.get("STREAMIO_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_file = Path(os.environ.get("STREAMIO_LOG_FILE", LOG_DIR / f"streamio-{run_id}.log"))
+        run_id = os.environ.get("STREMIO_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_file = Path(os.environ.get("STREMIO_LOG_FILE", LOG_DIR / f"stremio-{run_id}.log"))
         return cls(run_id=run_id, log_file=log_file)
 
     def env(self, *, background: bool = False, file_logging: bool = True) -> dict[str, str]:
         env = os.environ.copy()
         env.setdefault("INSTALL_MISSING_DEPS", "1")
-        env["STREAMIO_RUN_ID"] = self.run_id
+        env["STREMIO_RUN_ID"] = self.run_id
         if file_logging:
-            env["STREAMIO_LOG_FILE"] = str(self.log_file)
-            env["STREAMIO_LOG_SESSION"] = "1"
+            env["STREMIO_LOG_FILE"] = str(self.log_file)
+            env["STREMIO_LOG_SESSION"] = "1"
         else:
-            env.pop("STREAMIO_LOG_FILE", None)
-            env["STREAMIO_LOG_SESSION"] = "0"
+            env.pop("STREMIO_LOG_FILE", None)
+            env["STREMIO_LOG_SESSION"] = "0"
         if background:
-            env["STREAMIO_BACKGROUND"] = "1"
+            env["STREMIO_BACKGROUND"] = "1"
         return env
 
 
@@ -80,7 +80,7 @@ def require_uv() -> None:
     if shutil.which("uv"):
         return
     fail(
-        "uv is required to run this project. Run ./streamio, which bootstraps uv "
+        "uv is required to run this project. Run ./stremio, which bootstraps uv "
         "automatically, or install it manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
     )
 
@@ -269,7 +269,7 @@ def _prompt_yes_no(message: str, *, default: bool) -> bool:
 def _configure_optional_stremio_settings(env_path: Path) -> None:
     logger.info("Optional Stremio tweaks:")
     apply_patches = _prompt_yes_no(
-        "Enable the Streamio compatibility patch bundle?",
+        "Enable the Stremio compatibility patch bundle?",
         default=True,
     )
     write_env_setting(env_path, "STREMIO_APPLY_PATCHES", "1" if apply_patches else "0")
@@ -306,7 +306,7 @@ def _warn_for_optional_stremio_settings() -> None:
     if not patches_enabled:
         logger.warning(
             "STREMIO_APPLY_PATCHES=0. Running the upstream Stremio image behavior without "
-            "the local compatibility fixes. Use `./streamio restart` after changing this "
+            "the local compatibility fixes. Use `./stremio restart` after changing this "
             "setting so Docker rebuilds the image."
         )
     elif not skip_hw_probe_enabled:
@@ -324,7 +324,7 @@ def _check_nordvpn_ready() -> None:
     if not shutil.which("nordvpn"):
         fail(
             "nordvpn CLI not found. Install it from https://nordvpn.com/download/linux/, "
-            "then run `nordvpn login` and re-run `./streamio init`."
+            "then run `nordvpn login` and re-run `./stremio init`."
         )
     result = subprocess.run(["nordvpn", "account"], capture_output=True, text=True)
     if result.returncode != 0:
@@ -399,7 +399,7 @@ def main(ctx: typer.Context) -> None:
                 logger.info(".env not configured; running first-time setup.")
                 init()
                 return
-            fail(".env missing or WIREGUARD_PRIVATE_KEY unpopulated. Run `./streamio init`.")
+            fail(".env missing or WIREGUARD_PRIVATE_KEY unpopulated. Run `./stremio init`.")
         start()
 
 
@@ -429,7 +429,7 @@ def _print_manual_setup_pointer() -> None:
     typer.echo("     (mullvad, protonvpn, surfshark, expressvpn, etc.).")
     typer.echo("  3. Set VPN_TYPE (wireguard or openvpn) and the relevant credentials.")
     typer.echo("  4. Reference: https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers")
-    typer.echo("  5. Run `./streamio start` once .env is populated.")
+    typer.echo("  5. Run `./stremio start` once .env is populated.")
 
 
 @APP.command()
