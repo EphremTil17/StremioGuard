@@ -19,15 +19,15 @@ assert SPEC.loader
 sys.modules["stremio_vpn"] = stremio_vpn
 SPEC.loader.exec_module(stremio_vpn)
 
-STREAMIO_PATH = Path(__file__).resolve().parents[1] / "streamio.py"
-STREAMIO_LOADER = importlib.machinery.SourceFileLoader("streamio_app", str(STREAMIO_PATH))
-STREAMIO_SPEC = importlib.util.spec_from_loader("streamio_app", STREAMIO_LOADER)
-if STREAMIO_SPEC is None:
-    raise RuntimeError(f"Could not load module spec for {STREAMIO_PATH}")
-streamio = importlib.util.module_from_spec(STREAMIO_SPEC)
-assert STREAMIO_SPEC.loader
-sys.modules["streamio_app"] = streamio
-STREAMIO_SPEC.loader.exec_module(streamio)
+STREMIO_PATH = Path(__file__).resolve().parents[1] / "stremio.py"
+STREMIO_LOADER = importlib.machinery.SourceFileLoader("stremio_app", str(STREMIO_PATH))
+STREMIO_SPEC = importlib.util.spec_from_loader("stremio_app", STREMIO_LOADER)
+if STREMIO_SPEC is None:
+    raise RuntimeError(f"Could not load module spec for {STREMIO_PATH}")
+stremio_app = importlib.util.module_from_spec(STREMIO_SPEC)
+assert STREMIO_SPEC.loader
+sys.modules["stremio_app"] = stremio_app
+STREMIO_SPEC.loader.exec_module(stremio_app)
 
 
 GLUETUN_HEALTH_INSPECT = (
@@ -85,7 +85,7 @@ def completed(
 
 
 def make_config(tmp_path: Path, **overrides):
-    state_dir = tmp_path / ".streamio"
+    state_dir = tmp_path / ".stremio"
     state_dir.mkdir(parents=True, exist_ok=True)
     values = {
         "root_dir": tmp_path,
@@ -390,10 +390,10 @@ class GluetunGuardTests(unittest.TestCase):
             )
 
 
-class StreamioInitHelpersTests(unittest.TestCase):
+class StremioInitHelpersTests(unittest.TestCase):
     def test_env_needs_init_when_file_missing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            self.assertTrue(streamio.env_needs_init(Path(directory) / ".env"))
+            self.assertTrue(stremio_app.env_needs_init(Path(directory) / ".env"))
 
     def test_env_needs_init_when_placeholder_present(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -402,13 +402,13 @@ class StreamioInitHelpersTests(unittest.TestCase):
                 "VPN_SERVICE_PROVIDER=nordvpn\nWIREGUARD_PRIVATE_KEY=<paste-key-here>\n",
                 encoding="utf-8",
             )
-            self.assertTrue(streamio.env_needs_init(env))
+            self.assertTrue(stremio_app.env_needs_init(env))
 
     def test_env_needs_init_when_value_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
             env.write_text("WIREGUARD_PRIVATE_KEY=\n", encoding="utf-8")
-            self.assertTrue(streamio.env_needs_init(env))
+            self.assertTrue(stremio_app.env_needs_init(env))
 
     def test_env_needs_init_false_when_key_populated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -417,7 +417,7 @@ class StreamioInitHelpersTests(unittest.TestCase):
                 "WIREGUARD_PRIVATE_KEY=aGVsbG8td29ybGQ=\n",
                 encoding="utf-8",
             )
-            self.assertFalse(streamio.env_needs_init(env))
+            self.assertFalse(stremio_app.env_needs_init(env))
 
     def test_write_wireguard_key_replaces_line_in_place(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -428,7 +428,7 @@ class StreamioInitHelpersTests(unittest.TestCase):
                 "TZ=America/Chicago\n",
                 encoding="utf-8",
             )
-            streamio.write_wireguard_key(env, "secret-key")
+            stremio_app.write_wireguard_key(env, "secret-key")
             content = env.read_text(encoding="utf-8")
 
             self.assertIn("WIREGUARD_PRIVATE_KEY=secret-key", content)
@@ -440,7 +440,7 @@ class StreamioInitHelpersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
             env.write_text("VPN_SERVICE_PROVIDER=nordvpn\n", encoding="utf-8")
-            streamio.write_wireguard_key(env, "fallback-key")
+            stremio_app.write_wireguard_key(env, "fallback-key")
             content = env.read_text(encoding="utf-8")
 
             self.assertIn("VPN_SERVICE_PROVIDER=nordvpn", content)
@@ -451,7 +451,7 @@ class StreamioInitHelpersTests(unittest.TestCase):
             env = Path(directory) / ".env"
             env.write_text("STREMIO_APPLY_PATCHES=1\nTZ=America/Chicago\n", encoding="utf-8")
 
-            streamio.write_env_setting(env, "STREMIO_APPLY_PATCHES", "0")
+            stremio_app.write_env_setting(env, "STREMIO_APPLY_PATCHES", "0")
 
             content = env.read_text(encoding="utf-8")
             self.assertIn("STREMIO_APPLY_PATCHES=0", content)
@@ -462,15 +462,17 @@ class StreamioInitHelpersTests(unittest.TestCase):
             env = Path(directory) / ".env"
             env.write_text("STREMIO_SKIP_HW_PROBE=0\n", encoding="utf-8")
 
-            self.assertEqual(streamio.env_file_value(env, "STREMIO_SKIP_HW_PROBE"), "0")
+            self.assertEqual(stremio_app.env_file_value(env, "STREMIO_SKIP_HW_PROBE"), "0")
 
     def test_env_flag_enabled_uses_default_when_missing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
 
-            self.assertTrue(streamio.env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env))
+            self.assertTrue(
+                stremio_app.env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env)
+            )
             self.assertFalse(
-                streamio.env_flag_enabled("STREMIO_APPLY_PATCHES", False, env_path=env)
+                stremio_app.env_flag_enabled("STREMIO_APPLY_PATCHES", False, env_path=env)
             )
 
     def test_env_flag_enabled_reads_falsey_value(self) -> None:
@@ -479,7 +481,7 @@ class StreamioInitHelpersTests(unittest.TestCase):
             env.write_text("STREMIO_APPLY_PATCHES=0\n", encoding="utf-8")
 
             self.assertFalse(
-                streamio.env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env)
+                stremio_app.env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env)
             )
 
 

@@ -51,4 +51,4 @@ ensure_uv() {
 }
 
 ensure_uv
-exec uv --cache-dir "$ROOT_DIR/.uv-cache" run python "$ROOT_DIR/streamio.py" "$@"
+exec uv --cache-dir "$ROOT_DIR/.uv-cache" run python "$ROOT_DIR/stremio.py" "$@"

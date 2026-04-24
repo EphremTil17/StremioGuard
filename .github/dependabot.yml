@@ -1,0 +1,38 @@
+version: 2
+
+updates:
+  - package-ecosystem: "docker"
+    directory: "/docker/stremio"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    labels:
+      - "dependencies"
+      - "docker"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+    groups:
+      docker-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:15"
+      timezone: "America/Los_Angeles"
+    labels:
+      - "dependencies"
+      - "python"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"

@@ -188,7 +188,7 @@ wheels = [
 ]
 
 [[package]]
-name = "streamio-vpn-guard"
+name = "stremio-vpn-guard"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

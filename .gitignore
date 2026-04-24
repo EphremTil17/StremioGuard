@@ -15,8 +15,7 @@ __pycache__/
 !.env.example
 
 # Runtime state (pidfile, leak-check baseline)
-.streamio/
-
+.stremio/
 # Runtime logs
 logs/*.log
 
