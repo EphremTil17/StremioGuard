@@ -8,19 +8,20 @@ __pycache__/
 # uv local cache
 .uv-cache/
 
-# Local configuration and leak-check state
+# Local configuration
 .codex
 .env
 .env.*
-.streamio-watchdog.log
-.streamio-watchdog.pid
-.vpn-guard.home-ip
+!.env.example
 
+# Runtime state (pidfile, leak-check baseline)
+.stremio/
 # Runtime logs
 logs/*.log
 
 # Stremio runtime/container data
 stremio-data/
+gluetun-data/
 
 # OS/editor noise
 .DS_Store

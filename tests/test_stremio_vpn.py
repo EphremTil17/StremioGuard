@@ -19,6 +19,25 @@ assert SPEC.loader
 sys.modules["stremio_vpn"] = stremio_vpn
 SPEC.loader.exec_module(stremio_vpn)
 
+STREMIO_PATH = Path(__file__).resolve().parents[1] / "stremio.py"
+STREMIO_LOADER = importlib.machinery.SourceFileLoader("stremio_app", str(STREMIO_PATH))
+STREMIO_SPEC = importlib.util.spec_from_loader("stremio_app", STREMIO_LOADER)
+if STREMIO_SPEC is None:
+    raise RuntimeError(f"Could not load module spec for {STREMIO_PATH}")
+stremio_app = importlib.util.module_from_spec(STREMIO_SPEC)
+assert STREMIO_SPEC.loader
+sys.modules["stremio_app"] = stremio_app
+STREMIO_SPEC.loader.exec_module(stremio_app)
+
+
+GLUETUN_HEALTH_INSPECT = (
+    "docker",
+    "inspect",
+    "--format",
+    "{{.State.Health.Status}}",
+    "gluetun",
+)
+
 
 class FakeRunner:
     def __init__(
@@ -66,19 +85,19 @@ def completed(
 
 
 def make_config(tmp_path: Path, **overrides):
+    state_dir = tmp_path / ".stremio"
+    state_dir.mkdir(parents=True, exist_ok=True)
     values = {
         "root_dir": tmp_path,
         "compose_file": tmp_path / "docker-compose.yml",
         "service_name": "stremio",
         "container_name": "stremio-server",
-        "nordvpn_group": "p2p",
-        "nordvpn_country": "united_states",
-        "vpn_wait_seconds": 1,
+        "gluetun_container_name": "gluetun",
+        "gluetun_healthy_timeout_seconds": 1,
         "watch_interval_seconds": 1,
+        "watchdog_log_interval_seconds": 300,
         "public_ip_timeout_seconds": 1,
-        "reconnect_attempts": 3,
-        "reconnect_backoff_seconds": 1,
-        "home_ip_file": tmp_path / ".vpn-guard.home-ip",
+        "home_ip_file": state_dir / "home-ip",
         "expected_vpn_ip": None,
         "ip_check_urls": ("https://example.test/ip",),
         "install_missing": False,
@@ -90,15 +109,15 @@ def make_config(tmp_path: Path, **overrides):
     return stremio_vpn.Config(**values)
 
 
-class VpnGuardTests(unittest.TestCase):
+class GluetunGuardTests(unittest.TestCase):
     def test_public_ip_safe_rejects_saved_home_ip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_config(tmp_path)
             cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
-            guard = stremio_vpn.VpnGuard(cfg, FakeRunner({}))
+            guard = stremio_vpn.GluetunGuard(cfg, FakeRunner({}))
 
-            with mock.patch.object(guard, "public_ip", return_value="198.51.100.10"):
+            with mock.patch.object(guard, "public_ip_via_gluetun", return_value="198.51.100.10"):
                 self.assertFalse(guard.public_ip_safe())
 
     def test_public_ip_safe_accepts_non_home_ip(self) -> None:
@@ -106,88 +125,24 @@ class VpnGuardTests(unittest.TestCase):
             tmp_path = Path(directory)
             cfg = make_config(tmp_path)
             cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
-            guard = stremio_vpn.VpnGuard(cfg, FakeRunner({}))
+            guard = stremio_vpn.GluetunGuard(cfg, FakeRunner({}))
 
-            with mock.patch.object(guard, "public_ip", return_value="203.0.113.20"):
+            with mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"):
                 self.assertTrue(guard.public_ip_safe())
-
-    def test_connect_vpn_attempts_configured_p2p_country_when_disconnected(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            runner = FakeRunner(
-                {
-                    ("nordvpn", "status"): [
-                        completed(["nordvpn", "status"], "Status: Disconnected\n"),
-                        completed(["nordvpn", "status"], "Status: Connected\n"),
-                    ],
-                    ("nordvpn", "connect", "--group", "p2p", "united_states"): completed(
-                        ["nordvpn", "connect", "--group", "p2p", "united_states"],
-                        "Connecting...\n",
-                    ),
-                }
-            )
-            guard = stremio_vpn.VpnGuard(make_config(tmp_path), runner)
-
-            with mock.patch.object(stremio_vpn.time, "sleep", return_value=None):
-                guard.connect_vpn()
-
-            self.assertIn(["nordvpn", "connect", "--group", "p2p", "united_states"], runner.calls)
-
-    def test_watch_once_stops_container_before_reconnect_when_vpn_drops(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            runner = FakeRunner(
-                {
-                    ("nordvpn", "status"): [
-                        completed(["nordvpn", "status"], "Status: Disconnected\n"),
-                        completed(["nordvpn", "status"], "Status: Disconnected\n"),
-                        completed(["nordvpn", "status"], "Status: Connected\n"),
-                        completed(["nordvpn", "status"], "Status: Connected\n"),
-                    ],
-                    ("nordvpn", "connect", "--group", "p2p", "united_states"): completed(
-                        ["nordvpn", "connect", "--group", "p2p", "united_states"]
-                    ),
-                    ("docker", "inspect", "-f", "{{.State.Running}}", "stremio-server"): completed(
-                        ["docker", "inspect", "-f", "{{.State.Running}}", "stremio-server"],
-                        "true\n",
-                    ),
-                }
-            )
-            guard = stremio_vpn.VpnGuard(make_config(tmp_path), runner)
-
-            with (
-                mock.patch.object(guard, "public_ip_safe", return_value=True),
-                mock.patch.object(stremio_vpn.time, "sleep", return_value=None),
-            ):
-                guard.watch_once()
-
-            stop_call = [
-                "docker",
-                "compose",
-                "-f",
-                str(tmp_path / "docker-compose.yml"),
-                "stop",
-                "stremio",
-            ]
-            connect_call = ["nordvpn", "connect", "--group", "p2p", "united_states"]
-            self.assertIn(stop_call, runner.calls)
-            self.assertIn(connect_call, runner.calls)
-            self.assertLess(runner.calls.index(stop_call), runner.calls.index(connect_call))
 
     def test_setup_resets_builds_and_starts_compose_instance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             runner = FakeRunner(
                 {
-                    ("nordvpn", "status"): completed(["nordvpn", "status"], "Status: Connected\n"),
                     ("docker", "compose", "version"): completed(["docker", "compose", "version"]),
                 }
             )
-            guard = stremio_vpn.VpnGuard(make_config(tmp_path), runner)
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
 
             with (
                 mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "preflight", return_value=None),
             ):
                 guard.setup_stremio(reset=True)
 
@@ -199,38 +154,22 @@ class VpnGuardTests(unittest.TestCase):
     def test_start_runs_setup_when_no_compose_instance_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner(
-                {
-                    (
-                        "docker",
-                        "compose",
-                        "-f",
-                        str(tmp_path / "docker-compose.yml"),
-                        "ps",
-                        "-a",
-                        "-q",
-                        "stremio",
-                    ): completed(
-                        [
-                            "docker",
-                            "compose",
-                            "-f",
-                            str(tmp_path / "docker-compose.yml"),
-                            "ps",
-                            "-a",
-                            "-q",
-                            "stremio",
-                        ],
-                        "",
-                    ),
-                    ("nordvpn", "status"): completed(["nordvpn", "status"], "Status: Connected\n"),
-                }
+            ps_args = (
+                "docker",
+                "compose",
+                "-f",
+                str(tmp_path / "docker-compose.yml"),
+                "ps",
+                "-a",
+                "-q",
+                "stremio",
             )
-            guard = stremio_vpn.VpnGuard(make_config(tmp_path), runner)
+            runner = FakeRunner({ps_args: completed(list(ps_args), "")})
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
 
             with (
                 mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "preflight", return_value=None),
             ):
                 guard.start_stremio()
 
@@ -238,118 +177,6 @@ class VpnGuardTests(unittest.TestCase):
             self.assertIn([*compose_prefix, "build", "stremio"], runner.calls)
             self.assertIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
             self.assertNotIn([*compose_prefix, "down", "--remove-orphans"], runner.calls)
-
-    def test_record_home_ip_refuses_when_vpn_connected(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            runner = FakeRunner(
-                {
-                    ("nordvpn", "status"): completed(["nordvpn", "status"], "Status: Connected\n"),
-                }
-            )
-            guard = stremio_vpn.VpnGuard(make_config(tmp_path), runner)
-
-            with (
-                mock.patch.object(guard, "public_ip", return_value="203.0.113.20"),
-                self.assertRaises(RuntimeError) as ctx,
-            ):
-                guard.record_home_ip()
-
-            self.assertIn("connected", str(ctx.exception).lower())
-            self.assertFalse(guard.config.home_ip_file.exists())
-
-    def test_record_home_ip_refuses_when_ip_matches_expected_vpn_ip(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            runner = FakeRunner(
-                {
-                    ("nordvpn", "status"): completed(
-                        ["nordvpn", "status"], "Status: Disconnected\n"
-                    ),
-                }
-            )
-            guard = stremio_vpn.VpnGuard(
-                make_config(tmp_path, expected_vpn_ip="203.0.113.20"), runner
-            )
-
-            with (
-                mock.patch.object(guard, "public_ip", return_value="203.0.113.20"),
-                self.assertRaises(RuntimeError) as ctx,
-            ):
-                guard.record_home_ip()
-
-            self.assertIn("EXPECTED_VPN_IP", str(ctx.exception))
-            self.assertFalse(guard.config.home_ip_file.exists())
-
-    def test_record_home_ip_writes_when_disconnected(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            runner = FakeRunner(
-                {
-                    ("nordvpn", "status"): completed(
-                        ["nordvpn", "status"], "Status: Disconnected\n"
-                    ),
-                }
-            )
-            guard = stremio_vpn.VpnGuard(make_config(tmp_path), runner)
-
-            with mock.patch.object(guard, "public_ip", return_value="198.51.100.10"):
-                guard.record_home_ip()
-
-            self.assertEqual(
-                guard.config.home_ip_file.read_text(encoding="utf-8").strip(),
-                "198.51.100.10",
-            )
-
-    def test_start_stremio_stops_container_when_vpn_drops_after_up(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            runner = FakeRunner(
-                {
-                    ("nordvpn", "status"): [
-                        completed(["nordvpn", "status"], "Status: Connected\n"),
-                        completed(["nordvpn", "status"], "Status: Connected\n"),
-                        completed(["nordvpn", "status"], "Status: Disconnected\n"),
-                    ],
-                    (
-                        "docker",
-                        "compose",
-                        "-f",
-                        str(tmp_path / "docker-compose.yml"),
-                        "ps",
-                        "-a",
-                        "-q",
-                        "stremio",
-                    ): completed(
-                        [
-                            "docker",
-                            "compose",
-                            "-f",
-                            str(tmp_path / "docker-compose.yml"),
-                            "ps",
-                            "-a",
-                            "-q",
-                            "stremio",
-                        ],
-                        "abc123\n",
-                    ),
-                }
-            )
-            guard = stremio_vpn.VpnGuard(make_config(tmp_path), runner)
-
-            with (
-                mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "public_ip_safe", return_value=True),
-                mock.patch.object(stremio_vpn.time, "sleep", return_value=None),
-                self.assertRaises(RuntimeError),
-            ):
-                guard.start_stremio()
-
-            compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
-            self.assertIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
-            up_index = runner.calls.index([*compose_prefix, "up", "-d", "stremio"])
-            stop_index = runner.calls.index([*compose_prefix, "stop", "stremio"])
-            self.assertLess(up_index, stop_index)
 
     def test_parse_public_ip_accepts_valid_addresses(self) -> None:
         self.assertEqual(stremio_vpn.parse_public_ip("203.0.113.20\n"), "203.0.113.20")
@@ -363,31 +190,299 @@ class VpnGuardTests(unittest.TestCase):
         self.assertIsNone(stremio_vpn.parse_public_ip("::::"))
         self.assertIsNone(stremio_vpn.parse_public_ip("203.0.113.20 extra"))
 
-    def test_watch_once_leaves_stremio_stopped_after_recovery_failures(self) -> None:
+    def test_gluetun_healthy_returns_true_when_inspect_shows_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {GLUETUN_HEALTH_INSPECT: completed(list(GLUETUN_HEALTH_INSPECT), "healthy\n")}
+            )
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+            self.assertTrue(guard.gluetun_healthy())
+
+    def test_gluetun_healthy_returns_false_when_inspect_shows_starting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {GLUETUN_HEALTH_INSPECT: completed(list(GLUETUN_HEALTH_INSPECT), "starting\n")}
+            )
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+            self.assertFalse(guard.gluetun_healthy())
+
+    def test_gluetun_healthy_returns_false_when_container_missing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             runner = FakeRunner(
                 {
-                    ("nordvpn", "status"): completed(
-                        ["nordvpn", "status"],
-                        "Status: Disconnected\n",
-                    ),
-                    ("nordvpn", "connect", "--group", "p2p", "united_states"): completed(
-                        ["nordvpn", "connect", "--group", "p2p", "united_states"]
-                    ),
+                    GLUETUN_HEALTH_INSPECT: completed(
+                        list(GLUETUN_HEALTH_INSPECT),
+                        "",
+                        "Error: No such object: gluetun\n",
+                        returncode=1,
+                    )
                 }
             )
-            guard = stremio_vpn.VpnGuard(
-                make_config(tmp_path, reconnect_attempts=2, vpn_wait_seconds=0),
-                runner,
-            )
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+            self.assertFalse(guard.gluetun_healthy())
 
-            with mock.patch.object(stremio_vpn.time, "sleep", return_value=None):
+    def test_watch_once_stops_stremio_when_gluetun_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+
+            with mock.patch.object(guard, "gluetun_healthy", return_value=False):
                 guard.watch_once(auto_start=True)
 
             compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
             self.assertIn([*compose_prefix, "stop", "stremio"], runner.calls)
             self.assertNotIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
+            self.assertEqual(guard.vpn_drop_count, 1)
+
+    def test_watch_once_stops_stremio_when_ip_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "public_ip_safe", return_value=False),
+            ):
+                guard.watch_once(auto_start=True)
+
+            compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
+            self.assertIn([*compose_prefix, "stop", "stremio"], runner.calls)
+            self.assertNotIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
+
+    def test_watch_once_auto_starts_stremio_when_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "container_running", return_value=False),
+            ):
+                guard.watch_once(auto_start=True)
+
+            compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
+            self.assertIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
+
+    def test_watch_once_does_not_log_healthy_tick_before_summary_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "log") as log_mock,
+            ):
+                guard.watch_once(auto_start=True)
+
+            log_messages = [call.args[0] for call in log_mock.call_args_list]
+            self.assertFalse(any("Watchdog summary" in message for message in log_messages))
+
+    def test_watch_once_logs_summary_after_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = stremio_vpn.GluetunGuard(
+                make_config(tmp_path, watchdog_log_interval_seconds=5),
+                runner,
+            )
+            guard.last_public_ip = "203.0.113.20"
+            guard.summary_started_at = 10.0
+
+            with (
+                mock.patch.object(stremio_vpn.time, "monotonic", return_value=16.0),
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "log") as log_mock,
+            ):
+                guard.watch_once(auto_start=True)
+
+            log_messages = [call.args[0] for call in log_mock.call_args_list]
+            self.assertTrue(any("Watchdog summary" in message for message in log_messages))
+            self.assertEqual(guard.checks_since_summary, 0)
+            self.assertEqual(guard.summary_started_at, 16.0)
+
+    def test_wait_for_gluetun_healthy_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {GLUETUN_HEALTH_INSPECT: completed(list(GLUETUN_HEALTH_INSPECT), "starting\n")}
+            )
+            guard = stremio_vpn.GluetunGuard(
+                make_config(tmp_path, gluetun_healthy_timeout_seconds=0), runner
+            )
+
+            with (
+                mock.patch.object(stremio_vpn.time, "sleep", return_value=None),
+                self.assertRaises(RuntimeError) as ctx,
+            ):
+                guard.wait_for_gluetun_healthy()
+
+            self.assertIn("did not become healthy", str(ctx.exception))
+
+    def test_public_ip_via_gluetun_uses_docker_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            exec_call = (
+                "docker",
+                "exec",
+                "gluetun",
+                "wget",
+                "-qO-",
+                "--timeout",
+                "1",
+                "https://example.test/ip",
+            )
+            runner = FakeRunner({exec_call: completed(list(exec_call), "203.0.113.20\n")})
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+
+            self.assertEqual(guard.public_ip_via_gluetun(), "203.0.113.20")
+            self.assertIn(list(exec_call), runner.calls)
+
+    def test_record_home_ip_refuses_when_gluetun_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {GLUETUN_HEALTH_INSPECT: completed(list(GLUETUN_HEALTH_INSPECT), "healthy\n")}
+            )
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+
+            with (
+                mock.patch.object(guard, "public_ip", return_value="203.0.113.20"),
+                self.assertRaises(RuntimeError) as ctx,
+            ):
+                guard.record_home_ip()
+
+            self.assertIn("healthy", str(ctx.exception).lower())
+            self.assertFalse(guard.config.home_ip_file.exists())
+
+    def test_record_home_ip_writes_when_gluetun_not_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {
+                    GLUETUN_HEALTH_INSPECT: completed(
+                        list(GLUETUN_HEALTH_INSPECT),
+                        "",
+                        "Error: No such object: gluetun\n",
+                        returncode=1,
+                    )
+                }
+            )
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+
+            with mock.patch.object(guard, "public_ip", return_value="198.51.100.10"):
+                guard.record_home_ip()
+
+            self.assertEqual(
+                guard.config.home_ip_file.read_text(encoding="utf-8").strip(),
+                "198.51.100.10",
+            )
+
+
+class StremioInitHelpersTests(unittest.TestCase):
+    def test_env_needs_init_when_file_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertTrue(stremio_app.env_needs_init(Path(directory) / ".env"))
+
+    def test_env_needs_init_when_placeholder_present(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\nWIREGUARD_PRIVATE_KEY=<paste-key-here>\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(stremio_app.env_needs_init(env))
+
+    def test_env_needs_init_when_value_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("WIREGUARD_PRIVATE_KEY=\n", encoding="utf-8")
+            self.assertTrue(stremio_app.env_needs_init(env))
+
+    def test_env_needs_init_false_when_key_populated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "WIREGUARD_PRIVATE_KEY=aGVsbG8td29ybGQ=\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(stremio_app.env_needs_init(env))
+
+    def test_write_wireguard_key_replaces_line_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\n"
+                "WIREGUARD_PRIVATE_KEY=<paste-key-here>\n"
+                "TZ=America/Chicago\n",
+                encoding="utf-8",
+            )
+            stremio_app.write_wireguard_key(env, "secret-key")
+            content = env.read_text(encoding="utf-8")
+
+            self.assertIn("WIREGUARD_PRIVATE_KEY=secret-key", content)
+            self.assertNotIn("<paste-key-here>", content)
+            self.assertIn("VPN_SERVICE_PROVIDER=nordvpn", content)
+            self.assertIn("TZ=America/Chicago", content)
+
+    def test_write_wireguard_key_appends_when_line_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("VPN_SERVICE_PROVIDER=nordvpn\n", encoding="utf-8")
+            stremio_app.write_wireguard_key(env, "fallback-key")
+            content = env.read_text(encoding="utf-8")
+
+            self.assertIn("VPN_SERVICE_PROVIDER=nordvpn", content)
+            self.assertIn("WIREGUARD_PRIVATE_KEY=fallback-key", content)
+
+    def test_write_env_setting_replaces_existing_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("STREMIO_APPLY_PATCHES=1\nTZ=America/Chicago\n", encoding="utf-8")
+
+            stremio_app.write_env_setting(env, "STREMIO_APPLY_PATCHES", "0")
+
+            content = env.read_text(encoding="utf-8")
+            self.assertIn("STREMIO_APPLY_PATCHES=0", content)
+            self.assertIn("TZ=America/Chicago", content)
+
+    def test_env_file_value_reads_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("STREMIO_SKIP_HW_PROBE=0\n", encoding="utf-8")
+
+            self.assertEqual(stremio_app.env_file_value(env, "STREMIO_SKIP_HW_PROBE"), "0")
+
+    def test_env_flag_enabled_uses_default_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+
+            self.assertTrue(
+                stremio_app.env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env)
+            )
+            self.assertFalse(
+                stremio_app.env_flag_enabled("STREMIO_APPLY_PATCHES", False, env_path=env)
+            )
+
+    def test_env_flag_enabled_reads_falsey_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("STREMIO_APPLY_PATCHES=0\n", encoding="utf-8")
+
+            self.assertFalse(
+                stremio_app.env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env)
+            )
 
 
 if __name__ == "__main__":
