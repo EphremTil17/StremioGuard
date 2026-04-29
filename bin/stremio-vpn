@@ -74,6 +74,28 @@ class SubprocessRunner:
         )
 
 
+def docker_permission_help(output: str) -> str | None:
+    normalized = output.lower()
+    if "permission denied" not in normalized:
+        return None
+    if "/var/run/docker.sock" not in normalized and "docker api" not in normalized:
+        return None
+    return (
+        "Permission error: Docker is installed, but this user is not authorized to run it "
+        "without sudo permissions.\n"
+        "Try `docker ps` to confirm, then add your user to the `docker` group or "
+        "enable Docker Desktop WSL integration for this distro. After changing group "
+        "membership, start a fresh shell or restart WSL and try again.\n"
+        "If you need a one-off bypass, run `sudo ./stremio`."
+    )
+
+
+def docker_daemon_help(runner: Runner) -> str | None:
+    result = runner.run(["docker", "ps", "--format", "{{.ID}}"], check=False)
+    detail = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+    return docker_permission_help(detail)
+
+
 @dataclass(frozen=True)
 class Config:
     root_dir: Path
@@ -187,7 +209,22 @@ class GluetunGuard:
 
         result = self.runner.run(["docker", "compose", "version"], check=False)
         if result.returncode != 0:
+            detail = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+            help_text = docker_permission_help(detail)
+            if help_text:
+                raise RuntimeError(help_text)
             raise RuntimeError("Docker Compose plugin is not available.")
+
+        daemon_result = self.runner.run(["docker", "ps", "--format", "{{.ID}}"], check=False)
+        if daemon_result.returncode != 0:
+            detail = f"{daemon_result.stdout or ''}\n{daemon_result.stderr or ''}".strip()
+            help_text = docker_permission_help(detail)
+            if help_text:
+                raise RuntimeError(help_text)
+            raise RuntimeError(
+                "Docker is installed, but the daemon is not reachable from this shell. "
+                "Run `docker ps` to confirm and fix Docker access before retrying."
+            )
 
     def install_missing_commands(self, missing: list[str]) -> None:
         if not shutil.which("apt"):
@@ -323,8 +360,8 @@ class GluetunGuard:
         if not env_file.exists():
             raise RuntimeError(
                 f".env not found at {env_file}. Run `./stremio init` for guided "
-                "first-time setup, or copy .env.example to .env and populate "
-                "WIREGUARD_PRIVATE_KEY manually (see README.md → First-time setup)."
+                "first-time setup, or copy .env.example to .env and populate the "
+                "chosen VPN credentials manually (see README.md → First-time setup)."
             )
         self.log(f"Ensuring {self.config.gluetun_container_name} is running.")
         self.compose("up", "-d", self.config.gluetun_container_name, capture=False)
@@ -517,9 +554,24 @@ def run_command(action: Callable[[GluetunGuard], None]) -> None:
     except KeyboardInterrupt:
         logger.info("Interrupted.")
         raise typer.Exit(130) from None
+    except subprocess.CalledProcessError as error:
+        detail = f"{error.stdout or ''}\n{error.stderr or ''}".strip()
+        help_text = docker_permission_help(detail)
+        if help_text is None and error.cmd and str(error.cmd[0]) == "docker":
+            help_text = docker_daemon_help(guard.runner)
+        if help_text:
+            guard.warn(help_text)
+        else:
+            guard.warn(
+                f"Command failed with exit status {error.returncode}: "
+                f"{' '.join(str(part) for part in error.cmd)}"
+            )
+            if detail:
+                logger.error(detail)
+        raise typer.Exit(1) from None
     except RuntimeError as error:
         logger.error(str(error))
-        raise typer.Exit(1) from error
+        raise typer.Exit(1) from None
 
 
 def configure_file_logging(config: Config) -> None:
