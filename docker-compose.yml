@@ -9,7 +9,7 @@ services:
       - /dev/net/tun:/dev/net/tun
     env_file: .env
     ports:
-      - "11470:11470"
+      - "${HOST_BIND_ADDR:-127.0.0.1}:11470:11470"
     volumes:
       - ./gluetun-data:/gluetun
 
