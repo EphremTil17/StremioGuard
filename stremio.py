@@ -32,6 +32,8 @@ UV_CACHE = ROOT_DIR / ".uv-cache"
 ENV_FILE = ROOT_DIR / ".env"
 ENV_EXAMPLE = ROOT_DIR / ".env.example"
 WIREGUARD_KEY_PLACEHOLDER = "<paste-key-here>"
+OPENVPN_USER_PLACEHOLDER = "<paste-service-username-here>"
+OPENVPN_PASSWORD_PLACEHOLDER = "<paste-service-password-here>"
 WIREGUARD_KEY_LINE = re.compile(r"^WIREGUARD_PRIVATE_KEY=.*$", re.MULTILINE)
 ENV_LINE_TEMPLATE = r"^{key}=.*$"
 
@@ -102,7 +104,10 @@ def run_guard(
     context = context or RunContext.create()
     if file_logging:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(guard_command(*args), check=True, env=context.env(file_logging=file_logging))
+    try:
+        subprocess.run(guard_command(*args), check=True, env=context.env(file_logging=file_logging))
+    except subprocess.CalledProcessError as error:
+        raise typer.Exit(error.returncode or 1) from None
 
 
 WATCHDOG_CMDLINE_MARKER = "stremio-vpn"
@@ -217,20 +222,43 @@ def latest_log() -> Path | None:
 
 
 def env_needs_init(env_path: Path = ENV_FILE) -> bool:
-    """Return True when .env is missing or WIREGUARD_PRIVATE_KEY is unpopulated."""
+    """Return True when .env is missing or the chosen VPN auth fields are unpopulated."""
     if not env_path.exists():
         return True
-    content = env_path.read_text(encoding="utf-8")
-    match = WIREGUARD_KEY_LINE.search(content)
-    if not match:
-        return True
-    value = match.group(0).split("=", 1)[1].strip()
-    return value in {"", WIREGUARD_KEY_PLACEHOLDER}
+    provider = (_read_env_provider(env_path) or "nordvpn").lower()
+    vpn_type = (env_file_value(env_path, "VPN_TYPE") or "wireguard").strip().lower()
+
+    if provider != "nordvpn":
+        if vpn_type == "openvpn":
+            user = env_file_value(env_path, "OPENVPN_USER")
+            password = env_file_value(env_path, "OPENVPN_PASSWORD")
+            return not user or not password
+
+        key = env_file_value(env_path, "WIREGUARD_PRIVATE_KEY")
+        return key in {None, "", WIREGUARD_KEY_PLACEHOLDER}
+
+    if vpn_type == "openvpn":
+        user = env_file_value(env_path, "OPENVPN_USER")
+        password = env_file_value(env_path, "OPENVPN_PASSWORD")
+        return user in {None, "", OPENVPN_USER_PLACEHOLDER} or password in {
+            None,
+            "",
+            OPENVPN_PASSWORD_PLACEHOLDER,
+        }
+
+    key = env_file_value(env_path, "WIREGUARD_PRIVATE_KEY")
+    return key in {None, "", WIREGUARD_KEY_PLACEHOLDER}
 
 
 def write_wireguard_key(env_path: Path, key: str) -> None:
     """Replace WIREGUARD_PRIVATE_KEY=... in env_path with the given key."""
     write_env_setting(env_path, "WIREGUARD_PRIVATE_KEY", key)
+
+
+def write_openvpn_credentials(env_path: Path, username: str, password: str) -> None:
+    """Replace OPENVPN_USER/PASSWORD in env_path with the given values."""
+    write_env_setting(env_path, "OPENVPN_USER", username)
+    write_env_setting(env_path, "OPENVPN_PASSWORD", password)
 
 
 def write_env_setting(env_path: Path, key: str, value: str) -> None:
@@ -264,6 +292,72 @@ def env_flag_enabled(key: str, default: bool, *, env_path: Path = ENV_FILE) -> b
 
 def _prompt_yes_no(message: str, *, default: bool) -> bool:
     return typer.confirm(message, default=default)
+
+
+def _prompt_nordvpn_key_setup_mode() -> str:
+    """Ask how to obtain the NordVPN WireGuard private key."""
+    typer.echo("")
+    typer.echo("NordVPN WireGuard key setup:")
+    typer.echo("  1) Paste an existing WireGuard private key  (recommended)")
+    typer.echo("  2) Extract automatically via host NordVPN CLI")
+    choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
+    if choice in {"2", "auto", "extract", "cli"}:
+        return "auto"
+    return "manual"
+
+
+def _prompt_nordvpn_protocol() -> str:
+    typer.echo("")
+    typer.echo("NordVPN protocol:")
+    typer.echo("  1) WireGuard / NordLynx  (recommended)")
+    typer.echo("  2) OpenVPN               (manual service credentials)")
+    choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
+    if choice in {"2", "openvpn"}:
+        return "openvpn"
+    return "wireguard"
+
+
+def _prompt_manual_wireguard_key() -> str:
+    logger.info("Recommended path selected: manual WireGuard key entry.")
+    typer.echo("")
+    typer.echo("Paste an existing NordVPN WireGuard private key below.")
+    typer.echo("If you do not already have one, cancel and choose the host-side extraction")
+    typer.echo("path instead, or switch to OpenVPN and use NordVPN service credentials.")
+    return typer.prompt("WireGuard private key", hide_input=True).strip()
+
+
+def _prompt_openvpn_credentials() -> tuple[str, str]:
+    logger.info("OpenVPN selected: enter your NordVPN service credentials.")
+    typer.echo("")
+    typer.echo("Retrieve the credentials from Nord Account:")
+    typer.echo("  1. Log in to your Nord Account.")
+    typer.echo("  2. Open NordVPN -> Set up NordVPN manually.")
+    typer.echo("  3. Open the Service credentials section.")
+    typer.echo("  4. Paste the username and password below.")
+    username = typer.prompt("OpenVPN service username").strip()
+    password = typer.prompt("OpenVPN service password", hide_input=True).strip()
+    if not username or not password:
+        fail("OpenVPN service credentials were not provided; aborting.")
+    return username, password
+
+
+def _configure_external_access(env_path: Path) -> None:
+    logger.info("Network access:")
+    if _prompt_yes_no("Will clients use a public HTTPS domain to reach Stremio?", default=False):
+        external_url = typer.prompt(
+            "Public HTTPS URL",
+            default="https://stremio.example.com",
+        ).strip()
+        external_url = external_url.rstrip("/")
+        write_env_setting(env_path, "EXTERNAL_BASE_URL", external_url)
+        logger.info(f"Using public client origin: {external_url}")
+        return
+
+    write_env_setting(env_path, "EXTERNAL_BASE_URL", "")
+    logger.info(
+        "No public domain configured. Stremio will use the same host and port clients "
+        "connect to, such as a local IP address and port."
+    )
 
 
 def _configure_optional_stremio_settings(env_path: Path) -> None:
@@ -320,18 +414,57 @@ def is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def _check_nordvpn_ready() -> None:
-    if not shutil.which("nordvpn"):
-        fail(
-            "nordvpn CLI not found. Install it from https://nordvpn.com/download/linux/, "
-            "then run `nordvpn login` and re-run `./stremio init`."
+def _vpn_setup_checklist(provider: str = "general") -> str:
+    checklist = [
+        "- Docker with the Compose plugin installed and working.",
+        "- /dev/net/tun available on the Linux host or WSL2 guest.",
+        "- A VPN provider account and the client or credentials needed for your chosen setup.",
+    ]
+    if provider == "nordvpn":
+        checklist.extend(
+            [
+                "- nordvpn CLI installed and available on PATH.",
+                "- nordvpn logged in already (`nordvpn login`).",
+                "- wireguard-tools installed so the `wg` command is available.",
+            ]
         )
+    return "Required for VPN setup on Linux:\n" + "\n".join(checklist)
+
+
+def _missing_nordvpn_dependencies() -> list[str]:
+    missing: list[str] = []
+    if not shutil.which("nordvpn"):
+        missing.append(
+            "- nordvpn CLI: install it from https://nordvpn.com/download/linux/ "
+            "and make sure `nordvpn` is on PATH."
+        )
+    if not shutil.which("wg"):
+        missing.append(
+            "- wireguard-tools (`wg`): install it with `sudo apt install wireguard-tools` "
+            "(or your distro's equivalent)."
+        )
+    return missing
+
+
+def _preflight_nordvpn_setup() -> None:
+    missing = _missing_nordvpn_dependencies()
+    if missing:
+        details = "\n".join(missing)
+        fail(
+            f"{_vpn_setup_checklist('nordvpn')}\n\n"
+            "NordVPN first-run prerequisites are missing:\n"
+            f"{details}\n"
+            "Install the missing dependencies first, then re-run `./stremio init`."
+        )
+
     result = subprocess.run(["nordvpn", "account"], capture_output=True, text=True)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip() or "(no output)"
         fail(
-            f"`nordvpn account` exited {result.returncode}. If you are not logged in, "
-            f"run `nordvpn login` and follow the OAuth callback.\n  output: {detail}"
+            f"{_vpn_setup_checklist('nordvpn')}\n\n"
+            "NordVPN CLI is installed, but it is not ready yet.\n"
+            "Run `nordvpn login`, finish the OAuth flow, and then re-run `./stremio init`.\n"
+            f"  output: {detail}"
         )
 
 
@@ -355,13 +488,7 @@ def _run_nordvpn_streaming(cmd: list[str], *, check: bool = True) -> int:
 
 def _extract_wireguard_key() -> str:
     """Drive nordvpn nordlynx connect, capture the WG key, then disconnect."""
-    if not shutil.which("wg"):
-        fail(
-            "wg (wireguard-tools) not found. Run `sudo apt install wireguard-tools` "
-            "(or your distro's equivalent) and retry."
-        )
-
-    _check_nordvpn_ready()
+    _preflight_nordvpn_setup()
 
     logger.info("Setting NordVPN technology to nordlynx (WireGuard).")
     _run_nordvpn_streaming(["nordvpn", "set", "technology", "nordlynx"])
@@ -390,6 +517,47 @@ def _extract_wireguard_key() -> str:
     return key
 
 
+def _get_nordvpn_wireguard_key() -> str:
+    mode = _prompt_nordvpn_key_setup_mode()
+    if mode == "manual":
+        key = _prompt_manual_wireguard_key()
+        if not key:
+            fail("No WireGuard key entered; aborting.")
+        return key
+
+    logger.warning(
+        "Automatic extraction temporarily connects this Linux host to NordVPN and may "
+        "interrupt SSH, LAN access, or other active connections."
+    )
+    if not _prompt_yes_no("Continue with host-side NordVPN key extraction?", default=False):
+        fail(
+            "Automatic extraction cancelled. Re-run `./stremio init` and choose the "
+            "recommended manual key entry path instead."
+        )
+
+    logger.info("Checking NordVPN setup prerequisites before continuing.")
+    _preflight_nordvpn_setup()
+    return _extract_wireguard_key()
+
+
+def _configure_nordvpn(env_path: Path) -> None:
+    protocol = _prompt_nordvpn_protocol()
+    write_env_setting(env_path, "VPN_TYPE", protocol)
+
+    if protocol == "openvpn":
+        username, password = _prompt_openvpn_credentials()
+        write_openvpn_credentials(env_path, username, password)
+        write_env_setting(env_path, "WIREGUARD_PRIVATE_KEY", "")
+        logger.success("Stored NordVPN OpenVPN service credentials in .env.")
+        return
+
+    key = _get_nordvpn_wireguard_key()
+    write_wireguard_key(env_path, key)
+    write_env_setting(env_path, "OPENVPN_USER", "")
+    write_env_setting(env_path, "OPENVPN_PASSWORD", "")
+    logger.success(f"Wrote WireGuard key into {ENV_FILE.name}.")
+
+
 @APP.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
     """Start Stremio when no command is provided."""
@@ -403,13 +571,15 @@ def main(ctx: typer.Context) -> None:
         start()
 
 
-def _prompt_provider() -> str:
+def _prompt_provider(default: str | None = None) -> str:
     """Ask which VPN provider to use. Returns 'nordvpn' or 'other'."""
+    normalized_default = (default or "nordvpn").strip().lower()
+    default_choice = "2" if normalized_default == "other" else "1"
     typer.echo("")
     typer.echo("VPN provider:")
-    typer.echo("  1) NordVPN  (automated WireGuard key extraction)")
+    typer.echo("  1) NordVPN  (guided WireGuard or OpenVPN setup)")
     typer.echo("  2) Other    (manual setup — you edit .env yourself)")
-    choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
+    choice = typer.prompt("Choose [1-2]", default=default_choice).strip().lower()
     if choice in {"1", "nordvpn"}:
         return "nordvpn"
     return "other"
@@ -434,7 +604,7 @@ def _print_manual_setup_pointer() -> None:
 
 @APP.command()
 def init() -> None:
-    """First-time setup: create .env, extract WireGuard key, then start."""
+    """First-time setup: create .env, configure VPN credentials, then start."""
     if not is_interactive():
         fail("`init` needs an interactive terminal (stdin/stdout must be a TTY).")
 
@@ -447,20 +617,19 @@ def init() -> None:
         logger.info(f"{ENV_FILE.name} already exists.")
 
     if not env_needs_init(ENV_FILE):
-        logger.info("WIREGUARD_PRIVATE_KEY already set; skipping extraction.")
+        logger.info("VPN credentials already set; skipping guided setup.")
         logger.info("Setup complete. Starting Stremio.")
         start()
         return
 
     untouched_template = ENV_EXAMPLE.exists() and ENV_FILE.read_bytes() == ENV_EXAMPLE.read_bytes()
     if untouched_template:
+        _configure_external_access(ENV_FILE)
         _configure_optional_stremio_settings(ENV_FILE)
-    provider = _prompt_provider() if untouched_template else _read_env_provider(ENV_FILE)
+    provider = _prompt_provider(_read_env_provider(ENV_FILE))
     if provider == "nordvpn":
-        logger.info("WIREGUARD_PRIVATE_KEY is unpopulated. Walking through extraction.")
-        key = _extract_wireguard_key()
-        write_wireguard_key(ENV_FILE, key)
-        logger.success(f"Wrote WireGuard key into {ENV_FILE.name}.")
+        logger.info("NordVPN credentials are unpopulated. Walking through protocol setup.")
+        _configure_nordvpn(ENV_FILE)
         logger.info("Setup complete. Starting Stremio.")
         start()
         return
