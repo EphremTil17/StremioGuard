@@ -490,39 +490,132 @@ class StremioInitHelpersTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.exit_code, 1)
 
-    def test_configure_external_access_clears_base_url_for_local_only_setup(self) -> None:
+    def test_configure_external_access_tier_one_writes_lan_bind_and_clears_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
-            env.write_text("EXTERNAL_BASE_URL=https://old.example\n", encoding="utf-8")
+            env.write_text(
+                "EXTERNAL_BASE_URL=https://old.example\nHOST_BIND_ADDR=127.0.0.1\n",
+                encoding="utf-8",
+            )
 
             with (
-                mock.patch.object(stremio_app, "_prompt_yes_no", return_value=False),
+                mock.patch.object(
+                    stremio_app.typer,
+                    "prompt",
+                    side_effect=["1", "10.0.0.5"],
+                ),
+                mock.patch.object(stremio_app.typer, "echo"),
                 mock.patch.object(stremio_app, "logger"),
             ):
                 stremio_app._configure_external_access(env)
 
             self.assertEqual(stremio_app.env_file_value(env, "EXTERNAL_BASE_URL"), "")
+            self.assertEqual(stremio_app.env_file_value(env, "HOST_BIND_ADDR"), "10.0.0.5")
 
-    def test_configure_external_access_writes_public_domain(self) -> None:
+    def test_configure_external_access_tier_two_writes_domain_and_lan_bind(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
-            env.write_text("EXTERNAL_BASE_URL=\n", encoding="utf-8")
+            env.write_text(
+                "EXTERNAL_BASE_URL=\nHOST_BIND_ADDR=127.0.0.1\n",
+                encoding="utf-8",
+            )
 
             with (
-                mock.patch.object(stremio_app, "_prompt_yes_no", return_value=True),
                 mock.patch.object(
                     stremio_app.typer,
                     "prompt",
-                    return_value="https://demo.example.com/",
+                    side_effect=["2", "10.0.0.5", "stremio.example.com"],
                 ),
+                mock.patch.object(stremio_app.typer, "echo"),
                 mock.patch.object(stremio_app, "logger"),
             ):
                 stremio_app._configure_external_access(env)
 
             self.assertEqual(
                 stremio_app.env_file_value(env, "EXTERNAL_BASE_URL"),
-                "https://demo.example.com",
+                "https://stremio.example.com",
             )
+            self.assertEqual(stremio_app.env_file_value(env, "HOST_BIND_ADDR"), "10.0.0.5")
+
+    def test_prompt_lan_bind_addr_accepts_lan_ip(self) -> None:
+        with (
+            mock.patch.object(stremio_app.typer, "prompt", return_value="10.168.77.10"),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_lan_bind_addr(), "10.168.77.10")
+
+    def test_prompt_lan_bind_addr_accepts_all_interfaces(self) -> None:
+        with (
+            mock.patch.object(stremio_app.typer, "prompt", return_value="0.0.0.0"),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_lan_bind_addr(), "0.0.0.0")
+
+    def test_prompt_lan_bind_addr_rejects_invalid_then_accepts_valid(self) -> None:
+        with (
+            mock.patch.object(
+                stremio_app.typer,
+                "prompt",
+                side_effect=["not-an-ip", "192.168.1.50"],
+            ),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_lan_bind_addr(), "192.168.1.50")
+
+    def test_prompt_lan_bind_addr_warns_on_loopback_and_re_prompts_when_declined(self) -> None:
+        with (
+            mock.patch.object(
+                stremio_app.typer,
+                "prompt",
+                side_effect=["127.0.0.1", "n", "10.0.0.5"],
+            ),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_lan_bind_addr(), "10.0.0.5")
+
+    def test_prompt_lan_bind_addr_accepts_loopback_after_explicit_confirmation(self) -> None:
+        with (
+            mock.patch.object(
+                stremio_app.typer,
+                "prompt",
+                side_effect=["127.0.0.1", "y"],
+            ),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_lan_bind_addr(), "127.0.0.1")
+
+    def test_prompt_public_domain_strips_trailing_slash(self) -> None:
+        with (
+            mock.patch.object(
+                stremio_app.typer,
+                "prompt",
+                return_value="stremio.example.com/",
+            ),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_public_domain(), "stremio.example.com")
+
+    def test_prompt_public_domain_rejects_scheme_then_accepts_bare_host(self) -> None:
+        with (
+            mock.patch.object(
+                stremio_app.typer,
+                "prompt",
+                side_effect=["https://stremio.example.com", "stremio.example.com"],
+            ),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_public_domain(), "stremio.example.com")
+
+    def test_prompt_public_domain_rejects_path_and_whitespace(self) -> None:
+        with (
+            mock.patch.object(
+                stremio_app.typer,
+                "prompt",
+                side_effect=["foo bar", "no-tld", "stremio.example.com"],
+            ),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_public_domain(), "stremio.example.com")
 
     def test_get_nordvpn_wireguard_key_manual_path_skips_host_extraction(self) -> None:
         with (
