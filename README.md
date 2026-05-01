@@ -57,10 +57,12 @@ Run the guided initializer:
 
 This creates `.env` from `.env.example` if needed, offers a couple of optional Stremio toggles up front, and then walks through NordVPN protocol setup. Re-running `init` is idempotent: once the chosen protocol credentials are populated, the setup step is skipped.
 
-During guided setup, Stremio also asks how clients will reach the server:
+During guided setup, Stremio asks which deployment **tier** you're running:
 
-- If you use a public HTTPS domain or reverse proxy, set `EXTERNAL_BASE_URL` to that URL.
-- If you only use a local IP and port, leave `EXTERNAL_BASE_URL` blank. In that mode, Stremio uses the same host and port the client actually connected to.
+- **Tier 1 — LAN + Tailscale only.** No public domain. Init writes `HOST_BIND_ADDR=<host-LAN-IP>` and clears `EXTERNAL_BASE_URL`. LAN clients reach Stremio at `http://<host-LAN-IP>:11470`; tailnet clients reach it at `http://<host-tailscale-IP>:11470`.
+- **Tier 2 / 3 — reverse-proxied behind a domain.** Init writes the same `HOST_BIND_ADDR` plus `EXTERNAL_BASE_URL=https://<your-domain>`. You provide the proxy (NPM, Caddy, Traefik, raw nginx); it upstreams to `<host-LAN-IP>:11470` and applies whatever access control fits your threat model. Tier 2 is tailnet-only via a Cloudflare → CGNAT DNS pivot; Tier 3 is publicly routable. The Stremio-side config is identical for both.
+
+`init` is idempotent — re-run it to switch tiers. The compose-file default for `HOST_BIND_ADDR` is loopback (`127.0.0.1`) purely as a fail-safe so an unconfigured `docker compose up` cannot accidentally expose anything before init runs. Loopback makes Stremio unreachable; init prompts you for a real LAN IP. See [docs/secure-access.md](docs/secure-access.md) for the full per-tier runbook, threat model, and verification steps.
 
 For NordVPN, `init` offers two protocol paths:
 
@@ -205,7 +207,10 @@ The local Stremio image is built from a digest-pinned `tsaridas/stremio-docker` 
   Optional. Keeps browser redirects and client-facing links on your public HTTPS origin. Leave it blank for local-only access so Stremio uses the host and port clients actually connect to.
 
 - `INTERNAL_MEDIA_BASE_URL=http://127.0.0.1:11470`
-  Keeps ffprobe and HLS self-references on loopback instead of probing back out through Cloudflare or another reverse proxy.
+  Keeps ffprobe and HLS self-references on loopback instead of probing back out through the reverse proxy.
+
+- `HOST_BIND_ADDR=127.0.0.1`
+  Bind interface for gluetun's published 11470 port. Loopback is secure-by-default for the collapsed deployment. Set to `0.0.0.0` (or a specific LAN IP) for split-host or LAN-direct access.
 
 If you change `STREMIO_APPLY_PATCHES` after the image has already been built, run `./stremio restart` so Docker rebuilds the image with the new build arg.
 
@@ -271,3 +276,19 @@ Defense-in-depth notes:
 - The host-level WSL connection itself is no longer routed through any VPN by default. Anything outside this Docker setup uses your home connection. Choose split tunneling at the WSL/Windows layer if you want broader coverage.
 - `WIREGUARD_PRIVATE_KEY` in `.env` is sensitive. The repo's `.gitignore` excludes `.env`; double-check before sharing dotfiles or backups.
 - Restarting gluetun mid-session (e.g., `docker compose restart gluetun`) leaves Stremio running but network-isolated until the watchdog's next tick stops it. Expected behavior of the netns-share model.
+
+## Inbound access threat model
+
+Outbound (torrent traffic) goes through gluetun's VPN. Inbound (clients reaching the streaming server and web UI) is a separate problem the repo does not solve in-stack. Stremio's streaming server has no built-in auth, so the trust boundary is whatever is in front of it.
+
+The repo supports three deployment tiers. Stremio-side config is two `.env` lines; pre-Stremio infrastructure (DNS, certs, reverse proxy) is yours to assemble.
+
+| Tier | What's in front of Stremio | Trust boundary |
+|------|----------------------------|----------------|
+| 1 | Nothing — direct LAN/Tailscale access | LAN devices + tailnet peers |
+| 2 | Reverse proxy + domain, A record on a Tailscale CGNAT IP (tailnet-only) | LAN devices + tailnet peers; open internet has no route |
+| 3 | Reverse proxy + publicly routable domain | whatever your proxy enforces (auth, allowlist, WAF, …) |
+
+Tier 2 is the recommended posture for off-LAN access without exposing anything publicly: clients on your tailnet see a friendly `https://your.domain`, the open internet sees an unroutable CGNAT IP, the home WAN port is never opened. Tier 3 trades that L3 isolation for full public reachability and puts the gating burden on the proxy.
+
+Per-tier setup steps, DNS-01 cert renewal, and verification live in [docs/secure-access.md](docs/secure-access.md). A raw nginx server-block reference for Tier 2/3 is in [docs/nginx-allowlist.conf](docs/nginx-allowlist.conf).
