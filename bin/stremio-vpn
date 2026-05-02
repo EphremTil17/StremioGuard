@@ -274,6 +274,14 @@ class GluetunGuard:
         )
         return result.returncode == 0 and (result.stdout or "").strip() == "healthy"
 
+    def gluetun_recent_logs(self, lines: int = 20) -> str:
+        result = self.runner.run(
+            ["docker", "logs", "--tail", str(lines), self.config.gluetun_container_name],
+            check=False,
+        )
+        parts = [p for p in (result.stdout or "", result.stderr or "") if p.strip()]
+        return "\n".join(parts).strip()
+
     def wait_for_gluetun_healthy(self) -> None:
         deadline = time.monotonic() + self.config.gluetun_healthy_timeout_seconds
         while time.monotonic() < deadline:
@@ -281,8 +289,23 @@ class GluetunGuard:
                 self.log("Gluetun is healthy.")
                 return
             time.sleep(2)
+
+        recent = self.gluetun_recent_logs()
+        if recent:
+            self.warn("Last gluetun log lines:")
+            self.log_lines(recent)
+
+        auth_markers = ("AUTH_FAILED", "Your credentials might be wrong", "authentication failure")
+        if any(m in recent for m in auth_markers):
+            raise RuntimeError(
+                "Gluetun VPN credentials were rejected (AUTH_FAILED). "
+                "Re-run `./stremio init` to update your VPN credentials."
+            )
+
         raise RuntimeError(
-            f"Gluetun did not become healthy within {self.config.gluetun_healthy_timeout_seconds}s."
+            f"Gluetun did not become healthy within "
+            f"{self.config.gluetun_healthy_timeout_seconds}s. "
+            "Check the log lines above or run `docker logs gluetun` for details."
         )
 
     def public_ip(self) -> str | None:

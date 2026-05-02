@@ -380,6 +380,81 @@ class GluetunGuardTests(unittest.TestCase):
 
             self.assertIn("did not become healthy", str(ctx.exception))
 
+    def test_wait_for_gluetun_healthy_detects_auth_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {GLUETUN_HEALTH_INSPECT: completed(list(GLUETUN_HEALTH_INSPECT), "starting\n")}
+            )
+            guard = stremio_vpn.GluetunGuard(
+                make_config(tmp_path, gluetun_healthy_timeout_seconds=0), runner
+            )
+
+            with (
+                mock.patch.object(stremio_vpn.time, "sleep", return_value=None),
+                mock.patch.object(
+                    guard,
+                    "gluetun_recent_logs",
+                    return_value="AUTH: Received control message: AUTH_FAILED",
+                ),
+                self.assertRaises(RuntimeError) as ctx,
+            ):
+                guard.wait_for_gluetun_healthy()
+
+            self.assertIn("credentials were rejected", str(ctx.exception))
+            self.assertIn("./stremio init", str(ctx.exception))
+
+    def test_wait_for_gluetun_healthy_surfaces_logs_on_generic_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {GLUETUN_HEALTH_INSPECT: completed(list(GLUETUN_HEALTH_INSPECT), "starting\n")}
+            )
+            guard = stremio_vpn.GluetunGuard(
+                make_config(tmp_path, gluetun_healthy_timeout_seconds=0), runner
+            )
+            logged: list[str] = []
+
+            with (
+                mock.patch.object(stremio_vpn.time, "sleep", return_value=None),
+                mock.patch.object(
+                    guard,
+                    "gluetun_recent_logs",
+                    return_value="some unrecognised error line",
+                ),
+                mock.patch.object(guard, "log_lines", side_effect=logged.append),
+                self.assertRaises(RuntimeError) as ctx,
+            ):
+                guard.wait_for_gluetun_healthy()
+
+            self.assertIn("did not become healthy", str(ctx.exception))
+            self.assertTrue(any("unrecognised error line" in entry for entry in logged))
+
+    def test_gluetun_recent_logs_combines_stdout_and_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            docker_logs_args = (
+                "docker",
+                "logs",
+                "--tail",
+                "20",
+                "gluetun",
+            )
+            runner = FakeRunner(
+                {
+                    docker_logs_args: completed(
+                        list(docker_logs_args),
+                        stdout="stdout line\n",
+                        stderr="stderr line\n",
+                    )
+                }
+            )
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), runner)
+            result = guard.gluetun_recent_logs()
+
+            self.assertIn("stdout line", result)
+            self.assertIn("stderr line", result)
+
     def test_public_ip_via_gluetun_uses_docker_exec(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
