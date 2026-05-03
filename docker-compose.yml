@@ -8,8 +8,6 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     env_file: .env
-    ports:
-      - "${HOST_BIND_ADDR:-127.0.0.1}:11470:11470"
     volumes:
       - ./gluetun-data:/gluetun
 

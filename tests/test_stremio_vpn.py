@@ -92,6 +92,7 @@ def make_config(tmp_path: Path, **overrides):
     values = {
         "root_dir": tmp_path,
         "compose_file": tmp_path / "docker-compose.yml",
+        "compose_override_file": tmp_path / ".stremio" / "docker-compose.bindings.yml",
         "service_name": "stremio",
         "container_name": "stremio-server",
         "gluetun_container_name": "gluetun",
@@ -109,6 +110,17 @@ def make_config(tmp_path: Path, **overrides):
     }
     values.update(overrides)
     return stremio_vpn.Config(**values)
+
+
+def compose_args_prefix(tmp_path: Path) -> list[str]:
+    return [
+        "docker",
+        "compose",
+        "-f",
+        str(tmp_path / "docker-compose.yml"),
+        "-f",
+        str(tmp_path / ".stremio" / "docker-compose.bindings.yml"),
+    ]
 
 
 class GluetunGuardTests(unittest.TestCase):
@@ -196,19 +208,46 @@ class GluetunGuardTests(unittest.TestCase):
             ):
                 guard.setup_stremio(reset=True)
 
-            compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
+            compose_prefix = compose_args_prefix(tmp_path)
             self.assertIn([*compose_prefix, "down", "--remove-orphans"], runner.calls)
             self.assertIn([*compose_prefix, "build", "stremio"], runner.calls)
             self.assertIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
+
+    def test_compose_override_uses_bind_address_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            (tmp_path / ".env").write_text(
+                "STREMIO_BIND_ADDRS=10.168.77.10,100.125.26.36\nSTREMIO_HOST_PORT=12470\n",
+                encoding="utf-8",
+            )
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), FakeRunner({}))
+
+            guard.write_compose_override()
+
+            override = (tmp_path / ".stremio" / "docker-compose.bindings.yml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('"10.168.77.10:12470:11470"', override)
+            self.assertIn('"100.125.26.36:12470:11470"', override)
+
+    def test_compose_override_supports_zero_bind_addresses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=\n", encoding="utf-8")
+            guard = stremio_vpn.GluetunGuard(make_config(tmp_path), FakeRunner({}))
+
+            guard.write_compose_override()
+
+            override = (tmp_path / ".stremio" / "docker-compose.bindings.yml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("ports: []", override)
 
     def test_start_runs_setup_when_no_compose_instance_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             ps_args = (
-                "docker",
-                "compose",
-                "-f",
-                str(tmp_path / "docker-compose.yml"),
+                *compose_args_prefix(tmp_path),
                 "ps",
                 "-a",
                 "-q",
@@ -223,7 +262,7 @@ class GluetunGuardTests(unittest.TestCase):
             ):
                 guard.start_stremio()
 
-            compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
+            compose_prefix = compose_args_prefix(tmp_path)
             self.assertIn([*compose_prefix, "build", "stremio"], runner.calls)
             self.assertIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
             self.assertNotIn([*compose_prefix, "down", "--remove-orphans"], runner.calls)
@@ -283,7 +322,7 @@ class GluetunGuardTests(unittest.TestCase):
             with mock.patch.object(guard, "gluetun_healthy", return_value=False):
                 guard.watch_once(auto_start=True)
 
-            compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
+            compose_prefix = compose_args_prefix(tmp_path)
             self.assertIn([*compose_prefix, "stop", "stremio"], runner.calls)
             self.assertNotIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
             self.assertEqual(guard.vpn_drop_count, 1)
@@ -300,7 +339,7 @@ class GluetunGuardTests(unittest.TestCase):
             ):
                 guard.watch_once(auto_start=True)
 
-            compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
+            compose_prefix = compose_args_prefix(tmp_path)
             self.assertIn([*compose_prefix, "stop", "stremio"], runner.calls)
             self.assertNotIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
 
@@ -317,7 +356,7 @@ class GluetunGuardTests(unittest.TestCase):
             ):
                 guard.watch_once(auto_start=True)
 
-            compose_prefix = ["docker", "compose", "-f", str(tmp_path / "docker-compose.yml")]
+            compose_prefix = compose_args_prefix(tmp_path)
             self.assertIn([*compose_prefix, "up", "-d", "stremio"], runner.calls)
 
     def test_watch_once_does_not_log_healthy_tick_before_summary_interval(self) -> None:
@@ -569,7 +608,7 @@ class StremioInitHelpersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
             env.write_text(
-                "EXTERNAL_BASE_URL=https://old.example\nHOST_BIND_ADDR=127.0.0.1\n",
+                "EXTERNAL_BASE_URL=https://old.example\nSTREMIO_BIND_ADDRS=127.0.0.1\n",
                 encoding="utf-8",
             )
 
@@ -577,7 +616,7 @@ class StremioInitHelpersTests(unittest.TestCase):
                 mock.patch.object(
                     stremio_app.typer,
                     "prompt",
-                    side_effect=["1", "10.0.0.5"],
+                    side_effect=["1", "1", "10.0.0.5"],
                 ),
                 mock.patch.object(stremio_app.typer, "echo"),
                 mock.patch.object(stremio_app, "logger"),
@@ -585,13 +624,14 @@ class StremioInitHelpersTests(unittest.TestCase):
                 stremio_app._configure_external_access(env)
 
             self.assertEqual(stremio_app.env_file_value(env, "EXTERNAL_BASE_URL"), "")
-            self.assertEqual(stremio_app.env_file_value(env, "HOST_BIND_ADDR"), "10.0.0.5")
+            self.assertEqual(stremio_app.env_file_value(env, "STREMIO_BIND_ADDRS"), "10.0.0.5")
+            self.assertEqual(stremio_app.env_file_value(env, "STREMIO_HOST_PORT"), "11470")
 
     def test_configure_external_access_tier_two_writes_domain_and_lan_bind(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
             env.write_text(
-                "EXTERNAL_BASE_URL=\nHOST_BIND_ADDR=127.0.0.1\n",
+                "EXTERNAL_BASE_URL=\nSTREMIO_BIND_ADDRS=127.0.0.1\n",
                 encoding="utf-8",
             )
 
@@ -599,7 +639,7 @@ class StremioInitHelpersTests(unittest.TestCase):
                 mock.patch.object(
                     stremio_app.typer,
                     "prompt",
-                    side_effect=["2", "10.0.0.5", "stremio.example.com"],
+                    side_effect=["2", "1", "10.0.0.5", "stremio.example.com"],
                 ),
                 mock.patch.object(stremio_app.typer, "echo"),
                 mock.patch.object(stremio_app, "logger"),
@@ -610,7 +650,53 @@ class StremioInitHelpersTests(unittest.TestCase):
                 stremio_app.env_file_value(env, "EXTERNAL_BASE_URL"),
                 "https://stremio.example.com",
             )
-            self.assertEqual(stremio_app.env_file_value(env, "HOST_BIND_ADDR"), "10.0.0.5")
+            self.assertEqual(stremio_app.env_file_value(env, "STREMIO_BIND_ADDRS"), "10.0.0.5")
+
+    def test_configure_external_access_uses_configured_host_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "EXTERNAL_BASE_URL=\nSTREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_HOST_PORT=12470\n",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(
+                    stremio_app.typer,
+                    "prompt",
+                    side_effect=["1", "1", "10.0.0.5"],
+                ),
+                mock.patch.object(stremio_app.typer, "echo") as echo,
+                mock.patch.object(stremio_app, "logger"),
+            ):
+                stremio_app._configure_external_access(env)
+
+            echo_messages = [call.args[0] for call in echo.call_args_list if call.args]
+            self.assertIn(
+                "How many host addresses should publish Stremio's streaming port (12470)?",
+                echo_messages,
+            )
+
+    def test_prompt_bind_addresses_accepts_multiple_addresses(self) -> None:
+        with (
+            mock.patch.object(
+                stremio_app.typer,
+                "prompt",
+                side_effect=["2", "10.168.77.10", "100.125.26.36"],
+            ),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(
+                stremio_app._prompt_bind_addresses(),
+                ["10.168.77.10", "100.125.26.36"],
+            )
+
+    def test_prompt_bind_addresses_accepts_zero_addresses(self) -> None:
+        with (
+            mock.patch.object(stremio_app.typer, "prompt", return_value="0"),
+            mock.patch.object(stremio_app.typer, "echo"),
+        ):
+            self.assertEqual(stremio_app._prompt_bind_addresses(), [])
 
     def test_prompt_lan_bind_addr_accepts_lan_ip(self) -> None:
         with (
@@ -826,6 +912,36 @@ class StremioInitHelpersTests(unittest.TestCase):
                 stremio_app.init()
 
             self.assertEqual(call_order, ["access", "optional", "key"])
+
+    def test_init_always_prompts_credentials_even_when_already_set(self) -> None:
+        """Re-running init after AUTH_FAILED must not silently skip credential setup."""
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            env_example = temp_root / ".env.example"
+            env_file = temp_root / ".env"
+            env_example.write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\nWIREGUARD_PRIVATE_KEY=<paste-key-here>\n",
+                encoding="utf-8",
+            )
+            # credentials are populated (but wrong — simulates AUTH_FAILED scenario)
+            env_file.write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\nWIREGUARD_PRIVATE_KEY=bad-key\n",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(stremio_app, "ENV_EXAMPLE", env_example),
+                mock.patch.object(stremio_app, "ENV_FILE", env_file),
+                mock.patch.object(stremio_app, "is_interactive", return_value=True),
+                mock.patch.object(stremio_app, "_prompt_provider", return_value="nordvpn"),
+                mock.patch.object(stremio_app, "_configure_nordvpn") as configure_nordvpn,
+                mock.patch.object(stremio_app, "restart") as restart,
+                mock.patch.object(stremio_app, "logger"),
+            ):
+                stremio_app.init()
+
+            configure_nordvpn.assert_called_once()
+            restart.assert_called_once()
 
     def test_init_prompts_provider_even_when_env_is_not_template_clean(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
