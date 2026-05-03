@@ -37,6 +37,7 @@ OPENVPN_USER_PLACEHOLDER = "<paste-service-username-here>"
 OPENVPN_PASSWORD_PLACEHOLDER = "<paste-service-password-here>"
 WIREGUARD_KEY_LINE = re.compile(r"^WIREGUARD_PRIVATE_KEY=.*$", re.MULTILINE)
 ENV_LINE_TEMPLATE = r"^{key}=.*$"
+DEFAULT_STREMIO_HOST_PORT = 11470
 
 logger.remove()
 logger.add(
@@ -291,6 +292,19 @@ def env_flag_enabled(key: str, default: bool, *, env_path: Path = ENV_FILE) -> b
     return value.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+def env_port_value(env_path: Path, key: str, default: int) -> int:
+    value = env_file_value(env_path, key)
+    if value in {None, ""}:
+        return default
+    try:
+        port = int(value)
+    except ValueError:
+        fail(f"{key} must be a TCP port number; got {value!r}.")
+    if port < 1 or port > 65535:
+        fail(f"{key} must be between 1 and 65535; got {value!r}.")
+    return port
+
+
 def _prompt_yes_no(message: str, *, default: bool) -> bool:
     return typer.confirm(message, default=default)
 
@@ -350,19 +364,26 @@ def _configure_external_access(env_path: Path) -> None:
     typer.echo("  2) Reverse-proxied behind a domain (NPM, Caddy, Traefik, raw nginx)")
     choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
     proxied = choice in {"2", "proxy", "domain", "reverse-proxy"}
+    host_port = env_port_value(env_path, "STREMIO_HOST_PORT", DEFAULT_STREMIO_HOST_PORT)
+    write_env_setting(env_path, "STREMIO_HOST_PORT", str(host_port))
 
-    bind_addr = _prompt_lan_bind_addr()
-    write_env_setting(env_path, "HOST_BIND_ADDR", bind_addr)
-    logger.info(f"Stremio will bind 11470 on {bind_addr}.")
+    bind_addrs = _prompt_bind_addresses(host_port=host_port)
+    bind_value = ",".join(bind_addrs)
+    write_env_setting(env_path, "STREMIO_BIND_ADDRS", bind_value)
+    if bind_addrs:
+        logger.info(f"Stremio will bind {host_port} on {bind_value}.")
+    else:
+        logger.info(f"Stremio will not publish {host_port} on any host interface.")
 
     if proxied:
         domain = _prompt_public_domain()
         external_url = f"https://{domain}"
         write_env_setting(env_path, "EXTERNAL_BASE_URL", external_url)
         logger.info(f"Clients will reach Stremio via {external_url}.")
+        bind_addr = bind_addrs[0] if bind_addrs else "<this-host-LAN-IP>"
         upstream = bind_addr if bind_addr != "0.0.0.0" else "<this-host-LAN-IP>"
         logger.info(
-            f"Point your reverse proxy upstream at http://{upstream}:11470 and apply "
+            f"Point your reverse proxy upstream at http://{upstream}:{host_port} and apply "
             "whatever access control fits the tier (see docs/secure-access.md)."
         )
     else:
@@ -373,10 +394,49 @@ def _configure_external_access(env_path: Path) -> None:
         )
 
 
-def _prompt_lan_bind_addr() -> str:
+def _prompt_bind_addresses(*, host_port: int = DEFAULT_STREMIO_HOST_PORT) -> list[str]:
     typer.echo("")
-    typer.echo("What address should Stremio's streaming port (11470) bind to?")
+    typer.echo(f"How many host addresses should publish Stremio's streaming port ({host_port})?")
+    typer.echo("  Use 1 for LAN-only or Tailscale-only, 2 for LAN + Tailscale.")
+    typer.echo("  Use 0 only if another container-only upstream will reach Stremio.")
+    while True:
+        raw = typer.prompt("Bind address count", default="1").strip()
+        try:
+            count = int(raw)
+        except ValueError:
+            typer.echo(f"  Not a valid number: {raw!r}")
+            continue
+        if count < 0:
+            typer.echo("  Count must be 0 or greater.")
+            continue
+        if count > 8:
+            typer.echo(
+                "  Refusing more than 8 bind addresses; use 0.0.0.0 if you really "
+                "need every interface."
+            )
+            continue
+        break
+
+    addresses: list[str] = []
+    for index in range(count):
+        while True:
+            address = _prompt_lan_bind_addr(host_port=host_port, index=index + 1)
+            if address in addresses:
+                typer.echo(f"  Address {address} is already listed.")
+                continue
+            addresses.append(address)
+            break
+    return addresses
+
+
+def _prompt_lan_bind_addr(
+    *, host_port: int = DEFAULT_STREMIO_HOST_PORT, index: int | None = None
+) -> str:
+    typer.echo("")
+    label = f" #{index}" if index is not None else ""
+    typer.echo(f"What address should Stremio's streaming port ({host_port}) bind to{label}?")
     typer.echo("  Use this host's LAN IP (find it with `ip -4 addr show` or `hostname -I`).")
+    typer.echo("  Use this host's Tailscale IP for Tailscale-only access.")
     typer.echo("  `0.0.0.0` binds on every NIC; only pick that on multi-homed hosts.")
     while True:
         raw = typer.prompt("Bind address").strip()
@@ -672,22 +732,16 @@ def init() -> None:
     else:
         logger.info(f"{ENV_FILE.name} already exists.")
 
-    if not env_needs_init(ENV_FILE):
-        logger.info("VPN credentials already set; skipping guided setup.")
-        logger.info("Setup complete. Starting Stremio.")
-        start()
-        return
-
     untouched_template = ENV_EXAMPLE.exists() and ENV_FILE.read_bytes() == ENV_EXAMPLE.read_bytes()
     if untouched_template:
         _configure_external_access(ENV_FILE)
         _configure_optional_stremio_settings(ENV_FILE)
     provider = _prompt_provider(_read_env_provider(ENV_FILE))
     if provider == "nordvpn":
-        logger.info("NordVPN credentials are unpopulated. Walking through protocol setup.")
+        logger.info("Walking through NordVPN credential setup.")
         _configure_nordvpn(ENV_FILE)
-        logger.info("Setup complete. Starting Stremio.")
-        start()
+        logger.info("Setup complete. Restarting Stremio so Docker reloads the updated VPN config.")
+        restart()
         return
 
     _print_manual_setup_pointer()

@@ -1,13 +1,13 @@
 # Secure access: deployment tiers
 
-The repo's job is the **Stremio side** of inbound access — `HOST_BIND_ADDR` and
-optionally `EXTERNAL_BASE_URL`. Everything else (domain registration, DNS,
-certs, reverse proxy installation, network topology) is your pre-existing
-infrastructure. This doc lists three tiers, what each tier assumes you have
-already, and what you set in `.env` for each.
+The repo's job is the **Stremio side** of inbound access — `STREMIO_BIND_ADDRS`,
+`STREMIO_HOST_PORT`, and optionally `EXTERNAL_BASE_URL`. Everything else
+(domain registration, DNS, certs, reverse proxy installation, network topology)
+is your pre-existing infrastructure. This doc lists three tiers, what each tier
+assumes you have already, and what you set in `.env` for each.
 
-The Stremio-side config collapses to two `.env` lines. Tiers differ only in
-what's in front of Stremio.
+The Stremio-side config is intentionally small. Tiers differ mainly in what's
+in front of Stremio.
 
 | Tier | What's in front of Stremio | `EXTERNAL_BASE_URL` |
 |------|----------------------------|---------------------|
@@ -15,7 +15,9 @@ what's in front of Stremio.
 | 2 | Reverse proxy, domain only routable via your tailnet | `https://<your-domain>` |
 | 3 | Reverse proxy, publicly routable domain | `https://<your-domain>` |
 
-`HOST_BIND_ADDR` is the same value in all three: this host's LAN IP.
+`STREMIO_BIND_ADDRS` controls which host interfaces publish Stremio. Use one
+address for a single entry path, or a comma-separated LAN + Tailscale pair for
+direct access on both networks.
 
 ## Tier 1 — LAN + Tailscale only
 
@@ -27,7 +29,8 @@ You already have:
 You set in `.env`:
 
 ```ini
-HOST_BIND_ADDR=<host-LAN-IP>
+STREMIO_HOST_PORT=11470
+STREMIO_BIND_ADDRS=<host-LAN-IP>,<host-tailscale-IP>
 EXTERNAL_BASE_URL=
 ```
 
@@ -62,7 +65,8 @@ You already have:
 You set in `.env`:
 
 ```ini
-HOST_BIND_ADDR=<host-LAN-IP>
+STREMIO_HOST_PORT=11470
+STREMIO_BIND_ADDRS=<host-LAN-IP>
 EXTERNAL_BASE_URL=https://<your-domain>
 ```
 
@@ -118,7 +122,8 @@ You already have:
 You set in `.env`:
 
 ```ini
-HOST_BIND_ADDR=<host-LAN-IP>
+STREMIO_HOST_PORT=11470
+STREMIO_BIND_ADDRS=<host-LAN-IP>
 EXTERNAL_BASE_URL=https://<your-domain>
 ```
 
@@ -141,9 +146,10 @@ After bringing the stack up (`./stremio restart`):
    ```bash
    ss -tlnp | grep 11470
    ```
-   The listener address should equal `HOST_BIND_ADDR`. If it shows
-   `127.0.0.1`, the compose default leaked through — `.env` isn't being read.
-   If it shows `0.0.0.0` and you didn't pick that, init wrote the wrong value.
+   The listener addresses should match `STREMIO_BIND_ADDRS`. If it shows only
+   `127.0.0.1`, `.env` is missing `STREMIO_BIND_ADDRS` or the guard-generated
+   compose override was not used. If it shows `0.0.0.0` and you didn't pick
+   that, init wrote the wrong value.
 
 2. **LAN-direct reachability** (any tier):
    ```bash
@@ -177,16 +183,15 @@ After bringing the stack up (`./stremio restart`):
 
 ## Risks and gotchas
 
-- **Loopback bind makes Stremio unreachable.** No tier uses
-  `HOST_BIND_ADDR=127.0.0.1`. The docker-compose default is loopback purely
-  as a fail-safe so an unconfigured `docker compose up` can't accidentally
-  expose anything before you run `./stremio init`. Init steers you away
-  from it.
+- **Loopback bind makes Stremio unreachable.** No real deployment tier uses
+  `STREMIO_BIND_ADDRS=127.0.0.1`. The default is loopback purely as a fail-safe
+  so an unconfigured run cannot accidentally expose anything before you run
+  `./stremio init`. Init steers you away from it.
 - **`0.0.0.0` is wider than you need.** It binds on every interface — LAN,
   loopback, docker0, tailscale0, future bridges. Picking the specific LAN IP
   is one rung tighter. Use `0.0.0.0` only on multi-homed hosts where every
   NIC genuinely needs to listen.
-- **WSL2 LAN reachability.** On WSL2, even with the right `HOST_BIND_ADDR`,
+- **WSL2 LAN reachability.** On WSL2, even with the right `STREMIO_BIND_ADDRS`,
   whether the Windows LAN actually reaches the WSL2 VM depends on the WSL2
   network mode. Default NAT may need
   `netsh portproxy v4tov4 listenport=11470 connectport=11470 connectaddress=<wsl-vm-ip>`
