@@ -59,10 +59,10 @@ This creates `.env` from `.env.example` if needed, offers a couple of optional S
 
 During guided setup, Stremio asks which deployment **tier** you're running:
 
-- **Tier 1 — LAN + Tailscale only.** No public domain. Init writes `HOST_BIND_ADDR=<host-LAN-IP>` and clears `EXTERNAL_BASE_URL`. LAN clients reach Stremio at `http://<host-LAN-IP>:11470`; tailnet clients reach it at `http://<host-tailscale-IP>:11470`.
-- **Tier 2 / 3 — reverse-proxied behind a domain.** Init writes the same `HOST_BIND_ADDR` plus `EXTERNAL_BASE_URL=https://<your-domain>`. You provide the proxy (NPM, Caddy, Traefik, raw nginx); it upstreams to `<host-LAN-IP>:11470` and applies whatever access control fits your threat model. Tier 2 is tailnet-only via a Cloudflare → CGNAT DNS pivot; Tier 3 is publicly routable. The Stremio-side config is identical for both.
+- **Tier 1 — LAN + Tailscale only.** No public domain. Init writes `STREMIO_BIND_ADDRS=<host-LAN-IP>,<host-tailscale-IP>` when you choose both addresses and clears `EXTERNAL_BASE_URL`. LAN clients reach Stremio at `http://<host-LAN-IP>:<STREMIO_HOST_PORT>`; tailnet clients reach it at `http://<host-tailscale-IP>:<STREMIO_HOST_PORT>`.
+- **Tier 2 / 3 — reverse-proxied behind a domain.** Init writes the selected bind addresses plus `EXTERNAL_BASE_URL=https://<your-domain>`. You provide the proxy (NPM, Caddy, Traefik, raw nginx); it upstreams to one selected host address on `STREMIO_HOST_PORT` and applies whatever access control fits your threat model. Tier 2 is tailnet-only via a Cloudflare → CGNAT DNS pivot; Tier 3 is publicly routable. The Stremio-side config is identical for both.
 
-`init` is idempotent — re-run it to switch tiers. The compose-file default for `HOST_BIND_ADDR` is loopback (`127.0.0.1`) purely as a fail-safe so an unconfigured `docker compose up` cannot accidentally expose anything before init runs. Loopback makes Stremio unreachable; init prompts you for a real LAN IP. See [docs/secure-access.md](docs/secure-access.md) for the full per-tier runbook, threat model, and verification steps.
+`init` is idempotent — re-run it to switch tiers. Raw `docker compose up` does not publish Stremio's host port; the guard generates a local Compose override from `STREMIO_BIND_ADDRS` before starting the stack. See [docs/secure-access.md](docs/secure-access.md) for the full per-tier runbook, threat model, and verification steps.
 
 For NordVPN, `init` offers two protocol paths:
 
@@ -209,8 +209,11 @@ The local Stremio image is built from a digest-pinned `tsaridas/stremio-docker` 
 - `INTERNAL_MEDIA_BASE_URL=http://127.0.0.1:11470`
   Keeps ffprobe and HLS self-references on loopback instead of probing back out through the reverse proxy.
 
-- `HOST_BIND_ADDR=127.0.0.1`
-  Bind interface for gluetun's published 11470 port. Loopback is secure-by-default for the collapsed deployment. Set to `0.0.0.0` (or a specific LAN IP) for split-host or LAN-direct access.
+- `STREMIO_HOST_PORT=11470`
+  Host-side TCP port published by the generated Compose override. The guard maps each selected bind address as `<bind-address>:<STREMIO_HOST_PORT>:11470`.
+
+- `STREMIO_BIND_ADDRS=127.0.0.1`
+  Comma-separated host interfaces for gluetun's published Stremio port. Use a LAN IP plus a Tailscale IP, such as `10.168.77.10,100.125.26.36`, for Tier 1 LAN + Tailscale access without binding on every interface. Set it empty to publish no host port, or use `0.0.0.0` only when you intentionally want every interface.
 
 If you change `STREMIO_APPLY_PATCHES` after the image has already been built, run `./stremio restart` so Docker rebuilds the image with the new build arg.
 
