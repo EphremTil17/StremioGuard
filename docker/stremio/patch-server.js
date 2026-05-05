@@ -27,27 +27,38 @@ const ESSENTIAL_PATCHES = [
   {
     name: "inject media url normalizer",
     from: "const router = new Router, converters = new Map;",
-    to: `const router = new Router, converters = new Map, normalizeMediaURL = mediaURL => {
+    to: `const router = new Router, converters = new Map, forwardedValue = value => "string" == typeof value ? value.split(",")[0].trim() : "", requestExternalOrigin = (req, protocol = "") => {
+            if (!req || !req.headers) return "";
+            const forwardedProto = forwardedValue(req.headers["x-forwarded-proto"]);
+            const forwardedHost = forwardedValue(req.headers["x-forwarded-host"]) || req.headers.host || "";
+            if (forwardedProto && forwardedHost) return forwardedProto + "://" + forwardedHost;
+            return protocol && req.headers.host ? protocol + req.headers.host : "";
+        }, normalizeMediaURL = (mediaURL, req, protocol = "") => {
             if ("string" != typeof mediaURL || 0 === mediaURL.length) return mediaURL;
             const internalBase = (process.env.INTERNAL_MEDIA_BASE_URL || "").replace(/\\/$/, "");
-            const externalBase = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, "");
-            return internalBase && externalBase && mediaURL.startsWith(externalBase) ? internalBase + mediaURL.slice(externalBase.length) : mediaURL;
+            const configuredExternalBase = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, "");
+            const requestBase = requestExternalOrigin(req, protocol).replace(/\\/$/, "");
+            if (!internalBase) return mediaURL;
+            for (const externalBase of [configuredExternalBase, requestBase]) {
+                if (externalBase && mediaURL.startsWith(externalBase)) return internalBase + mediaURL.slice(externalBase.length);
+            }
+            return mediaURL;
         };`,
   },
   {
     name: "normalize converter media url",
     from: "mediaURL: req.query.mediaURL,",
-    to: "mediaURL: normalizeMediaURL(req.query.mediaURL),",
+    to: "mediaURL: normalizeMediaURL(req.query.mediaURL, req, protocol),",
   },
   {
     name: "normalize hls probe media url",
     from: "mediaURL: req.query.mediaURL\n                });",
-    to: "mediaURL: normalizeMediaURL(req.query.mediaURL)\n                });",
+    to: "mediaURL: normalizeMediaURL(req.query.mediaURL, req, protocol)\n                });",
   },
   {
-    name: "force external streaming server url on redirect",
+    name: "derive streaming server url from forwarded request origin",
     from: 'var serverUrl = encodeURIComponent(protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
-    to: 'var configuredServerUrl = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, ""), serverUrl = encodeURIComponent(configuredServerUrl || protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
+    to: 'var configuredServerUrl = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, ""), forwardedProto = "string" == typeof req.headers["x-forwarded-proto"] ? req.headers["x-forwarded-proto"].split(",")[0].trim() : "", forwardedHost = "string" == typeof req.headers["x-forwarded-host"] ? req.headers["x-forwarded-host"].split(",")[0].trim() : "", detectedServerUrl = forwardedProto && forwardedHost ? forwardedProto + "://" + forwardedHost : "", serverUrl = encodeURIComponent(detectedServerUrl || configuredServerUrl || protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
   },
 ];
 

@@ -25,8 +25,10 @@ dev = [
 testpaths = ["tests"]
 
 [tool.pyright]
+include = ["src", "tests"]
 venvPath = "."
 venv = ".venv"
+exclude = ["vendor/comet"]
 
 [tool.ruff]
 line-length = 100

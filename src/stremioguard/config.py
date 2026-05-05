@@ -10,9 +10,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
+from stremioguard.env import env_file_value
+
 GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
 DEFAULT_STREMIO_HOST_PORT = 11470
 DEFAULT_STREMIO_CONTAINER_PORT = 11470
+DEFAULT_COMET_HOST_PORT = 18000
 
 
 def parse_public_ip(text: str) -> str | None:
@@ -132,4 +135,168 @@ class Config:
                 ).split(",")
                 if url.strip()
             ),
+        )
+
+
+def _parse_ipv4_csv(raw: str | None, *, default: list[str]) -> list[str]:
+    if raw is None:
+        return default
+    values: list[str] = []
+    for item in raw.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            ip = ipaddress.ip_address(candidate)
+        except ValueError as error:
+            raise RuntimeError(f"Invalid IP address value: {candidate!r}") from error
+        if ip.version != 4:
+            raise RuntimeError(f"Only IPv4 addresses are supported here: {candidate}")
+        normalized = str(ip)
+        if normalized not in values:
+            values.append(normalized)
+    return values
+
+
+@dataclass(frozen=True)
+class CometConfig:
+    root_dir: Path
+    env_file: Path
+    vendor_dir: Path
+    lock_file: Path
+    repo_dir: Path
+    compose_source_file: Path
+    state_dir: Path
+    runtime_env_file: Path
+    data_dir: Path
+    postgres_data_dir: Path
+    service_name: str
+    postgres_service_name: str
+    container_name: str
+    postgres_container_name: str
+    host_port: int
+    bind_addresses: tuple[str, ...]
+    public_base_url: str | None
+    proxy_debrid_stream: bool
+    proxy_max_connections: int
+    healthcheck_interval_seconds: int
+    configure_page_password: str | None
+    scrape_torrentio: str
+    torrentio_url: str
+    scrape_zilean: str
+    zilean_url: str
+    result_format_style: str
+    patch_episode_pack_results: bool
+    default_debrid_service: str
+    default_debrid_apikey: str | None
+    enabled: bool
+
+    @classmethod
+    def from_env(cls, root_dir: Path | None = None) -> CometConfig:
+        root_dir = root_dir or Path(__file__).resolve().parent.parent.parent
+        env_file = root_dir / ".env"
+        raw_host_port = env_file_value(env_file, "COMET_HOST_PORT")
+        host_port = DEFAULT_COMET_HOST_PORT
+        if raw_host_port not in {None, ""}:
+            assert raw_host_port is not None
+            try:
+                host_port = int(raw_host_port)
+            except ValueError as error:
+                raise RuntimeError(f"Invalid COMET_HOST_PORT value: {raw_host_port!r}") from error
+            if host_port < 1 or host_port > 65535:
+                raise RuntimeError(
+                    f"Invalid COMET_HOST_PORT value: {raw_host_port!r}; expected 1-65535"
+                )
+
+        bind_addresses = tuple(
+            _parse_ipv4_csv(
+                env_file_value(env_file, "STREMIO_BIND_ADDRS"),
+                default=["127.0.0.1"],
+            )
+        )
+        public_base_url = env_file_value(env_file, "COMET_PUBLIC_BASE_URL") or None
+        proxy_enabled = (
+            (env_file_value(env_file, "COMET_PROXY_DEBRID_STREAM") or "1").strip().lower()
+        )
+        proxy_max_connections_raw = env_file_value(env_file, "COMET_PROXY_MAX_CONNECTIONS")
+        proxy_max_connections = -1
+        if proxy_max_connections_raw not in {None, ""}:
+            assert proxy_max_connections_raw is not None
+            try:
+                proxy_max_connections = int(proxy_max_connections_raw)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Invalid COMET_PROXY_MAX_CONNECTIONS value: {proxy_max_connections_raw!r}"
+                ) from error
+        healthcheck_interval_raw = env_file_value(env_file, "COMET_HEALTHCHECK_INTERVAL_SECONDS")
+        healthcheck_interval_seconds = 300
+        if healthcheck_interval_raw not in {None, ""}:
+            assert healthcheck_interval_raw is not None
+            try:
+                healthcheck_interval_seconds = int(healthcheck_interval_raw)
+            except ValueError as error:
+                raise RuntimeError(
+                    "Invalid COMET_HEALTHCHECK_INTERVAL_SECONDS value: "
+                    f"{healthcheck_interval_raw!r}"
+                ) from error
+            if healthcheck_interval_seconds < 1:
+                raise RuntimeError(
+                    "Invalid COMET_HEALTHCHECK_INTERVAL_SECONDS value: "
+                    f"{healthcheck_interval_raw!r}; expected >= 1"
+                )
+        configure_page_password = env_file_value(env_file, "COMET_CONFIGURE_PAGE_PASSWORD") or None
+        scrape_torrentio = (env_file_value(env_file, "COMET_SCRAPE_TORRENTIO") or "live").strip()
+        torrentio_url = (
+            env_file_value(env_file, "COMET_TORRENTIO_URL") or "https://torrentio.strem.fun"
+        ).strip()
+        scrape_zilean = (env_file_value(env_file, "COMET_SCRAPE_ZILEAN") or "live").strip()
+        zilean_url = (
+            env_file_value(env_file, "COMET_ZILEAN_URL")
+            or "https://zileanfortheweebs.midnightignite.me"
+        ).strip()
+        result_format_style = (
+            (env_file_value(env_file, "COMET_RESULT_FORMAT_STYLE") or "plain").strip().lower()
+        )
+        if result_format_style not in {"plain", "emoji"}:
+            raise RuntimeError(
+                "Invalid COMET_RESULT_FORMAT_STYLE value: "
+                f"{result_format_style!r}; expected 'plain' or 'emoji'"
+            )
+        patch_episode_pack_results = (
+            env_file_value(env_file, "COMET_PATCH_EPISODE_PACK_RESULTS") or "1"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        return cls(
+            root_dir=root_dir,
+            env_file=env_file,
+            vendor_dir=root_dir / "vendor",
+            lock_file=root_dir / "vendor" / "comet.lock.json",
+            repo_dir=root_dir / "vendor" / "comet",
+            compose_source_file=root_dir / "vendor" / "comet" / "deployment" / "docker-compose.yml",
+            state_dir=root_dir / ".stremio" / "comet",
+            runtime_env_file=root_dir / ".stremio" / "comet" / ".env",
+            data_dir=root_dir / ".stremio" / "comet" / "data",
+            postgres_data_dir=root_dir / ".stremio" / "comet" / "postgres-data",
+            service_name="comet",
+            postgres_service_name="comet-postgres",
+            container_name="comet",
+            postgres_container_name="comet-postgres",
+            host_port=host_port,
+            bind_addresses=bind_addresses,
+            public_base_url=public_base_url,
+            proxy_debrid_stream=proxy_enabled not in {"0", "false", "no", "off"},
+            proxy_max_connections=proxy_max_connections,
+            healthcheck_interval_seconds=healthcheck_interval_seconds,
+            configure_page_password=configure_page_password,
+            scrape_torrentio=scrape_torrentio,
+            torrentio_url=torrentio_url,
+            scrape_zilean=scrape_zilean,
+            zilean_url=zilean_url,
+            result_format_style=result_format_style,
+            patch_episode_pack_results=patch_episode_pack_results,
+            default_debrid_service=(
+                env_file_value(env_file, "COMET_DEFAULT_DEBRID_SERVICE") or "realdebrid"
+            ).strip(),
+            default_debrid_apikey=env_file_value(env_file, "COMET_DEFAULT_DEBRID_APIKEY") or None,
+            enabled=(env_file_value(env_file, "COMET_ENABLED") or "0").strip().lower()
+            in {"1", "true", "yes", "on"},
         )

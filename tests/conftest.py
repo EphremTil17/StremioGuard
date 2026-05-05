@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from stremioguard.config import Config
+from stremioguard.config import CometConfig, Config
 
 
 class FakeRunner:
@@ -88,3 +88,42 @@ def compose_args_prefix(tmp_path: Path) -> list[str]:
         "-f",
         str(tmp_path / ".stremio" / "docker-compose.bindings.yml"),
     ]
+
+
+def make_comet_config(tmp_path: Path, **overrides: object) -> CometConfig:
+    state_dir = tmp_path / ".stremio" / "comet"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    values: dict[str, object] = {
+        "root_dir": tmp_path,
+        "env_file": tmp_path / ".env",
+        "vendor_dir": tmp_path / "vendor",
+        "lock_file": tmp_path / "vendor" / "comet.lock.json",
+        "repo_dir": tmp_path / "vendor" / "comet",
+        "compose_source_file": tmp_path / "vendor" / "comet" / "deployment" / "docker-compose.yml",
+        "state_dir": state_dir,
+        "runtime_env_file": state_dir / ".env",
+        "data_dir": state_dir / "data",
+        "postgres_data_dir": state_dir / "postgres-data",
+        "service_name": "comet",
+        "postgres_service_name": "comet-postgres",
+        "container_name": "comet",
+        "postgres_container_name": "comet-postgres",
+        "host_port": 18000,
+        "bind_addresses": ("127.0.0.1",),
+        "public_base_url": None,
+        "proxy_debrid_stream": True,
+        "proxy_max_connections": -1,
+        "healthcheck_interval_seconds": 300,
+        "configure_page_password": "cfg-password",
+        "scrape_torrentio": "live",
+        "torrentio_url": "https://torrentio.strem.fun",
+        "scrape_zilean": "live",
+        "zilean_url": "https://zileanfortheweebs.midnightignite.me",
+        "result_format_style": "plain",
+        "patch_episode_pack_results": True,
+        "default_debrid_service": "realdebrid",
+        "default_debrid_apikey": "rd-key",
+        "enabled": True,
+    }
+    values.update(overrides)
+    return CometConfig(**values)  # type: ignore[arg-type]
