@@ -6,6 +6,9 @@ The repo's job is the **Stremio side** of inbound access — `STREMIO_BIND_ADDRS
 is your pre-existing infrastructure. This doc lists three tiers, what each tier
 assumes you have already, and what you set in `.env` for each.
 
+For the Tailscale-specific MagicDNS/Serve workflow used in the unified
+StremioGuard + Comet setup, see [tailscale-runbook.md](tailscale-runbook.md).
+
 The Stremio-side config is intentionally small. Tiers differ mainly in what's
 in front of Stremio.
 

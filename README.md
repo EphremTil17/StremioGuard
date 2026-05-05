@@ -56,10 +56,12 @@ Run the guided initializer:
 ```
 
 This creates `.env` from `.env.example` if needed, offers a couple of optional Stremio toggles up front, and then walks through NordVPN protocol setup. Re-running `init` is idempotent: once the chosen protocol credentials are populated, the setup step is skipped.
+The same guided flow now also offers an optional Comet branch so you can leave
+Comet disabled on Stremio-only deployments or configure it in the same pass.
 
 During guided setup, Stremio asks which deployment **tier** you're running:
 
-- **Tier 1 — LAN + Tailscale only.** No public domain. Init writes `STREMIO_BIND_ADDRS=<host-LAN-IP>,<host-tailscale-IP>` when you choose both addresses and clears `EXTERNAL_BASE_URL`. LAN clients reach Stremio at `http://<host-LAN-IP>:<STREMIO_HOST_PORT>`; tailnet clients reach it at `http://<host-tailscale-IP>:<STREMIO_HOST_PORT>`.
+- **Tier 1 — LAN + Tailscale only.** No public domain. Init writes `STREMIO_BIND_ADDRS=<host-LAN-IP>,<host-tailscale-IP>` when you choose both addresses and clears `EXTERNAL_BASE_URL`. LAN clients reach Stremio at `http://<host-LAN-IP>:<STREMIO_HOST_PORT>`. Tailnet clients can still reach the raw Tailscale IP directly, but the recommended browser/addon path is Tailscale Serve HTTPS on the node's `*.ts.net` hostname. See [docs/tailscale-runbook.md](docs/tailscale-runbook.md) for the end-to-end Serve flow.
 - **Tier 2 / 3 — reverse-proxied behind a domain.** Init writes the selected bind addresses plus `EXTERNAL_BASE_URL=https://<your-domain>`. You provide the proxy (NPM, Caddy, Traefik, raw nginx); it upstreams to one selected host address on `STREMIO_HOST_PORT` and applies whatever access control fits your threat model. Tier 2 is tailnet-only via a Cloudflare → CGNAT DNS pivot; Tier 3 is publicly routable. The Stremio-side config is identical for both.
 
 `init` is idempotent — re-run it to switch tiers. Raw `docker compose up` does not publish Stremio's host port; the guard generates a local Compose override from `STREMIO_BIND_ADDRS` before starting the stack. See [docs/secure-access.md](docs/secure-access.md) for the full per-tier runbook, threat model, and verification steps.
@@ -114,6 +116,73 @@ Useful first-run checks:
 ./stremio stop
 ```
 
+## Modular Comet playback proxy
+
+Phase 1 now includes an optional, modular [Comet](https://github.com/g0ldyy/comet)
+subsystem for debrid stream proxy experiments. StremioGuard manages Comet as a
+first-class part of the same Docker product: when enabled, Comet shares
+`gluetun`'s network namespace and the root `./stremio` commands manage it
+automatically.
+
+- Upstream source lives in `vendor/comet` and is pinned by `vendor/comet.lock.json`.
+- Local Comet runtime state lives under `.stremio/comet/`.
+- StremioGuard generates the Comet runtime `.env` plus mounted runtime overrides;
+  it does not edit the upstream Comet checkout itself.
+- The managed override files are rendered by `scripts/generate_comet_overrides.py`,
+  which is also what the setup flow uses internally.
+- The default `COMET_TORRENTIO_URL` stays generic (`https://torrentio.strem.fun`)
+  so setup does not require pasting a secret-bearing native Torrentio addon URL
+  into the root `.env`.
+- `./stremio comet install` now protects Comet's `/configure` page by default so
+  a shared domain does not let other users rewrite addon settings.
+- The Comet setup flow also offers an optional episode-pack preservation patch
+  so Torrentio/Zilean-backed episode results inside season packs survive more
+  like native Torrentio.
+- These optional Comet compatibility patches are strongly recommended. See
+  [docs/comet-patches.md](docs/comet-patches.md) for the logic, methodology,
+  and tradeoffs behind them.
+- The current compatibility strategy is "resolved-file-first" matching:
+  preserve obviously valid Torrentio-backed results when the resolved filename
+  and file-level evidence are strong, instead of trusting only the noisy outer
+  torrent title.
+- Server-owned fallback debrid credentials are optional. If you prefer to do all
+  final addon configuration inside Comet's `/configure` page and then distribute
+  only the finished addon or Stremio account, you can skip them during setup.
+- Comet inherits `STREMIO_BIND_ADDRS` in the unified stack model, so Stremio and
+  Comet publish on the same host interfaces with separate ports.
+- Phase 1 validates debrid video proxy behavior only. It does **not** claim
+  that every subtitle, manifest, or auxiliary playback request is proxied.
+
+Comet commands:
+
+```bash
+./stremio comet install
+./stremio comet start
+./stremio comet status
+./stremio comet doctor
+./stremio comet probe-playback --url 'http://<comet-host>:18000/.../playback/...'
+./stremio comet logs
+./stremio comet stop
+```
+
+Recommended phase-1 shape:
+
+- publish Stremio and Comet on the same Tailscale and/or LAN bind addresses
+- use a server-owned debrid API key when needed
+- keep Comet inside `gluetun` so proxy egress matches the Stremio VPN path
+
+`./stremio comet doctor` verifies the pinned checkout, container health, bind
+surface, gluetun network-namespace sharing, matching VPN egress IPs, and
+required proxy settings. `./stremio comet probe-playback` is the proof tool: it
+checks whether a playback URL stays on the Comet endpoint or redirects the
+client to a provider URL.
+
+For the current end-to-end Tailscale/MagicDNS/Serve workflow, see
+[docs/tailscale-runbook.md](docs/tailscale-runbook.md).
+Longer term, the project direction is to support a cleaner authenticated HTTPS
+domain flow in front of Stremio/Comet so Tailscale does not have to be the
+primary end-user access UX.
+
 ## Recommended workflow
 
 Use the root wrapper as the normal entry point:
@@ -134,7 +203,9 @@ With no arguments, `./stremio` behaves like `./stremio start`.
    - the IP matches your saved home-IP baseline, or
    - `EXPECTED_VPN_IP` is set and does not match.
 6. Starts Stremio inside gluetun's network namespace.
-7. Launches the background watchdog and returns to the shell.
+7. If `COMET_ENABLED=1`, prepares the vendored Comet runtime and starts Comet
+   plus its PostgreSQL dependency inside the same gluetun network namespace.
+8. Launches the background watchdog and returns to the shell.
 
 ### Container restart policy
 
@@ -159,16 +230,16 @@ Command guide:
   Guided first-time setup. Creates `.env` from `.env.example` when needed, collects optional Stremio settings, and then helps you configure NordVPN through either WireGuard or OpenVPN before starting the stack.
 
 - `./stremio start`
-  Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then launches the watchdog in the background and returns to the shell.
+  Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then launches the watchdog in the background and returns to the shell. When `COMET_ENABLED=1`, it also prepares and starts Comet automatically.
 
 - `./stremio restart`
-  Reset/build/start flow. Runs `docker compose down --remove-orphans`, brings gluetun back up, rebuilds the local Stremio image, and starts Stremio again. It does not delete `stremio-data/` or `gluetun-data/`.
+  Reset/build/start flow. Runs `docker compose down --remove-orphans`, brings gluetun back up, rebuilds the local Stremio image, and starts Stremio again. When `COMET_ENABLED=1`, it also refreshes Comet runtime files and restarts Comet. It does not delete `stremio-data/`, `gluetun-data/`, or `.stremio/comet/`.
 
 - `./stremio stop`
-  Stops the watchdog first, then stops Stremio, so the background guard does not immediately start it back up again.
+  Stops the watchdog first, then stops Stremio and Comet when enabled, so the background guard does not immediately start them back up again.
 
 - `./stremio status`
-  Shows gluetun health, the current public IP as seen from inside gluetun, and the Stremio container status.
+  Shows gluetun health, the current public IP as seen from inside gluetun, and the Stremio container status. When `COMET_ENABLED=1`, it also shows Comet status and its observed network mode.
 
 - `./stremio logs`
   Tails the latest host-side run log.
