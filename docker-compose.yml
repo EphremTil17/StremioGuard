@@ -8,6 +8,8 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     env_file: .env
+    environment:
+      HTTP_CONTROL_SERVER_ADDRESS: 127.0.0.1:18080
     volumes:
       - ./gluetun-data:/gluetun
 
@@ -36,3 +38,60 @@ services:
     depends_on:
       gluetun:
         condition: service_healthy
+
+  comet-postgres:
+    image: postgres:18-alpine
+    container_name: comet-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: comet
+      POSTGRES_PASSWORD: comet
+      POSTGRES_DB: comet
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=128MB"
+      - "-c"
+      - "effective_cache_size=384MB"
+      - "-c"
+      - "maintenance_work_mem=64MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "wal_buffers=8MB"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_io_concurrency=200"
+      - "-c"
+      - "work_mem=8MB"
+      - "-c"
+      - "max_connections=100"
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U comet -d comet"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  comet:
+    image: g0ldyy/comet
+    container_name: comet
+    restart: unless-stopped
+    environment:
+      DATABASE_TYPE: postgresql
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+      comet-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
