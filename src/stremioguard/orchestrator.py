@@ -263,6 +263,7 @@ def reset() -> None:
 @app.command(hidden=True)
 def pull() -> None:
     """Pull the latest gluetun image."""
+
     def _pull(o: Orchestrator) -> None:
         o.guard.require_commands()
         o.guard.log(f"Pulling latest image for {o.guard.config.gluetun_container_name}.")

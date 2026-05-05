@@ -15,11 +15,14 @@ from pathlib import Path
 import typer
 from loguru import logger
 
+from stremioguard.comet import CometManager, prompt_comet_setup
+from stremioguard.config import CometConfig, Config
 from stremioguard.env import (
     env_flag_enabled,
     env_needs_init,
     fail,
     read_env_provider,
+    write_env_setting,
 )
 from stremioguard.init import (
     configure_external_access,
@@ -33,6 +36,8 @@ APP = typer.Typer(
     help="Start and guard Stremio behind the gluetun VPN container.",
     no_args_is_help=False,
 )
+COMET_APP = typer.Typer(help="Manage the modular Comet playback-proxy subsystem.")
+APP.add_typer(COMET_APP, name="comet")
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 LOG_DIR = ROOT_DIR / "logs"
@@ -212,6 +217,14 @@ def _latest_log() -> Path | None:
     return logs[0] if logs else None
 
 
+def _comet_manager() -> CometManager:
+    return CometManager(CometConfig.from_env(ROOT_DIR))
+
+
+def _comet_enabled() -> bool:
+    return CometConfig.from_env(ROOT_DIR).enabled
+
+
 def is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
@@ -260,14 +273,21 @@ def init() -> None:
     else:
         logger.info(f"{ENV_FILE.name} already exists.")
 
-    untouched_template = ENV_EXAMPLE.exists() and ENV_FILE.read_bytes() == ENV_EXAMPLE.read_bytes()
-    if untouched_template:
-        configure_external_access(ENV_FILE)
-        configure_optional_stremio_settings(ENV_FILE)
-    
+    configure_external_access(ENV_FILE)
+    configure_optional_stremio_settings(ENV_FILE)
+    existing_comet = CometConfig.from_env(ROOT_DIR).enabled
+    if typer.confirm(
+        "Configure the optional Comet playback-proxy subsystem?",
+        default=existing_comet,
+    ):
+        prompt_comet_setup(CometConfig.from_env(ROOT_DIR))
+    elif existing_comet:
+        write_env_setting(ENV_FILE, "COMET_ENABLED", "0")
+        logger.info("Comet disabled in .env. The unified stack will skip it on the next start.")
+
     logger.info("Pulling the latest VPN container image...")
     run_guard("pull", file_logging=False)
-    
+
     provider = prompt_provider(read_env_provider(ENV_FILE))
     if provider == "nordvpn":
         logger.info("Walking through NordVPN credential setup.")
@@ -283,8 +303,13 @@ def init() -> None:
 def start() -> None:
     """Initialize if needed, start Stremio, and launch the watchdog."""
     _warn_for_optional_stremio_settings()
+    comet_manager = _comet_manager() if _comet_enabled() else None
+    if comet_manager is not None:
+        comet_manager.prepare_runtime()
     context = RunContext.create()
     run_guard("start", context=context)
+    if comet_manager is not None:
+        comet_manager.start()
     _start_watchdog(context)
 
 
@@ -292,9 +317,14 @@ def start() -> None:
 def restart() -> None:
     """Reset/build/start Stremio and relaunch the watchdog."""
     _warn_for_optional_stremio_settings()
+    comet_manager = _comet_manager() if _comet_enabled() else None
+    if comet_manager is not None:
+        comet_manager.prepare_runtime()
     context = RunContext.create()
     _stop_watchdog()
     run_guard("reset", context=context)
+    if comet_manager is not None:
+        comet_manager.start()
     _start_watchdog(context)
 
 
@@ -302,6 +332,8 @@ def restart() -> None:
 def stop() -> None:
     """Stop the watchdog and Stremio."""
     _stop_watchdog()
+    if _comet_enabled():
+        _comet_manager().stop()
     run_guard("stop", file_logging=False)
 
 
@@ -309,6 +341,9 @@ def stop() -> None:
 def status() -> None:
     """Show VPN, public IP, and container status."""
     run_guard("status", file_logging=False)
+    if _comet_enabled():
+        logger.info("--- Comet ---")
+        _comet_manager().status()
 
 
 @APP.command()
@@ -335,6 +370,95 @@ def check() -> None:
     subprocess.run(_uv_command("ruff", "check", "."), check=True, cwd=ROOT_DIR)
     subprocess.run(_uv_command("pyright"), check=True, cwd=ROOT_DIR)
     subprocess.run(_uv_command("pytest"), check=True, cwd=ROOT_DIR)
+
+
+@COMET_APP.command("install")
+def comet_install() -> None:
+    """Clone/pin Comet and write local runtime configuration."""
+    config = CometConfig.from_env(ROOT_DIR)
+    if not is_interactive():
+        fail("`./stremio comet install` needs an interactive terminal.")
+    prompt_comet_setup(config)
+    manager = CometManager(CometConfig.from_env(ROOT_DIR))
+    manager.install()
+    logger.success("Comet is installed and configured locally.")
+
+
+@COMET_APP.command("update")
+def comet_update() -> None:
+    """Fetch Comet upstream refs and re-checkout the pinned commit."""
+    manager = _comet_manager()
+    manager.fetch_and_checkout_pinned()
+    logger.success("Comet checkout refreshed to the pinned commit.")
+
+
+@COMET_APP.command("start")
+def comet_start() -> None:
+    """Start the Comet stack managed by StremioGuard."""
+    manager = _comet_manager()
+    manager.start()
+
+
+@COMET_APP.command("stop")
+def comet_stop() -> None:
+    """Stop the Comet stack."""
+    manager = _comet_manager()
+    manager.stop()
+
+
+@COMET_APP.command("status")
+def comet_status() -> None:
+    """Show Comet repo and container status."""
+    manager = _comet_manager()
+    manager.status()
+
+
+@COMET_APP.command("doctor")
+def comet_doctor() -> None:
+    """Validate the local Comet proxy deployment."""
+    manager = _comet_manager()
+    manager.doctor()
+
+
+@COMET_APP.command("probe-playback")
+def comet_probe_playback(
+    url: str = typer.Option(..., "--url", help="Comet playback URL to probe."),
+) -> None:
+    """Probe a Comet playback URL to verify it stays on the proxy path."""
+    manager = _comet_manager()
+    result = manager.probe_playback(url, expect_proxy=manager.config.proxy_debrid_stream)
+    logger.info(
+        f"Playback probe classification={result.classification} "
+        f"status={result.status_code} location={result.location or '-'} "
+        f"content_type={result.content_type or '-'}"
+    )
+
+
+@COMET_APP.command("logs")
+def comet_logs(
+    lines: int = typer.Option(120, "--lines", "-n", help="Initial lines to show."),
+) -> None:
+    """Tail the Comet service logs."""
+    manager = _comet_manager()
+    manager.prepare_runtime()
+    root_config = Config.from_env()
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(root_config.compose_file),
+            "-f",
+            str(root_config.compose_override_file),
+            "logs",
+            "-f",
+            "--tail",
+            str(lines),
+            manager.config.service_name,
+            manager.config.postgres_service_name,
+        ],
+        check=False,
+    )
 
 
 if __name__ == "__main__":

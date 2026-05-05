@@ -19,6 +19,10 @@ __pycache__/
 # Runtime logs
 logs/*.log
 
+# Managed upstream vendored checkout
+vendor/comet/
+!vendor/comet.lock.json
+
 # Stremio runtime/container data
 stremio-data/
 gluetun-data/
@@ -27,3 +31,5 @@ gluetun-data/
 .DS_Store
 Thumbs.db
 CLAUDE.md
+certs/lemons.tarpon-penny.ts.net.crt
+certs/lemons.tarpon-penny.ts.net.key
