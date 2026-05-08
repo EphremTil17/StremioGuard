@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -69,6 +70,16 @@ def render_stream_override(repo_dir: Path) -> str:
     helper_marker = "def _build_stream_name(\n"
     if "_display_resolution_label(" not in content:
         helper = """
+def _forwarded_external_base(request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+    forwarded_prefix = request.headers.get("x-forwarded-prefix", "")
+    if forwarded_proto and forwarded_host:
+        prefix = forwarded_prefix.rstrip("/")
+        return f"{forwarded_proto}://{forwarded_host}{prefix}"
+    return f"{request.url.scheme}://{request.url.netloc}"
+
+
 def _hdr_badge(formatted_components: dict | None) -> str:
     if not formatted_components:
         return ""
@@ -123,10 +134,29 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
                 "stream helper signature has changed."
             )
         content = content.replace(helper_marker, helper + helper_marker, 1)
+    original_base_url = """    base_playback_host = (
+        settings.PUBLIC_BASE_URL
+        if settings.PUBLIC_BASE_URL
+        else f"{request.url.scheme}://{request.url.netloc}"
+    )
+"""
+    replacement_base_url = """    base_playback_host = (
+        settings.PUBLIC_BASE_URL
+        if settings.PUBLIC_BASE_URL
+        else _forwarded_external_base(request)
+    )
+"""
+    if replacement_base_url not in content:
+        if original_base_url not in content:
+            raise RuntimeError(
+                "Unable to apply managed Comet playback-base patch; upstream "
+                "playback URL block has changed."
+            )
+        content = content.replace(original_base_url, replacement_base_url, 1)
     original = '        return f"[{service}{icon}] Comet {resolution}"'
     replacement = (
-        '        primary = _display_primary_label(resolution, formatted_components)\n'
-        '        hdr = _hdr_badge(formatted_components)\n'
+        "        primary = _display_primary_label(resolution, formatted_components)\n"
+        "        hdr = _hdr_badge(formatted_components)\n"
         '        return f"{primary} | {hdr}" if hdr else primary'
     )
     if replacement not in content:
@@ -135,6 +165,177 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
                 "Unable to apply managed Comet stream-name patch; upstream name format has changed."
             )
         content = content.replace(original, replacement, 1)
+    return content
+
+
+def render_config_override(repo_dir: Path) -> str:
+    config_file = repo_dir / "comet" / "api" / "endpoints" / "config.py"
+    if not config_file.exists():
+        raise RuntimeError(f"Comet config endpoint file not found at {config_file}.")
+    content = config_file.read_text(encoding="utf-8")
+
+    marker = "def _next_url(request: Request):\n"
+    if "_forwarded_prefix(" not in content:
+        helper = """
+def _forwarded_prefix(request: Request) -> str:
+    prefix = request.headers.get("x-forwarded-prefix", "").strip().rstrip("/")
+    if not prefix:
+        return ""
+    return prefix if prefix.startswith("/") else f"/{prefix}"
+
+
+def _prefixed_path(request: Request, path: str) -> str:
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    prefix = _forwarded_prefix(request)
+    if prefix and not normalized_path.startswith(f"{prefix}/") and normalized_path != prefix:
+        return f"{prefix}{normalized_path}"
+    return normalized_path
+
+
+def _sanitize_next_url_for_request(request: Request, next_url: str | None):
+    sanitized = _sanitize_next_url(next_url)
+    if sanitized == "/configure":
+        return _prefixed_path(request, "/configure")
+    return sanitized
+
+
+def _is_secure_request(request: Request) -> bool:
+    return (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
+
+
+"""
+        if marker not in content:
+            raise RuntimeError(
+                "Unable to apply managed Comet config-prefix patch; upstream "
+                "next-url helper has changed."
+            )
+        content = content.replace(marker, helper + marker, 1)
+
+    original_next = """def _next_url(request: Request):
+    return (
+        f"{request.url.path}?{request.url.query}"
+        if request.url.query
+        else request.url.path
+    )
+"""
+    replacement_next = """def _next_url(request: Request):
+    path = _prefixed_path(request, request.url.path)
+    return f"{path}?{request.url.query}" if request.url.query else path
+"""
+    if replacement_next not in content:
+        if original_next not in content:
+            raise RuntimeError(
+                "Unable to apply managed Comet config-prefix patch; upstream "
+                "next-url body has changed."
+            )
+        content = content.replace(original_next, replacement_next, 1)
+
+    replacements = {
+        '"form_action": "/configure/login",': (
+            '"form_action": _prefixed_path(request, "/configure/login"),'
+        ),
+        '"next_url": _sanitize_next_url(next_url),': (
+            '"next_url": _sanitize_next_url_for_request(request, next_url),'
+        ),
+        "return RedirectResponse(_sanitize_next_url(next_url), status_code=303)": (
+            "return RedirectResponse("
+            "_sanitize_next_url_for_request(request, next_url), status_code=303)"
+        ),
+        'next_url=_sanitize_next_url(next_url), error="Invalid password"': (
+            'next_url=_sanitize_next_url_for_request(request, next_url), error="Invalid password"'
+        ),
+        "response = RedirectResponse(_sanitize_next_url(next_url), status_code=303)": (
+            "response = RedirectResponse("
+            "_sanitize_next_url_for_request(request, next_url), status_code=303)"
+        ),
+        'secure=request.url.scheme == "https",': "secure=_is_secure_request(request),",
+        'return RedirectResponse("/configure", status_code=303)': (
+            'return RedirectResponse(_prefixed_path(request, "/configure"), status_code=303)'
+        ),
+    }
+    for before, after in replacements.items():
+        content = content.replace(before, after)
+    return content
+
+
+def render_configure_template_override(
+    repo_dir: Path,
+    gateway_addon_base_url: str | None = None,
+) -> str:
+    template_file = repo_dir / "comet" / "templates" / "index.html"
+    if not template_file.exists():
+        raise RuntimeError(f"Comet configure template not found at {template_file}.")
+    content = template_file.read_text(encoding="utf-8")
+
+    prefix_marker = '          const stremioApiPrefix = {{ (stremioApiPrefix or "") | tojson }};\n'
+    gateway_base_literal = json.dumps((gateway_addon_base_url or "").rstrip("/"))
+    if "function getCometMountPath()" not in content:
+        prefix_line = (
+            '          const stremioApiPrefix = {{ (stremioApiPrefix or "") | tojson }};\n'
+        )
+        prefix_helper = (
+            prefix_line
+            + """          const cometConfiguredPublicBase = __GATEWAY_ADDON_BASE_URL__;
+
+          function getCometMountPath() {
+            const segments = window.location.pathname.split("/").filter(Boolean);
+            const configureIndex = segments.lastIndexOf("configure");
+            const cometIndex = segments.indexOf("comet");
+            if (cometIndex < 0 || configureIndex < 0 || cometIndex >= configureIndex) {
+              return "";
+            }
+            return "/" + segments.slice(0, cometIndex + 1).join("/");
+          }
+
+          function getCometPublicBase() {
+            if (cometConfiguredPublicBase) {
+              return cometConfiguredPublicBase;
+            }
+            return `${window.location.origin}${getCometMountPath()}`;
+          }
+
+          function getCometInstallBase(host, cometMountPath) {
+            if (!cometConfiguredPublicBase) {
+              return `${host}${cometMountPath}`;
+            }
+            const url = new URL(cometConfiguredPublicBase);
+            return `${url.host}${url.pathname.replace(/\\/$/, "")}`;
+          }
+"""
+        )
+        prefix_helper = prefix_helper.replace("__GATEWAY_ADDON_BASE_URL__", gateway_base_literal)
+        if prefix_marker not in content:
+            raise RuntimeError(
+                "Unable to apply managed Comet configure-template patch; upstream "
+                "stremioApiPrefix marker has changed."
+            )
+        content = content.replace(prefix_marker, prefix_helper, 1)
+
+    host_line = "            const host = window.location.host;"
+    host_replacement = (
+        "            const host = window.location.host;\n"
+        "            const cometMountPath = getCometMountPath();\n"
+        "            const cometPublicBase = getCometPublicBase();\n"
+        "            const cometInstallBase = getCometInstallBase(host, cometMountPath);"
+    )
+    if host_replacement not in content:
+        content = content.replace(host_line, host_replacement)
+    content = content.replace(
+        "`stremio://${host}${stremioApiPrefix}/manifest.json`",
+        "`stremio://${cometInstallBase}${stremioApiPrefix}/manifest.json`",
+    )
+    content = content.replace(
+        "`stremio://${host}${stremioApiPrefix}/${settingsString}/manifest.json`",
+        "`stremio://${cometInstallBase}${stremioApiPrefix}/${settingsString}/manifest.json`",
+    )
+    content = content.replace(
+        "`${window.location.origin}${stremioApiPrefix}/manifest.json`",
+        "`${cometPublicBase}${stremioApiPrefix}/manifest.json`",
+    )
+    content = content.replace(
+        "`${window.location.origin}${stremioApiPrefix}/${settingsString}/manifest.json`",
+        "`${cometPublicBase}${stremioApiPrefix}/${settingsString}/manifest.json`",
+    )
     return content
 
 
@@ -199,40 +400,44 @@ def render_torrentio_override(repo_dir: Path) -> str:
     indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
     inner = indent + "    "
     inner2 = inner + "    "
+    quality_needles = (
+        '"hdr", "dolby vision", " dv ", "[dv", "web-dl", "webrip", '
+        '"bluray", "bdrip", "hdtv", "remux"'
+    )
     replacement_lines = [
         f'{indent}info_hash = torrent.get("infoHash")',
         f'{indent}file_index = torrent.get("fileIdx", None)',
         f'{indent}behavior_hints = torrent.get("behaviorHints", {{}}) or {{}}',
-        f'{indent}title_lines = [line.strip() for line in title_full.splitlines() if line.strip()]',
+        f"{indent}title_lines = [line.strip() for line in title_full.splitlines() if line.strip()]",
         f'{indent}resolved_filename = behavior_hints.get("filename")',
-        f'{indent}metadata_lines = [',
-        f'{inner}line for line in title_lines',
+        f"{indent}metadata_lines = [",
+        f"{inner}line for line in title_lines",
         f'{inner}if "💾" not in line and "👤" not in line and "⚙️" not in line and "🇬" not in line',
-        f'{indent}]',
-        f'{indent}def _line_score(line: str) -> tuple[int, int]:',
-        f'{inner}normalized = line.lower()',
-        f'{inner}score = 0',
+        f"{indent}]",
+        f"{indent}def _line_score(line: str) -> tuple[int, int]:",
+        f"{inner}normalized = line.lower()",
+        f"{inner}score = 0",
         f'{inner}for needle in ("2160p", "1080p", "720p", "576p", "480p", "360p", "240p", "4k"):',
-        f'{inner2}if needle in normalized:',
-        f'{inner2}    score += 8',
-        f'{inner}for needle in ("hdr", "dolby vision", " dv ", "[dv", "web-dl", "webrip", "bluray", "bdrip", "hdtv", "remux"):',
-        f'{inner2}if needle in normalized:',
-        f'{inner2}    score += 4',
+        f"{inner2}if needle in normalized:",
+        f"{inner2}    score += 8",
+        f"{inner}for needle in ({quality_needles}):",
+        f"{inner2}if needle in normalized:",
+        f"{inner2}    score += 4",
         f'{inner}for needle in ("x265", "x264", "hevc", "avc", "xvid", "ddp", "dts", "aac"):',
-        f'{inner2}if needle in normalized:',
-        f'{inner2}    score += 2',
+        f"{inner2}if needle in normalized:",
+        f"{inner2}    score += 2",
         f'{inner}if "s01e01" in normalized or "s01" in normalized or "1x01" in normalized:',
-        f'{inner2}score += 2',
-        f'{inner}return score, len(line)',
-        f'{indent}display_title = title',
-        f'{indent}if metadata_lines:',
-        f'{inner}display_title = max(metadata_lines, key=_line_score)',
-        f'{indent}elif title_lines:',
-        f'{inner}display_title = title_lines[0]',
-        f'{indent}if not resolved_filename and title_lines:',
-        f'{inner}fallback_filename = title_lines[-1]',
-        f'{inner}if fallback_filename != display_title:',
-        f'{inner2}resolved_filename = fallback_filename',
+        f"{inner2}score += 2",
+        f"{inner}return score, len(line)",
+        f"{indent}display_title = title",
+        f"{indent}if metadata_lines:",
+        f"{inner}display_title = max(metadata_lines, key=_line_score)",
+        f"{indent}elif title_lines:",
+        f"{inner}display_title = title_lines[0]",
+        f"{indent}if not resolved_filename and title_lines:",
+        f"{inner}fallback_filename = title_lines[-1]",
+        f"{inner}if fallback_filename != display_title:",
+        f"{inner2}resolved_filename = fallback_filename",
         "",
         f"{indent}if not info_hash:",
         f'{inner}binge_group = behavior_hints.get("bingeGroup", "")',
@@ -501,6 +706,7 @@ def write_override_bundle(
     result_format_style: str,
     *,
     patch_episode_pack_results: bool,
+    gateway_addon_base_url: str | None = None,
 ) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -513,6 +719,11 @@ def write_override_bundle(
         formatter_target.write_text(formatter_rendered, encoding="utf-8")
 
     (state_dir / "stream.py").write_text(render_stream_override(repo_dir), encoding="utf-8")
+    (state_dir / "config.py").write_text(render_config_override(repo_dir), encoding="utf-8")
+    (state_dir / "index.html").write_text(
+        render_configure_template_override(repo_dir, gateway_addon_base_url),
+        encoding="utf-8",
+    )
     (state_dir / "torrentio.py").write_text(render_torrentio_override(repo_dir), encoding="utf-8")
     (state_dir / "filtering.py").write_text(render_filtering_override(repo_dir), encoding="utf-8")
     orchestration_target = state_dir / "orchestration.py"

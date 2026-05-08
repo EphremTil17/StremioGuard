@@ -14,7 +14,11 @@ from pathlib import Path
 import typer
 from loguru import logger
 
-from stremioguard.auth import AuthConfig
+from stremioguard.comet_gateway import (
+    COMET_GATEWAY_CONTAINER_PORT,
+    CometGatewayConfig,
+    CometGatewayManager,
+)
 from stremioguard.comet_overrides import (
     render_formatter_override as render_formatter_override_file,
 )
@@ -200,23 +204,43 @@ class CometManager:
     def root_override_file(self) -> Path:
         return self.config.root_dir / GENERATED_COMPOSE_FILE
 
+    def gateway_config(self) -> CometGatewayConfig:
+        return CometGatewayConfig.from_env(self.config.root_dir)
+
+    def gateway_manager(self) -> CometGatewayManager:
+        return CometGatewayManager(self.gateway_config(), self.runner)
+
+    def gateway_addon_base_url(self) -> str | None:
+        gateway_config = self.gateway_config()
+        if not gateway_config.enabled:
+            return None
+        gateway_manager = self.gateway_manager()
+        default_token = gateway_manager.default_token()
+        if not default_token:
+            return None
+        return gateway_manager.addon_base_url(default_token)
+
     def write_stack_override_file(self) -> None:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.config.postgres_data_dir.mkdir(parents=True, exist_ok=True)
+        gateway_config = self.gateway_config()
+        gateway_manager = CometGatewayManager(gateway_config, self.runner)
+        if gateway_config.enabled:
+            gateway_manager.prepare_runtime()
         write_override_bundle(
             repo_dir=self.config.repo_dir,
             state_dir=self.config.state_dir,
             result_format_style=self.config.result_format_style,
             patch_episode_pack_results=self.config.patch_episode_pack_results,
+            gateway_addon_base_url=self.gateway_addon_base_url(),
         )
-        auth_config = AuthConfig.from_env(self.config.root_dir)
         content = render_stack_compose_override(
             bind_addresses=list(self.config.bind_addresses),
             stremio_host_port=self.stremio_host_port(),
             stremio_container_port=self.stremio_container_port(),
             comet_config=self.config,
-            auth_config=auth_config if auth_config.enabled else None,
+            comet_gateway_config=gateway_config if gateway_config.enabled else None,
         )
         root_override = self.root_override_file()
         root_override.parent.mkdir(parents=True, exist_ok=True)
@@ -235,7 +259,8 @@ class CometManager:
         proxy_password = (
             env_file_value(existing, "PROXY_DEBRID_STREAM_PASSWORD") if existing else None
         ) or secrets.token_urlsafe(18)
-        public_base_url = self.config.public_base_url or ""
+        gateway_config = self.gateway_config()
+        public_base_url = "" if gateway_config.enabled else self.config.public_base_url or ""
         api_key = self.config.default_debrid_apikey or ""
         return "\n".join(
             [
@@ -308,21 +333,23 @@ class CometManager:
         self.prepare_runtime()
         self.check_bind_addresses()
         self.log("Starting Comet stack.")
-        self.compose(
-            "up",
-            "-d",
-            self.config.postgres_service_name,
-            self.config.service_name,
-            capture=False,
-        )
+        services = [self.config.postgres_service_name, self.config.service_name]
+        gateway_config = self.gateway_config()
+        if gateway_config.enabled:
+            services.append(gateway_config.service_name)
+        self.compose("up", "-d", *services, capture=False)
 
     def stop(self) -> None:
         self.require_commands()
         self.log("Stopping Comet stack.")
+        services = []
+        gateway_config = self.gateway_config()
+        if gateway_config.enabled:
+            services.append(gateway_config.service_name)
+        services.extend([self.config.service_name, self.config.postgres_service_name])
         self.compose(
             "stop",
-            self.config.service_name,
-            self.config.postgres_service_name,
+            *services,
             check=False,
             capture=False,
         )
@@ -336,10 +363,13 @@ class CometManager:
         if current and current != lock.pinned_commit:
             self.warn("Comet checkout is not on the pinned commit.")
         self.require_commands()
+        gateway_config = self.gateway_config()
+        services = [self.config.service_name, self.config.postgres_service_name]
+        if gateway_config.enabled:
+            services.append(gateway_config.service_name)
         result = self.compose(
             "ps",
-            self.config.service_name,
-            self.config.postgres_service_name,
+            *services,
             check=False,
         )
         self.log((result.stdout or "").rstrip() or "No Comet compose output available.")
@@ -429,6 +459,8 @@ class CometManager:
         return response.status == 200 and '"status":"ok"' in body.replace(" ", "")
 
     def base_url_for_checks(self) -> str:
+        if self.gateway_config().enabled:
+            return f"http://127.0.0.1:{self.config.host_port}"
         address = self.config.bind_addresses[0] if self.config.bind_addresses else "127.0.0.1"
         host = "127.0.0.1" if address == "0.0.0.0" else address
         return f"http://{host}:{self.config.host_port}"
@@ -455,15 +487,39 @@ class CometManager:
                 f"{self.base_url_for_checks()}/health. This can happen on WSL or "
                 "multi-interface hosts even when container health is fine."
             )
+        gateway_config = self.gateway_config()
+        comet_is_gateway_gated = gateway_config.enabled
         port_output = self.compose("ps", "gluetun", check=False).stdout or ""
-        for address in self.config.bind_addresses:
-            expected = f"{address}:{self.config.host_port}->8000/tcp"
-            if address == "0.0.0.0":
-                expected = f"0.0.0.0:{self.config.host_port}->8000/tcp"
-            if expected not in port_output:
-                raise RuntimeError(
-                    f"Comet port publishing does not include expected mapping {expected!r}."
+        if comet_is_gateway_gated:
+            for address in self.config.bind_addresses:
+                raw_comet_publish = f"{address}:{self.config.host_port}->8000/tcp"
+                if address != "127.0.0.1" and raw_comet_publish in port_output:
+                    raise RuntimeError(
+                        "Comet gateway is enabled but Comet's raw host port is still "
+                        f"published on {address}."
+                    )
+                expected_gateway = (
+                    f"{address}:{gateway_config.host_port}->{COMET_GATEWAY_CONTAINER_PORT}/tcp"
                 )
+                if expected_gateway not in port_output:
+                    raise RuntimeError(
+                        "Comet gateway port publishing does not include expected mapping "
+                        f"{expected_gateway!r}."
+                    )
+            if f"127.0.0.1:{self.config.host_port}->8000/tcp" not in port_output:
+                raise RuntimeError(
+                    "Comet gateway is enabled but raw Comet is not available on loopback "
+                    "for local operator diagnostics."
+                )
+        else:
+            for address in self.config.bind_addresses:
+                expected = f"{address}:{self.config.host_port}->8000/tcp"
+                if address == "0.0.0.0":
+                    expected = f"0.0.0.0:{self.config.host_port}->8000/tcp"
+                if expected not in port_output:
+                    raise RuntimeError(
+                        f"Comet port publishing does not include expected mapping {expected!r}."
+                    )
         runtime_env = self.config.runtime_env_file
         proxy_setting = (env_file_value(runtime_env, "PROXY_DEBRID_STREAM") or "").strip().lower()
         if proxy_setting not in {"true", "1", "yes", "on"}:
@@ -632,6 +688,54 @@ def prompt_comet_setup(config: CometConfig) -> None:
         "COMET_PROXY_MAX_CONNECTIONS",
         str(parsed_max_connections),
     )
+
+    typer.echo("")
+    typer.echo(
+        "Comet gateway access: public addon, stream, and playback URLs are protected by "
+        "a short token while /configure remains protected by the Comet password."
+    )
+    gateway_enabled = typer.confirm("Enable the token-managed Comet gateway?", default=True)
+    write_env_setting(config.env_file, "COMET_GATEWAY_ENABLED", "1" if gateway_enabled else "0")
+    if gateway_enabled:
+        gateway_config = CometGatewayConfig.from_env(config.root_dir)
+        gateway_port = typer.prompt(
+            "Comet gateway host port",
+            default=str(gateway_config.host_port),
+        ).strip()
+        try:
+            parsed_gateway_port = int(gateway_port)
+        except ValueError:
+            fail(f"COMET_GATEWAY_HOST_PORT must be a TCP port number; got {gateway_port!r}.")
+        if parsed_gateway_port < 1 or parsed_gateway_port > 65535:
+            fail(
+                f"COMET_GATEWAY_HOST_PORT must be between 1 and 65535; got {parsed_gateway_port!r}."
+            )
+        write_env_setting(config.env_file, "COMET_GATEWAY_HOST_PORT", str(parsed_gateway_port))
+
+        gateway_public_base_url = typer.prompt(
+            "Comet gateway public base URL (blank to infer from host/port)",
+            default=gateway_config.public_base_url or "",
+        ).strip()
+        write_env_setting(
+            config.env_file,
+            "COMET_GATEWAY_PUBLIC_BASE_URL",
+            gateway_public_base_url.rstrip("/"),
+        )
+        write_env_setting(
+            config.env_file,
+            "COMET_GATEWAY_TOKEN_LENGTH",
+            str(gateway_config.token_length),
+        )
+
+        refreshed_gateway = CometGatewayManager(CometGatewayConfig.from_env(config.root_dir))
+        if not refreshed_gateway.list_tokens() and typer.confirm(
+            "Create the default shared Comet addon token now?",
+            default=True,
+        ):
+            token_id, token_value = refreshed_gateway.add_token("Shared Addon")
+            logger.success(f"Created default Comet gateway token {token_id}.")
+            typer.echo(f"  Addon base: {refreshed_gateway.addon_base_url(token_value)}")
+
     typer.echo("")
     typer.echo(
         "Optional: configure one server-owned fallback debrid account. Leave this disabled "

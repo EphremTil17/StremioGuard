@@ -10,7 +10,6 @@ from loguru import logger
 
 from stremioguard.env import (
     DEFAULT_STREMIO_HOST_PORT,
-    env_file_value,
     env_port_value,
     write_env_setting,
 )
@@ -229,47 +228,3 @@ def print_manual_setup_pointer() -> None:
     typer.echo("  3. Set VPN_TYPE (wireguard or openvpn) and the relevant credentials.")
     typer.echo("  4. Reference: https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers")
     typer.echo("  5. Run `./stremio start` once .env is populated.")
-
-
-def _infer_auth_domain(env_path: Path) -> str:
-    external_url = env_file_value(env_path, "EXTERNAL_BASE_URL") or ""
-    if "://" in external_url:
-        host_part = external_url.split("://", 1)[1].rstrip("/")
-        if ":" in host_part:
-            host_part = host_part.rsplit(":", 1)[0]
-        return host_part
-    return ""
-
-
-def configure_auth_access(env_path: Path) -> None:
-    logger.info("Token-based authentication setup:")
-    typer.echo("")
-    typer.echo("This adds an nginx reverse-proxy that validates a short token in the URL path.")
-    typer.echo("Each device gets a unique URL like https://streamio.example.com/<token>/")
-    typer.echo("")
-
-    host_port = env_port_value(env_path, "AUTH_HOST_PORT", 11471)
-    write_env_setting(env_path, "AUTH_HOST_PORT", str(host_port))
-    logger.info(f"Auth proxy will publish on host port {host_port}.")
-
-    default_domain = _infer_auth_domain(env_path)
-    domain = (
-        typer.prompt(
-            "Domain for token URLs (e.g., streamio.example.com)",
-            default=default_domain or "",
-        )
-        .strip()
-        .lower()
-        .rstrip("/")
-    )
-    if domain.startswith(("http://", "https://")):
-        domain = domain.split("://", 1)[1]
-    write_env_setting(env_path, "AUTH_DOMAIN", domain)
-
-    write_env_setting(env_path, "AUTH_ENABLED", "1")
-    logger.success('Auth proxy enabled. Use `./stremio auth add "label"` to create tokens.')
-    typer.echo("")
-    typer.echo("After creating tokens, update your reverse proxy upstream:")
-    typer.echo("  Old: http://<bind-addr>:11470")
-    typer.echo(f"  New: http://<bind-addr>:{host_port}")
-    typer.echo("  Keep any network allowlists you want; the token is an application-layer gate.")
