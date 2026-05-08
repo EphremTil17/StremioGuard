@@ -39,10 +39,11 @@ services:
       gluetun:
         condition: service_healthy
 
-  auth-proxy:
+  comet-gateway:
     image: nginx:alpine
-    container_name: auth-proxy
+    container_name: comet-gateway
     restart: unless-stopped
+    network_mode: "service:gluetun"
     depends_on:
       gluetun:
         condition: service_healthy

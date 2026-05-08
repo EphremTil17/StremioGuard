@@ -268,7 +268,6 @@ class UnifiedCliTests(unittest.TestCase):
             mock.patch.object(cli_mod, "_warn_for_optional_stremio_settings"),
             mock.patch.object(cli_mod, "_comet_enabled", return_value=True),
             mock.patch.object(cli_mod, "_comet_manager", return_value=fake_manager),
-            mock.patch.object(cli_mod, "_auth_enabled", return_value=False),
             mock.patch.object(cli_mod, "RunContext") as context_cls,
             mock.patch.object(cli_mod, "run_guard") as run_guard,
             mock.patch.object(cli_mod, "_start_watchdog") as start_watchdog,
@@ -286,7 +285,6 @@ class UnifiedCliTests(unittest.TestCase):
             mock.patch.object(cli_mod, "_stop_watchdog"),
             mock.patch.object(cli_mod, "_comet_enabled", return_value=True),
             mock.patch.object(cli_mod, "_comet_manager", return_value=fake_manager),
-            mock.patch.object(cli_mod, "_auth_enabled", return_value=False),
             mock.patch.object(cli_mod, "run_guard") as run_guard,
         ):
             cli_mod.stop()
