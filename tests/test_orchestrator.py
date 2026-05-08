@@ -39,7 +39,7 @@ class OrchestratorTests(unittest.TestCase):
                 orch.setup_stremio(reset=True)
 
             prefix = compose_args_prefix(tmp_path)
-            self.assertIn([*prefix, "down", "--remove-orphans"], runner.calls)
+            self.assertIn([*prefix, "down", "--remove-orphans", "--timeout", "10"], runner.calls)
             self.assertIn([*prefix, "build", "stremio"], runner.calls)
             self.assertIn([*prefix, "up", "-d", "stremio"], runner.calls)
 
@@ -60,7 +60,7 @@ class OrchestratorTests(unittest.TestCase):
             prefix = compose_args_prefix(tmp_path)
             self.assertIn([*prefix, "build", "stremio"], runner.calls)
             self.assertIn([*prefix, "up", "-d", "stremio"], runner.calls)
-            self.assertNotIn([*prefix, "down", "--remove-orphans"], runner.calls)
+            self.assertNotIn([*prefix, "down", "--remove-orphans", "--timeout", "10"], runner.calls)
 
     def test_watch_once_stops_stremio_when_gluetun_unhealthy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -145,6 +145,10 @@ automatically.
   preserve obviously valid Torrentio-backed results when the resolved filename
   and file-level evidence are strong, instead of trusting only the noisy outer
   torrent title.
+- The managed Comet patch set also improves ranking and labeling by preserving
+  richer Torrentio title metadata and degrading better when resolution is
+  missing. See [docs/comet-patches.md](docs/comet-patches.md) for the full
+  rationale and tradeoffs.
 - Server-owned fallback debrid credentials are optional. If you prefer to do all
   final addon configuration inside Comet's `/configure` page and then distribute
   only the finished addon or Stremio account, you can skip them during setup.
@@ -182,6 +186,40 @@ For the current end-to-end Tailscale/MagicDNS/Serve workflow, see
 Longer term, the project direction is to support a cleaner authenticated HTTPS
 domain flow in front of Stremio/Comet so Tailscale does not have to be the
 primary end-user access UX.
+
+## Optional Auth Proxy
+
+The stack also supports an optional token-gated auth proxy in front of Stremio
+for lower-friction remote sharing without requiring every user to join a
+tailnet.
+
+- Each device gets its own tokenized URL like
+  `https://streamio.example.com/<token>/`
+- The raw Stremio host-port publish is suppressed when auth-proxy mode is on,
+  so the token gate becomes the intended remote entrypoint
+- The generated proxy config preserves the token path in Stremio-generated URLs
+  and clears client IP headers upstream by default
+
+If you want the details, see:
+
+- [docs/auth-proxy.md](docs/auth-proxy.md)
+- [docs/comet-patches.md](docs/comet-patches.md)
+
+For public reverse proxies such as Nginx Proxy Manager or raw nginx, the
+recommended upstream shape is:
+
+```nginx
+location / {
+    proxy_set_header X-Forwarded-For "";
+    proxy_set_header X-Real-IP "";
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $http_connection;
+    proxy_http_version 1.1;
+    proxy_pass http://<SERVERIP:11471>$request_uri;
+}
+```
+
+Replace `11471` with your configured `AUTH_HOST_PORT` if you changed it.
 
 ## Recommended workflow
 

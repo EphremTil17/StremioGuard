@@ -39,6 +39,20 @@ services:
       gluetun:
         condition: service_healthy
 
+  auth-proxy:
+    image: nginx:alpine
+    container_name: auth-proxy
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
   comet-postgres:
     image: postgres:18-alpine
     container_name: comet-postgres
