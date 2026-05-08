@@ -153,7 +153,7 @@ class InitPromptTests(unittest.TestCase):
             )
             self.assertEqual(env_file_value(env, "STREMIO_BIND_ADDRS"), "10.0.0.5")
 
-    def test_configure_external_access_warns_docker_proxy_on_loopback(self) -> None:
+    def test_configure_external_access_proxy_loopback_confirms_host_native(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
             env.write_text("EXTERNAL_BASE_URL=\nSTREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
@@ -161,18 +161,15 @@ class InitPromptTests(unittest.TestCase):
                 mock.patch.object(
                     typer,
                     "prompt",
-                    side_effect=["2", "1", "127.0.0.1", "y", "stremio.example.com"],
+                    side_effect=["2", "127.0.0.1", "y", "stremio.example.com"],
                 ),
-                mock.patch.object(typer, "echo"),
-                mock.patch.object(init_mod, "logger") as log,
+                mock.patch.object(typer, "echo") as echo,
+                mock.patch.object(init_mod, "logger"),
             ):
                 init_mod.configure_external_access(env)
-            log_messages = [call.args[0] for call in log.info.call_args_list if call.args]
+            echo_msgs = [call.args[0] for call in echo.call_args_list if call.args]
             self.assertTrue(
-                any(
-                    "loopback upstream only works for a host-native proxy" in m
-                    for m in log_messages
-                )
+                any("not in Docker" in m for m in echo_msgs),
             )
 
     def test_configure_external_access_uses_configured_host_port(self) -> None:
@@ -189,59 +186,61 @@ class InitPromptTests(unittest.TestCase):
             ):
                 init_mod.configure_external_access(env)
             echo_msgs = [call.args[0] for call in echo.call_args_list if call.args]
-            self.assertIn(
-                "How many host addresses should publish Stremio's streaming port (12470)?",
-                echo_msgs,
+            self.assertTrue(
+                any("12470" in m for m in echo_msgs),
             )
 
-    def test_prompt_bind_addresses_accepts_multiple_addresses(self) -> None:
+    def test_direct_bind_accepts_multiple_addresses(self) -> None:
         with (
             mock.patch.object(typer, "prompt", side_effect=["2", "10.168.77.10", "100.125.26.36"]),
             mock.patch.object(typer, "echo"),
         ):
-            self.assertEqual(init_mod._prompt_bind_addresses(), ["10.168.77.10", "100.125.26.36"])
+            self.assertEqual(
+                init_mod._prompt_direct_bind_addresses(),
+                ["10.168.77.10", "100.125.26.36"],
+            )
 
-    def test_prompt_bind_addresses_accepts_zero_addresses(self) -> None:
+    def test_direct_bind_accepts_zero_addresses(self) -> None:
         with (
             mock.patch.object(typer, "prompt", return_value="0"),
             mock.patch.object(typer, "echo"),
         ):
-            self.assertEqual(init_mod._prompt_bind_addresses(), [])
+            self.assertEqual(init_mod._prompt_direct_bind_addresses(), [])
 
-    def test_prompt_lan_bind_addr_accepts_lan_ip(self) -> None:
+    def test_proxy_bind_accepts_lan_ip(self) -> None:
         with (
             mock.patch.object(typer, "prompt", return_value="10.168.77.10"),
             mock.patch.object(typer, "echo"),
         ):
-            self.assertEqual(init_mod._prompt_lan_bind_addr(), "10.168.77.10")
+            self.assertEqual(init_mod._prompt_proxy_bind_address(), ["10.168.77.10"])
 
-    def test_prompt_lan_bind_addr_accepts_all_interfaces(self) -> None:
+    def test_proxy_bind_accepts_all_interfaces(self) -> None:
         with (
             mock.patch.object(typer, "prompt", return_value="0.0.0.0"),
             mock.patch.object(typer, "echo"),
         ):
-            self.assertEqual(init_mod._prompt_lan_bind_addr(), "0.0.0.0")
+            self.assertEqual(init_mod._prompt_proxy_bind_address(), ["0.0.0.0"])
 
-    def test_prompt_lan_bind_addr_rejects_invalid_then_accepts_valid(self) -> None:
+    def test_single_bind_rejects_invalid_then_accepts_valid(self) -> None:
         with (
             mock.patch.object(typer, "prompt", side_effect=["not-an-ip", "192.168.1.50"]),
             mock.patch.object(typer, "echo"),
         ):
-            self.assertEqual(init_mod._prompt_lan_bind_addr(), "192.168.1.50")
+            self.assertEqual(init_mod._prompt_single_bind_addr(), "192.168.1.50")
 
-    def test_prompt_lan_bind_addr_warns_on_loopback_and_re_prompts_when_declined(self) -> None:
+    def test_single_bind_warns_on_loopback_and_re_prompts_when_declined(self) -> None:
         with (
             mock.patch.object(typer, "prompt", side_effect=["127.0.0.1", "n", "10.0.0.5"]),
             mock.patch.object(typer, "echo"),
         ):
-            self.assertEqual(init_mod._prompt_lan_bind_addr(), "10.0.0.5")
+            self.assertEqual(init_mod._prompt_single_bind_addr(), "10.0.0.5")
 
-    def test_prompt_lan_bind_addr_accepts_loopback_after_explicit_confirmation(self) -> None:
+    def test_proxy_bind_warns_on_loopback_confirms_host_native(self) -> None:
         with (
             mock.patch.object(typer, "prompt", side_effect=["127.0.0.1", "y"]),
             mock.patch.object(typer, "echo"),
         ):
-            self.assertEqual(init_mod._prompt_lan_bind_addr(), "127.0.0.1")
+            self.assertEqual(init_mod._prompt_proxy_bind_address(), ["127.0.0.1"])
 
     def test_prompt_public_domain_strips_trailing_slash(self) -> None:
         with (
@@ -269,6 +268,7 @@ class UnifiedCliTests(unittest.TestCase):
             mock.patch.object(cli_mod, "_warn_for_optional_stremio_settings"),
             mock.patch.object(cli_mod, "_comet_enabled", return_value=True),
             mock.patch.object(cli_mod, "_comet_manager", return_value=fake_manager),
+            mock.patch.object(cli_mod, "_auth_enabled", return_value=False),
             mock.patch.object(cli_mod, "RunContext") as context_cls,
             mock.patch.object(cli_mod, "run_guard") as run_guard,
             mock.patch.object(cli_mod, "_start_watchdog") as start_watchdog,
@@ -286,6 +286,7 @@ class UnifiedCliTests(unittest.TestCase):
             mock.patch.object(cli_mod, "_stop_watchdog"),
             mock.patch.object(cli_mod, "_comet_enabled", return_value=True),
             mock.patch.object(cli_mod, "_comet_manager", return_value=fake_manager),
+            mock.patch.object(cli_mod, "_auth_enabled", return_value=False),
             mock.patch.object(cli_mod, "run_guard") as run_guard,
         ):
             cli_mod.stop()

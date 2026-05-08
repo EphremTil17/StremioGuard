@@ -69,6 +69,13 @@ def render_stream_override(repo_dir: Path) -> str:
     helper_marker = "def _build_stream_name(\n"
     if "_display_resolution_label(" not in content:
         helper = """
+def _hdr_badge(formatted_components: dict | None) -> str:
+    if not formatted_components:
+        return ""
+    video_info = str(formatted_components.get("video", "") or "").upper()
+    return "HDR" if "HDR" in video_info or "DV" in video_info else ""
+
+
 def _display_resolution_label(resolution) -> str:
     normalized = str(resolution).strip().upper()
     labels = {
@@ -85,6 +92,30 @@ def _display_resolution_label(resolution) -> str:
     return labels.get(normalized, str(resolution))
 
 
+def _display_primary_label(resolution, formatted_components: dict | None = None) -> str:
+    normalized = str(resolution).strip().upper()
+    mapped = _display_resolution_label(resolution)
+    if normalized and normalized != "UNKNOWN":
+        return mapped
+
+    if formatted_components:
+        quality_info = str(formatted_components.get("quality", "") or "").strip()
+        if quality_info:
+            quality_value = quality_info.removeprefix("✦ ").strip()
+            if quality_value:
+                return quality_value
+
+        video_info = str(formatted_components.get("video", "") or "").lower()
+        if "xvid" in video_info:
+            return "XviD"
+        if "hevc" in video_info:
+            return "HEVC"
+        if "avc" in video_info or "h.264" in video_info:
+            return "AVC"
+
+    return mapped
+
+
 """
         if helper_marker not in content:
             raise RuntimeError(
@@ -93,7 +124,11 @@ def _display_resolution_label(resolution) -> str:
             )
         content = content.replace(helper_marker, helper + helper_marker, 1)
     original = '        return f"[{service}{icon}] Comet {resolution}"'
-    replacement = "        return _display_resolution_label(resolution)"
+    replacement = (
+        '        primary = _display_primary_label(resolution, formatted_components)\n'
+        '        hdr = _hdr_badge(formatted_components)\n'
+        '        return f"{primary} | {hdr}" if hdr else primary'
+    )
     if replacement not in content:
         if original not in content:
             raise RuntimeError(
@@ -109,6 +144,12 @@ def render_torrentio_override(repo_dir: Path) -> str:
     # pipeline to reason about them. We do not try to fully reimplement
     # Torrentio here; we only normalize the result into the fields Comet
     # expects, with extra support for resolved URL / filename-derived data.
+    #
+    # Important: native Torrentio often returns a rich display title on the
+    # first line and a concrete resolved filename on a later line. Comet needs
+    # both:
+    # - the rich first line for RTN parsing/ranking (resolution, HDR, codec...)
+    # - the resolved filename for exact episode/file matching
     scraper_file = repo_dir / "comet" / "scrapers" / "torrentio.py"
     if not scraper_file.exists():
         raise RuntimeError(f"Comet Torrentio scraper file not found at {scraper_file}.")
@@ -162,6 +203,36 @@ def render_torrentio_override(repo_dir: Path) -> str:
         f'{indent}info_hash = torrent.get("infoHash")',
         f'{indent}file_index = torrent.get("fileIdx", None)',
         f'{indent}behavior_hints = torrent.get("behaviorHints", {{}}) or {{}}',
+        f'{indent}title_lines = [line.strip() for line in title_full.splitlines() if line.strip()]',
+        f'{indent}resolved_filename = behavior_hints.get("filename")',
+        f'{indent}metadata_lines = [',
+        f'{inner}line for line in title_lines',
+        f'{inner}if "💾" not in line and "👤" not in line and "⚙️" not in line and "🇬" not in line',
+        f'{indent}]',
+        f'{indent}def _line_score(line: str) -> tuple[int, int]:',
+        f'{inner}normalized = line.lower()',
+        f'{inner}score = 0',
+        f'{inner}for needle in ("2160p", "1080p", "720p", "576p", "480p", "360p", "240p", "4k"):',
+        f'{inner2}if needle in normalized:',
+        f'{inner2}    score += 8',
+        f'{inner}for needle in ("hdr", "dolby vision", " dv ", "[dv", "web-dl", "webrip", "bluray", "bdrip", "hdtv", "remux"):',
+        f'{inner2}if needle in normalized:',
+        f'{inner2}    score += 4',
+        f'{inner}for needle in ("x265", "x264", "hevc", "avc", "xvid", "ddp", "dts", "aac"):',
+        f'{inner2}if needle in normalized:',
+        f'{inner2}    score += 2',
+        f'{inner}if "s01e01" in normalized or "s01" in normalized or "1x01" in normalized:',
+        f'{inner2}score += 2',
+        f'{inner}return score, len(line)',
+        f'{indent}display_title = title',
+        f'{indent}if metadata_lines:',
+        f'{inner}display_title = max(metadata_lines, key=_line_score)',
+        f'{indent}elif title_lines:',
+        f'{inner}display_title = title_lines[0]',
+        f'{indent}if not resolved_filename and title_lines:',
+        f'{inner}fallback_filename = title_lines[-1]',
+        f'{inner}if fallback_filename != display_title:',
+        f'{inner2}resolved_filename = fallback_filename',
         "",
         f"{indent}if not info_hash:",
         f'{inner}binge_group = behavior_hints.get("bingeGroup", "")',
@@ -189,9 +260,9 @@ def render_torrentio_override(repo_dir: Path) -> str:
         "",
         f"{indent}torrents.append(",
         f"{inner}{{",
-        f'{inner2}"title": title,',
+        f'{inner2}"title": display_title,',
         f'{inner2}"sourceTitle": title_full,',
-        f'{inner2}"resolvedFileName": behavior_hints.get("filename"),',
+        f'{inner2}"resolvedFileName": resolved_filename,',
         f'{inner2}"infoHash": info_hash.lower(),',
         f'{inner2}"fileIndex": file_index,',
         f'{inner2}"seeders": seeders,',
