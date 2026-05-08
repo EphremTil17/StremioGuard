@@ -63,7 +63,15 @@ class Orchestrator:
         g.ensure_data_dir()
         if reset:
             g.log("Resetting Compose instance without deleting stremio-data.")
-            g.compose("down", "--remove-orphans", check=False, capture=False)
+            g.compose(
+                "down",
+                "--remove-orphans",
+                "--timeout",
+                "10",
+                check=False,
+                capture=False,
+            )
+            time.sleep(2)
         g.preflight()
         g.log(
             f"Running: docker compose -f {g.config.compose_file} "

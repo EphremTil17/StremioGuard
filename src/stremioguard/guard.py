@@ -11,6 +11,7 @@ import urllib.request
 
 from loguru import logger
 
+from stremioguard.auth import AuthConfig
 from stremioguard.config import (
     CometConfig,
     Config,
@@ -93,11 +94,13 @@ class GluetunGuard:
         host_port = self.stremio_host_port()
         container_port = self.stremio_container_port()
         comet_config = CometConfig.from_env(self.config.root_dir)
+        auth_config = AuthConfig.from_env(self.config.root_dir)
         content = render_stack_compose_override(
             bind_addresses=addresses,
             stremio_host_port=host_port,
             stremio_container_port=container_port,
             comet_config=comet_config if comet_config.enabled else None,
+            auth_config=auth_config if auth_config.enabled else None,
         )
         self.config.compose_override_file.parent.mkdir(parents=True, exist_ok=True)
         self.config.compose_override_file.write_text(content, encoding="utf-8")

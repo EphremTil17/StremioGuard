@@ -15,6 +15,7 @@ from pathlib import Path
 import typer
 from loguru import logger
 
+from stremioguard.auth import AuthConfig, AuthManager
 from stremioguard.comet import CometManager, prompt_comet_setup
 from stremioguard.config import CometConfig, Config
 from stremioguard.env import (
@@ -38,6 +39,8 @@ APP = typer.Typer(
 )
 COMET_APP = typer.Typer(help="Manage the modular Comet playback-proxy subsystem.")
 APP.add_typer(COMET_APP, name="comet")
+AUTH_APP = typer.Typer(help="Manage token-based authentication for remote access.")
+APP.add_typer(AUTH_APP, name="auth")
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 LOG_DIR = ROOT_DIR / "logs"
@@ -225,6 +228,14 @@ def _comet_enabled() -> bool:
     return CometConfig.from_env(ROOT_DIR).enabled
 
 
+def _auth_manager() -> AuthManager:
+    return AuthManager(AuthConfig.from_env(ROOT_DIR))
+
+
+def _auth_enabled() -> bool:
+    return AuthConfig.from_env(ROOT_DIR).enabled
+
+
 def is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
@@ -285,6 +296,18 @@ def init() -> None:
         write_env_setting(ENV_FILE, "COMET_ENABLED", "0")
         logger.info("Comet disabled in .env. The unified stack will skip it on the next start.")
 
+    existing_auth = AuthConfig.from_env(ROOT_DIR).enabled
+    if typer.confirm(
+        "Enable token-based authenticated access for remote clients?",
+        default=existing_auth,
+    ):
+        from stremioguard.init import configure_auth_access
+
+        configure_auth_access(ENV_FILE)
+    elif existing_auth:
+        write_env_setting(ENV_FILE, "AUTH_ENABLED", "0")
+        logger.info("Auth proxy disabled in .env.")
+
     logger.info("Pulling the latest VPN container image...")
     run_guard("pull", file_logging=False)
 
@@ -310,6 +333,10 @@ def start() -> None:
     run_guard("start", context=context)
     if comet_manager is not None:
         comet_manager.start()
+    if _auth_enabled():
+        auth_manager = _auth_manager()
+        auth_manager.prepare_runtime()
+        auth_manager.start()
     _start_watchdog(context)
 
 
@@ -325,6 +352,10 @@ def restart() -> None:
     run_guard("reset", context=context)
     if comet_manager is not None:
         comet_manager.start()
+    if _auth_enabled():
+        auth_manager = _auth_manager()
+        auth_manager.prepare_runtime()
+        auth_manager.start()
     _start_watchdog(context)
 
 
@@ -334,6 +365,8 @@ def stop() -> None:
     _stop_watchdog()
     if _comet_enabled():
         _comet_manager().stop()
+    if _auth_enabled():
+        _auth_manager().stop()
     run_guard("stop", file_logging=False)
 
 
@@ -344,6 +377,9 @@ def status() -> None:
     if _comet_enabled():
         logger.info("--- Comet ---")
         _comet_manager().status()
+    if _auth_enabled():
+        logger.info("--- Auth Proxy ---")
+        _auth_manager().status()
 
 
 @APP.command()
@@ -459,6 +495,75 @@ def comet_logs(
         ],
         check=False,
     )
+
+
+# ── Auth proxy commands ────────────────────────────────────────────
+
+
+@AUTH_APP.command("add")
+def auth_add(
+    label: str = typer.Argument(..., help='Device label (e.g., "Dad\'s TV").'),
+) -> None:
+    """Generate a new access token and print the full URL."""
+    manager = _auth_manager()
+    token_id, token_value = manager.add_token(label)
+    url = manager.full_url(token_value)
+    logger.success(f"Token created: {token_id} ({label})")
+    typer.echo(f"  URL: {url}")
+    typer.echo(f"  Token: {token_value}")
+    if manager.container_running():
+        manager.reload_nginx()
+        logger.info("Auth proxy config reloaded.")
+    else:
+        logger.info("Auth proxy is not running; token will take effect on next start.")
+
+
+@AUTH_APP.command("revoke")
+def auth_revoke(
+    token_id: str = typer.Argument(..., help="Token ID to revoke."),
+) -> None:
+    """Revoke an access token."""
+    manager = _auth_manager()
+    try:
+        label = manager.revoke_token(token_id)
+    except KeyError:
+        fail(f"Token ID {token_id!r} not found.")
+    logger.success(f"Token {token_id} ({label}) revoked.")
+    if manager.container_running():
+        manager.reload_nginx()
+        logger.info("Auth proxy config reloaded.")
+
+
+@AUTH_APP.command("list")
+def auth_list() -> None:
+    """Show all active tokens."""
+    manager = _auth_manager()
+    tokens = manager.list_tokens()
+    if not tokens:
+        logger.info("No tokens configured.")
+        return
+    for t in tokens:
+        url = manager.full_url(t["token"])
+        typer.echo(f"  {t['id']}  {t['label']:<20}  {url}")
+
+
+@AUTH_APP.command("rotate")
+def auth_rotate(
+    token_id: str = typer.Argument(..., help="Token ID to rotate."),
+) -> None:
+    """Revoke a token and issue a replacement with the same label."""
+    manager = _auth_manager()
+    try:
+        new_id, new_token = manager.rotate_token(token_id)
+    except KeyError:
+        fail(f"Token ID {token_id!r} not found.")
+    url = manager.full_url(new_token)
+    logger.success(f"Token rotated: {new_id}")
+    typer.echo(f"  New URL: {url}")
+    typer.echo(f"  New Token: {new_token}")
+    if manager.container_running():
+        manager.reload_nginx()
+        logger.info("Auth proxy config reloaded.")
 
 
 if __name__ == "__main__":
