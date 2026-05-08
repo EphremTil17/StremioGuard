@@ -13,6 +13,7 @@ import typer
 from stremioguard import cli as cli_mod
 from stremioguard import comet as comet_mod
 from stremioguard.comet import CometManager
+from stremioguard.comet_gateway import CometGatewayConfig, CometGatewayManager
 from stremioguard.env import env_file_value
 from stremioguard.publishing import render_stack_compose_override
 
@@ -36,11 +37,15 @@ def _write_lock(path: Path, commit: str = "abc123") -> None:
 def _write_upstream_patch_sources(cfg) -> None:
     formatting_file = cfg.repo_dir / "comet" / "utils" / "formatting.py"
     stream_file = cfg.repo_dir / "comet" / "api" / "endpoints" / "stream.py"
+    config_file = cfg.repo_dir / "comet" / "api" / "endpoints" / "config.py"
+    template_file = cfg.repo_dir / "comet" / "templates" / "index.html"
     torrentio_file = cfg.repo_dir / "comet" / "scrapers" / "torrentio.py"
     filtering_file = cfg.repo_dir / "comet" / "services" / "filtering.py"
     orchestration_file = cfg.repo_dir / "comet" / "services" / "orchestration.py"
     formatting_file.parent.mkdir(parents=True, exist_ok=True)
     stream_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    template_file.parent.mkdir(parents=True, exist_ok=True)
     torrentio_file.parent.mkdir(parents=True, exist_ok=True)
     filtering_file.parent.mkdir(parents=True, exist_ok=True)
     orchestration_file.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +74,66 @@ def _write_upstream_patch_sources(cfg) -> None:
         '    status: str = "",\n'
         "):\n"
         "    if not kodi:\n"
-        '        return f"[{service}{icon}] Comet {resolution}"\n',
+        '        return f"[{service}{icon}] Comet {resolution}"\n'
+        "\n"
+        "async def stream(request):\n"
+        "    base_playback_host = (\n"
+        "        settings.PUBLIC_BASE_URL\n"
+        "        if settings.PUBLIC_BASE_URL\n"
+        '        else f"{request.url.scheme}://{request.url.netloc}"\n'
+        "    )\n",
+        encoding="utf-8",
+    )
+    config_file.write_text(
+        "from fastapi import Request\n"
+        "from fastapi.responses import RedirectResponse\n"
+        "\n"
+        "def _next_url(request: Request):\n"
+        "    return (\n"
+        '        f"{request.url.path}?{request.url.query}"\n'
+        "        if request.url.query\n"
+        "        else request.url.path\n"
+        "    )\n"
+        "\n"
+        "def _sanitize_next_url(next_url: str | None):\n"
+        "    if not next_url:\n"
+        '        return "/configure"\n'
+        "    return next_url\n"
+        "\n"
+        'def _render_configure_login(request: Request, next_url: str, error: str = ""):\n'
+        "    return {\n"
+        '        "form_action": "/configure/login",\n'
+        '        "next_url": _sanitize_next_url(next_url),\n'
+        "    }\n"
+        "\n"
+        'async def configure_login(request: Request, next_url: str = "/configure"):\n'
+        "    if False:\n"
+        "        return RedirectResponse(_sanitize_next_url(next_url), status_code=303)\n"
+        "    return _render_configure_login(\n"
+        "        request,\n"
+        '        next_url=_sanitize_next_url(next_url), error="Invalid password"\n'
+        "    )\n"
+        "\n"
+        "async def configure(request: Request, b64config: str | None = None):\n"
+        "    if b64config is not None:\n"
+        '        return RedirectResponse("/configure", status_code=303)\n',
+        encoding="utf-8",
+    )
+    template_file.write_text(
+        '          const stremioApiPrefix = {{ (stremioApiPrefix or "") | tojson }};\n'
+        "          function getManifestUrl(settings, forInstall = false) {\n"
+        "            const host = window.location.host;\n"
+        "            const settingsString = btoa(JSON.stringify(settings));\n"
+        "            return forInstall\n"
+        "              ? `stremio://${host}${stremioApiPrefix}/${settingsString}/manifest.json`\n"
+        "              : `${window.location.origin}${stremioApiPrefix}/"
+        "${settingsString}/manifest.json`;\n"
+        "          }\n"
+        "          function getKodiManifestUrl(settings) {\n"
+        "            const settingsString = btoa(JSON.stringify(settings));\n"
+        "            return `${window.location.origin}${stremioApiPrefix}/"
+        "${settingsString}/manifest.json`;\n"
+        "          }\n",
         encoding="utf-8",
     )
     torrentio_file.write_text(
@@ -229,9 +293,10 @@ class CometManagerTests(unittest.TestCase):
                 manager.fetch_and_checkout_pinned()
             warn.assert_called_once()
 
-    def test_render_runtime_env_uses_localhost_postgres_and_server_defaults(self) -> None:
+    def test_render_runtime_env_uses_public_base_when_gateway_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
+            (tmp_path / ".env").write_text("COMET_GATEWAY_ENABLED=0\n", encoding="utf-8")
             cfg = make_comet_config(
                 tmp_path,
                 public_base_url="https://comet.example.com",
@@ -249,6 +314,19 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn("PROXY_DEBRID_STREAM_DEBRID_DEFAULT_SERVICE=torbox", rendered)
             self.assertIn("PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY=tb-key", rendered)
 
+    def test_render_runtime_env_blanks_public_base_when_gateway_is_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            (tmp_path / ".env").write_text(
+                "COMET_GATEWAY_ENABLED=1\n",
+                encoding="utf-8",
+            )
+            cfg = make_comet_config(tmp_path, public_base_url="https://comet.example.com")
+            manager = CometManager(cfg, FakeRunner({}))
+            rendered = manager.render_runtime_env()
+            self.assertIn("PUBLIC_BASE_URL=", rendered)
+            self.assertNotIn("PUBLIC_BASE_URL=https://comet.example.com", rendered)
+
     def test_render_runtime_env_allows_blank_server_owned_debrid_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
@@ -262,13 +340,23 @@ class CometManagerTests(unittest.TestCase):
             tmp_path = Path(directory)
             make_config(tmp_path)
             cfg = make_comet_config(tmp_path, bind_addresses=("10.0.0.5", "100.64.0.8"))
+            (tmp_path / ".env").write_text(
+                "COMET_GATEWAY_ENABLED=1\n"
+                "COMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.com\n"
+                "STREMIO_BIND_ADDRS=10.0.0.5,100.64.0.8\n",
+                encoding="utf-8",
+            )
+            gateway = CometGatewayManager(CometGatewayConfig.from_env(tmp_path))
+            _, token_value = gateway.add_token("Shared Addon")
             _write_upstream_patch_sources(cfg)
             manager = CometManager(cfg, FakeRunner({}))
             manager.write_stack_override_file()
             root_override = tmp_path / ".stremio" / "docker-compose.bindings.yml"
             content = root_override.read_text(encoding="utf-8")
-            self.assertIn('"10.0.0.5:18000:8000"', content)
-            self.assertIn('"100.64.0.8:18000:8000"', content)
+            self.assertIn('"127.0.0.1:18000:8000"', content)
+            self.assertIn('"10.0.0.5:18001:8080"', content)
+            self.assertIn('"100.64.0.8:18001:8080"', content)
+            self.assertNotIn('"10.0.0.5:18000:8000"', content)
             self.assertIn(str(cfg.runtime_env_file), content)
             self.assertIn(
                 f"{cfg.state_dir / 'formatting.py'}:/app/comet/utils/formatting.py:ro",
@@ -276,6 +364,14 @@ class CometManagerTests(unittest.TestCase):
             )
             self.assertIn(
                 f"{cfg.state_dir / 'stream.py'}:/app/comet/api/endpoints/stream.py:ro",
+                content,
+            )
+            self.assertIn(
+                f"{cfg.state_dir / 'config.py'}:/app/comet/api/endpoints/config.py:ro",
+                content,
+            )
+            self.assertIn(
+                f"{cfg.state_dir / 'index.html'}:/app/comet/templates/index.html:ro",
                 content,
             )
             self.assertIn(
@@ -297,13 +393,24 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn("sourceTitle", torrentio_override)
             self.assertIn("resolvedFileName", torrentio_override)
             self.assertIn("metadata_lines = [", torrentio_override)
-            self.assertIn("display_title = max(metadata_lines, key=_line_score)", torrentio_override)
+            self.assertIn(
+                "display_title = max(metadata_lines, key=_line_score)", torrentio_override
+            )
             self.assertIn('"title": display_title,', torrentio_override)
             self.assertIn("fallback_filename", torrentio_override)
             self.assertIn('"resolvedFileName": resolved_filename,', torrentio_override)
             stream_override = (cfg.state_dir / "stream.py").read_text(encoding="utf-8")
             self.assertIn("def _hdr_badge(", stream_override)
             self.assertIn("def _display_primary_label(", stream_override)
+            self.assertIn("def _forwarded_external_base(", stream_override)
+            self.assertIn("else _forwarded_external_base(request)", stream_override)
+            config_override = (cfg.state_dir / "config.py").read_text(encoding="utf-8")
+            template_override = (cfg.state_dir / "index.html").read_text(encoding="utf-8")
+            self.assertIn("def _prefixed_path(", config_override)
+            self.assertIn('request.headers.get("x-forwarded-prefix"', config_override)
+            self.assertIn("function getCometMountPath()", template_override)
+            self.assertIn("function getCometInstallBase(", template_override)
+            self.assertIn(f"https://comet.example.com/comet/{token_value}", template_override)
 
     def test_write_stack_override_omits_orchestration_mount_when_patch_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -399,7 +506,7 @@ class CometManagerTests(unittest.TestCase):
                         "gluetun",
                     ): completed(
                         ["docker", "compose", "ps"],
-                        "gluetun  running  127.0.0.1:18000->8000/tcp\n",
+                        "gluetun  running  127.0.0.1:18000->8000/tcp, 127.0.0.1:18001->8080/tcp\n",
                     ),
                     ("docker", "compose", "version"): completed(["docker", "compose", "version"]),
                     ("docker", "ps", "--format", "{{.ID}}"): completed(
@@ -482,7 +589,7 @@ class CometManagerTests(unittest.TestCase):
                         "gluetun",
                     ): completed(
                         ["docker", "compose", "ps"],
-                        "gluetun  running  127.0.0.1:18000->8000/tcp\n",
+                        "gluetun  running  127.0.0.1:18000->8000/tcp, 127.0.0.1:18001->8080/tcp\n",
                     ),
                     ("docker", "compose", "version"): completed(["docker", "compose", "version"]),
                     ("docker", "ps", "--format", "{{.ID}}"): completed(
@@ -631,6 +738,8 @@ class CometCliTests(unittest.TestCase):
                         "18000",  # host port
                         "cfg-pass",  # configure password
                         "7",  # max connections
+                        "18001",  # gateway port
+                        "https://comet.example.com",  # gateway public base URL
                     ],
                 ),
                 mock.patch.object(
@@ -639,6 +748,8 @@ class CometCliTests(unittest.TestCase):
                     side_effect=[
                         True,  # episode-pack patch
                         True,  # proxy enabled
+                        True,  # gateway enabled
+                        False,  # do not create token in this unit test
                         False,  # no server default creds
                     ],
                 ),
@@ -657,6 +768,11 @@ class CometCliTests(unittest.TestCase):
                 "https://zilean.example/custom",
             )
             self.assertEqual(env_file_value(env_file, "COMET_RESULT_FORMAT_STYLE"), "emoji")
+            self.assertEqual(env_file_value(env_file, "COMET_GATEWAY_ENABLED"), "1")
+            self.assertEqual(
+                env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL"),
+                "https://comet.example.com",
+            )
 
     def test_prompt_comet_setup_rejects_invalid_proxy_max_connections(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

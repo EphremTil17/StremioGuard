@@ -30,6 +30,11 @@ def main() -> int:
         action="store_true",
         help="Generate the orchestration override that preserves more episode results from packs",
     )
+    parser.add_argument(
+        "--gateway-addon-base-url",
+        default=None,
+        help="Optional gated Comet addon base URL for generated configure/install links",
+    )
     args = parser.parse_args()
 
     write_override_bundle(
@@ -37,6 +42,7 @@ def main() -> int:
         state_dir=Path(args.state_dir),
         result_format_style=args.result_format_style,
         patch_episode_pack_results=args.patch_episode_pack_results,
+        gateway_addon_base_url=args.gateway_addon_base_url,
     )
     return 0
 
