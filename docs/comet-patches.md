@@ -10,6 +10,7 @@ that:
 - proxy behavior remains reproducible
 - formatting stays readable on TV clients
 - Torrentio-backed episode results survive more like native Torrentio
+- Torrentio-style ranking signals are preserved more faithfully
 
 ## Why Patch Comet
 
@@ -22,6 +23,9 @@ Stock Comet is powerful, but in this setup there were a few practical gaps:
 4. Title filtering could reject valid results whose outer release title did not
    strictly match the Stremio metadata title, even when the resolved filename
    clearly matched the requested episode.
+5. Some valid results survived filtering but were still ranked or labeled badly
+   because Comet parsed a stripped filename instead of Torrentio's richer title
+   line.
 
 That last point matters a lot for multilingual and branded titles. Native
 Torrentio is often more permissive there, so without patching, Comet could show
@@ -77,17 +81,27 @@ Approach:
 Purpose:
 
 - reduce left-side duplication like `TB`, `Comet`, and raw resolution spam
+- degrade more gracefully when a torrent lacks explicit resolution metadata
 
 Approach:
 
 - normalize the left-side label to mostly resolution-oriented naming such as
   `UHD`, `FHD`, `HD`
+- add a compact inline HDR indicator like `UHD | HDR` when the parsed metadata
+  clearly contains `HDR` or `DV`
+- if resolution is missing, fall back to more useful labels such as:
+  - `WEBRip`
+  - `WEB-DL`
+  - `HDTV`
+  - weak codec/container hints in lower-confidence cases
 
 ### 3. Torrentio scraper patch
 
 Purpose:
 
 - support configured/native Torrentio-style resolved results better
+- preserve richer ranking metadata from Torrentio instead of collapsing too
+  early to a bare filename
 
 Approach:
 
@@ -96,8 +110,15 @@ Approach:
   - `behaviorHints.bingeGroup`
   - resolved Torrentio URLs
   - resolved filename hints
+- keep both:
+  - a richer display title for RTN parsing/ranking
+  - a resolved filename for exact episode/file matching
+- prefer the most metadata-rich line when Torrentio returns a multi-line title
+  block with one line for release metadata and another for the resolved file
 
 This lets Comet ingest more of the same results that native Torrentio surfaces.
+It also reduces cases where a result survives filtering but gets buried because
+resolution, HDR, quality, or codec signals were lost before parsing.
 
 ### 4. Episode-pack preservation patch
 
@@ -134,6 +155,23 @@ Approach:
 - if those clearly contain the requested Stremio title phrase, keep the result
 
 This is deliberately heuristic rather than a static studio-name mapping.
+
+## What These Patches Fix In Practice
+
+In practice, the patch set is aimed at a few recurring Torrentio/Comet mismatch
+patterns:
+
+1. Branded or multilingual titles such as `Marvel's Daredevil` versus plain
+   `Daredevil`
+2. Season-pack results where Torrentio already resolved a concrete episode file
+3. Multi-line Torrentio titles where the first line contains the useful ranking
+   metadata but a later line contains only the resolved filename
+4. Results with incomplete resolution metadata that should still display as
+   `WEBRip` or `HDTV` instead of `unknown`
+
+The goal is not to duplicate Torrentio internals exactly. The goal is to keep
+the same kinds of evidence Torrentio already gives us, then let Comet preserve
+and use that evidence more faithfully.
 
 ## Why This Is Safer Than Ad-Hoc Container Patching
 

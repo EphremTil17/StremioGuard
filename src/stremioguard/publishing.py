@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from stremioguard.auth import AUTH_CONTAINER_PORT, AuthConfig
 from stremioguard.config import CometConfig
 
 
@@ -24,8 +25,11 @@ def render_stack_compose_override(
     stremio_host_port: int,
     stremio_container_port: int,
     comet_config: CometConfig | None,
+    auth_config: AuthConfig | None = None,
 ) -> str:
-    port_mappings: list[tuple[int, int]] = [(stremio_host_port, stremio_container_port)]
+    port_mappings: list[tuple[int, int]] = []
+    if not (auth_config and auth_config.enabled):
+        port_mappings.append((stremio_host_port, stremio_container_port))
     if comet_config and comet_config.enabled:
         port_mappings.append((comet_config.host_port, 8000))
 
@@ -35,6 +39,23 @@ def render_stack_compose_override(
         content.append("    ports: []")
     else:
         content.extend(["    ports:", ports])
+
+    if auth_config and auth_config.enabled:
+        auth_port_lines = []
+        for address in bind_addresses:
+            auth_port_lines.append(
+                f'      - "{address}:{auth_config.host_port}:{AUTH_CONTAINER_PORT}"'
+            )
+        content.extend(
+            [
+                "  auth-proxy:",
+                "    ports:",
+                *auth_port_lines,
+                "    volumes:",
+                f"      - {auth_config.nginx_conf_file}:/etc/nginx/nginx.conf:ro",
+                f"      - {auth_config.tokens_map_file}:/etc/nginx/tokens.map:ro",
+            ]
+        )
 
     if comet_config and comet_config.enabled:
         comet_volumes = [f"      - {comet_config.data_dir}:/app/data"]

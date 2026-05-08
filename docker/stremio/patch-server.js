@@ -27,12 +27,18 @@ const ESSENTIAL_PATCHES = [
   {
     name: "inject media url normalizer",
     from: "const router = new Router, converters = new Map;",
-    to: `const router = new Router, converters = new Map, forwardedValue = value => "string" == typeof value ? value.split(",")[0].trim() : "", requestExternalOrigin = (req, protocol = "") => {
+    to: `const router = new Router, converters = new Map, forwardedValue = value => "string" == typeof value ? value.split(",")[0].trim() : "", forwardedPrefix = req => {
+            if (!req || !req.headers) return "";
+            const prefix = forwardedValue(req.headers["x-forwarded-prefix"]);
+            if (!prefix) return "";
+            return prefix.startsWith("/") ? prefix.replace(/\\/$/, "") : "/" + prefix.replace(/\\/$/, "");
+        }, requestExternalOrigin = (req, protocol = "") => {
             if (!req || !req.headers) return "";
             const forwardedProto = forwardedValue(req.headers["x-forwarded-proto"]);
             const forwardedHost = forwardedValue(req.headers["x-forwarded-host"]) || req.headers.host || "";
-            if (forwardedProto && forwardedHost) return forwardedProto + "://" + forwardedHost;
-            return protocol && req.headers.host ? protocol + req.headers.host : "";
+            const prefix = forwardedPrefix(req);
+            if (forwardedProto && forwardedHost) return forwardedProto + "://" + forwardedHost + prefix;
+            return protocol && req.headers.host ? protocol + req.headers.host + prefix : "";
         }, normalizeMediaURL = (mediaURL, req, protocol = "") => {
             if ("string" != typeof mediaURL || 0 === mediaURL.length) return mediaURL;
             const internalBase = (process.env.INTERNAL_MEDIA_BASE_URL || "").replace(/\\/$/, "");
@@ -58,7 +64,7 @@ const ESSENTIAL_PATCHES = [
   {
     name: "derive streaming server url from forwarded request origin",
     from: 'var serverUrl = encodeURIComponent(protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
-    to: 'var configuredServerUrl = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, ""), forwardedProto = "string" == typeof req.headers["x-forwarded-proto"] ? req.headers["x-forwarded-proto"].split(",")[0].trim() : "", forwardedHost = "string" == typeof req.headers["x-forwarded-host"] ? req.headers["x-forwarded-host"].split(",")[0].trim() : "", detectedServerUrl = forwardedProto && forwardedHost ? forwardedProto + "://" + forwardedHost : "", serverUrl = encodeURIComponent(detectedServerUrl || configuredServerUrl || protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
+    to: 'var configuredServerUrl = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, ""), forwardedProto = "string" == typeof req.headers["x-forwarded-proto"] ? req.headers["x-forwarded-proto"].split(",")[0].trim() : "", forwardedHost = "string" == typeof req.headers["x-forwarded-host"] ? req.headers["x-forwarded-host"].split(",")[0].trim() : "", forwardedPrefix = "string" == typeof req.headers["x-forwarded-prefix"] ? req.headers["x-forwarded-prefix"].split(",")[0].trim().replace(/\\/$/, "") : "", normalizedPrefix = forwardedPrefix ? forwardedPrefix.startsWith("/") ? forwardedPrefix : "/" + forwardedPrefix : "", detectedServerUrl = forwardedProto && forwardedHost ? forwardedProto + "://" + forwardedHost + normalizedPrefix : "", serverUrl = encodeURIComponent(detectedServerUrl || configuredServerUrl || protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
   },
 ];
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from stremioguard.auth import AuthConfig
 from stremioguard.config import CometConfig, Config
 
 
@@ -127,3 +128,25 @@ def make_comet_config(tmp_path: Path, **overrides: object) -> CometConfig:
     }
     values.update(overrides)
     return CometConfig(**values)  # type: ignore[arg-type]
+
+
+def make_auth_config(tmp_path: Path, **overrides: object) -> AuthConfig:
+    state_dir = tmp_path / ".stremio" / "auth"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    values: dict[str, object] = {
+        "root_dir": tmp_path,
+        "env_file": tmp_path / ".env",
+        "state_dir": state_dir,
+        "tokens_file": state_dir / "tokens.json",
+        "nginx_conf_file": state_dir / "nginx.conf",
+        "tokens_map_file": state_dir / "tokens.map",
+        "service_name": "auth-proxy",
+        "container_name": "auth-proxy",
+        "host_port": 11471,
+        "bind_addresses": ("127.0.0.1",),
+        "domain": "streamio.example.com",
+        "token_length": 8,
+        "enabled": True,
+    }
+    values.update(overrides)
+    return AuthConfig(**values)  # type: ignore[arg-type]

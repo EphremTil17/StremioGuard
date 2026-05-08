@@ -14,6 +14,7 @@ from pathlib import Path
 import typer
 from loguru import logger
 
+from stremioguard.auth import AuthConfig
 from stremioguard.comet_overrides import (
     render_formatter_override as render_formatter_override_file,
 )
@@ -209,11 +210,13 @@ class CometManager:
             result_format_style=self.config.result_format_style,
             patch_episode_pack_results=self.config.patch_episode_pack_results,
         )
+        auth_config = AuthConfig.from_env(self.config.root_dir)
         content = render_stack_compose_override(
             bind_addresses=list(self.config.bind_addresses),
             stremio_host_port=self.stremio_host_port(),
             stremio_container_port=self.stremio_container_port(),
             comet_config=self.config,
+            auth_config=auth_config if auth_config.enabled else None,
         )
         root_override = self.root_override_file()
         root_override.parent.mkdir(parents=True, exist_ok=True)

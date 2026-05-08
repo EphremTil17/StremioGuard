@@ -296,6 +296,14 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn("resolvedFileName", filtering_override)
             self.assertIn("sourceTitle", torrentio_override)
             self.assertIn("resolvedFileName", torrentio_override)
+            self.assertIn("metadata_lines = [", torrentio_override)
+            self.assertIn("display_title = max(metadata_lines, key=_line_score)", torrentio_override)
+            self.assertIn('"title": display_title,', torrentio_override)
+            self.assertIn("fallback_filename", torrentio_override)
+            self.assertIn('"resolvedFileName": resolved_filename,', torrentio_override)
+            stream_override = (cfg.state_dir / "stream.py").read_text(encoding="utf-8")
+            self.assertIn("def _hdr_badge(", stream_override)
+            self.assertIn("def _display_primary_label(", stream_override)
 
     def test_write_stack_override_omits_orchestration_mount_when_patch_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
