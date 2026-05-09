@@ -1,11 +1,13 @@
 [Unit]
 Description=Guard Stremio behind the gluetun VPN container
-After=default.target
+After=docker.service
 
 [Service]
-Type=simple
-WorkingDirectory=%h/projects/stremio
-ExecStart=%h/.local/bin/uv --cache-dir %h/projects/stremio/.uv-cache run python %h/projects/stremio/bin/stremio-vpn watchdog
+Type=forking
+WorkingDirectory=%h/projects/docker/StremioGuard
+ExecStart=%h/projects/docker/StremioGuard/stremio start
+ExecStop=%h/projects/docker/StremioGuard/stremio stop
+PIDFile=%h/projects/docker/StremioGuard/.stremio/watchdog.pid
 Restart=always
 RestartSec=10
 

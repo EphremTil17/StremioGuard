@@ -139,9 +139,10 @@ layer more naturally than the current tailnet-only operator flow.
 ## Commit message preference
 
 Use the local Codex skill at
-`/home/seven/.codex/skills/commit-message-style/SKILL.md`.
+`.codex/skills/commit-message-style/SKILL.md`.
 
 In short:
+
 - subject line: 8-12 words
 - explanation section: short human paragraphs about why and what changed
 - categorical section: group changed files or folders in backticks
