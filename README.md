@@ -187,22 +187,24 @@ Longer term, the project direction is to support a cleaner authenticated HTTPS
 domain flow in front of Stremio/Comet so Tailscale does not have to be the
 primary end-user access UX.
 
-## Optional Auth Proxy
+## Token-Managed Comet Gateway
 
-The stack also supports an optional token-gated auth proxy in front of Stremio
-for lower-friction remote sharing without requiring every user to join a
-tailnet.
+The recommended low-friction access model is to protect Comet, not Stremio.
+Users keep their own Stremio accounts, while Comet acts as the token-gated
+addon, stream-discovery, and playback relay.
 
-- Each device gets its own tokenized URL like
-  `https://streamio.example.com/<token>/`
-- The raw Stremio host-port publish is suppressed when auth-proxy mode is on,
-  so the token gate becomes the intended remote entrypoint
-- The generated proxy config preserves the token path in Stremio-generated URLs
-  and clears client IP headers upstream by default
+- Configure/admin stays at `https://comet.example.com/configure` and is
+  protected by Comet's configure password.
+- Addon, stream, playback, and debrid-sync routes live under
+  `https://comet.example.com/comet/<token>/...`.
+- Raw Comet is published only on `127.0.0.1:COMET_HOST_PORT` for local
+  operator diagnostics.
+- Public reverse proxies should point at `COMET_GATEWAY_HOST_PORT`, not the raw
+  Comet port.
 
 If you want the details, see:
 
-- [docs/auth-proxy.md](docs/auth-proxy.md)
+- [docs/comet-gateway.md](docs/comet-gateway.md)
 - [docs/comet-patches.md](docs/comet-patches.md)
 
 For public reverse proxies such as Nginx Proxy Manager or raw nginx, the
@@ -210,16 +212,33 @@ recommended upstream shape is:
 
 ```nginx
 location / {
+    proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For "";
     proxy_set_header X-Real-IP "";
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $http_connection;
     proxy_http_version 1.1;
-    proxy_pass http://<SERVERIP:11471>$request_uri;
+    proxy_pass http://<SERVERIP:18001>$request_uri;
 }
 ```
 
-Replace `11471` with your configured `AUTH_HOST_PORT` if you changed it.
+Replace `18001` with your configured `COMET_GATEWAY_HOST_PORT` if you changed
+it. Do not point `comet.example.com` directly at raw `COMET_HOST_PORT`.
+
+Create and manage gateway tokens with:
+
+```bash
+./stremio comet token add "Shared Addon"
+./stremio comet token list
+./stremio comet token rotate <id>
+./stremio comet token revoke <id>
+./stremio comet token use <id>
+```
+
+Use `./stremio comet gateway-logs` while testing the public domain to confirm
+requests are hitting the token gate.
 
 ## Recommended workflow
 
@@ -348,23 +367,60 @@ If your VPN endpoint has a stable IP, you can make the check stricter:
 EXPECTED_VPN_IP=1.2.3.4 ./stremio start
 ```
 
-## Start automatically
+## Start automatically (Persistent Boot Setup)
 
-The included user service can make this feel native. It assumes the repo lives at `~/projects/stremio` (uses systemd's `%h` substitution); if it lives elsewhere, edit `WorkingDirectory` and `ExecStart` paths in the copied unit before enabling.
+To ensure that your entire StremioGuard stack (including the VPN container, Comet gateway, Comet, and the watchdog) automatically boots up upon system restart, choose one of the two standard persistence methods below:
 
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/user/stremio-vpn-watch.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now stremio-vpn-watch.service
-```
+### Option A: The Cron `@reboot` Method (Simplest & Recommended for general use)
+This is the most straightforward, zero-configuration method. It does not require root (`sudo`) access, has no complex unit files, and completely avoids D-Bus session errors.
 
-Check it with:
+1. Open your user's cron scheduler:
+   ```bash
+   crontab -e
+   ```
+2. Add the following line at the very bottom of the file (replacing `/path/to/StremioGuard` with the absolute path to your cloned repository):
+   ```text
+   @reboot /path/to/StremioGuard/stremio start
+   ```
 
-```bash
-systemctl --user status stremio-vpn-watch.service
-journalctl --user -u stremio-vpn-watch.service -f
-```
+---
+
+### Option B: System-Wide Systemd Service (Most Robust / Production-Grade)
+For advanced deployments where you want **automatic crash recovery** (restarts StremioGuard if it crashes) and native log management via `journalctl`. By registering it as a system-wide service that runs under your user account, we avoid any D-Bus/user-session complications.
+
+1. Create the service definition file `/etc/systemd/system/stremio-guard.service` (replacing `<username>` with your local Linux username and `/path/to/StremioGuard` with the absolute path to your cloned repository):
+   ```ini
+   [Unit]
+   Description=Guard Stremio behind the gluetun VPN container
+   After=docker.service
+   Requires=docker.service
+
+   [Service]
+   Type=forking
+   User=<username>
+   WorkingDirectory=/path/to/StremioGuard
+   ExecStart=/path/to/StremioGuard/stremio start
+   ExecStop=/path/to/StremioGuard/stremio stop
+   PIDFile=/path/to/StremioGuard/.stremio/watchdog.pid
+   Restart=always
+   RestartSec=10
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+2. Enable and start the service:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now stremio-guard.service
+   ```
+3. Monitor your service:
+   ```bash
+   # Check status and process tree
+   sudo systemctl status stremio-guard.service
+
+   # View active logs in real-time
+   journalctl -u stremio-guard.service -f
+   ```
 
 ## Tests
 
