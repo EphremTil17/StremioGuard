@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 
@@ -46,6 +47,52 @@ def render_formatter_override(repo_dir: Path, result_format_style: str) -> str |
                 "function signature has changed."
             )
         rendered = content.replace(emoji_block, plain_block, 1)
+
+    if "def _strip_redundant_hdr_tokens(" not in rendered:
+        helper_marker = "def format_video_info(data: ParsedData):\n"
+        helper_block = """
+def _normalize_video_token(token: str) -> str:
+    normalized = token.strip()
+    upper = normalized.upper()
+    if upper == "HEVC":
+        return "HEVC"
+    return normalized
+
+
+def _strip_redundant_hdr_tokens(info: str) -> str:
+    if not info:
+        return ""
+    parts = [part.strip() for part in info.split("•")]
+    filtered = []
+    for part in parts:
+        normalized = part.upper().strip()
+        if normalized == "HDR":
+            continue
+        filtered.append(_normalize_video_token(part))
+    return " • ".join(filtered)
+
+
+"""
+        if helper_marker not in rendered:
+            raise RuntimeError(
+                "Unable to apply managed Comet formatter patch; upstream "
+                "video formatting helper has changed."
+            )
+        rendered = rendered.replace(helper_marker, helper_block + helper_marker, 1)
+
+    original_video_return = '    return " • ".join(video_parts) if video_parts else ""\n'
+    replacement_video_return = (
+        '    info = " • ".join(video_parts) if video_parts else ""\n'
+        "    return _strip_redundant_hdr_tokens(info)\n"
+    )
+    if replacement_video_return not in rendered:
+        if original_video_return not in rendered:
+            raise RuntimeError(
+                "Unable to apply managed Comet formatter patch; upstream "
+                "video info return block has changed."
+            )
+        rendered = rendered.replace(original_video_return, replacement_video_return, 1)
+
     replacements = {
         '    "title": "{}",': '    "title": "☰  {}",',
         '    "video": "{}",': '    "video": "📽 {}",',
@@ -55,10 +102,50 @@ def render_formatter_override(repo_dir: Path, result_format_style: str) -> str |
         '    "size": "Size: {}",': '    "size": "⛃{}",',
         '    "tracker": "Source: {}",': '    "tracker": "🔍︎ {}",',
         '    "tracker_clean": "Source: Comet|{}",': '    "tracker_clean": "🔍︎ Comet|{}",',
-        '    "languages": "Languages: {}",': '    "languages": "{}"',
+        '    "languages": "Languages: {}",': '    "languages": "{}",',
     }
     for before, after in replacements.items():
         rendered = rendered.replace(before, after)
+
+    replacement_format_title = """def format_title(components: dict):
+    lines = []
+
+    if "title" in components:
+        lines.append(components["title"])
+
+    if "video" in components:
+        lines.append(components["video"])
+
+    if "quality" in components:
+        lines.append(components["quality"])
+
+    if "audio" in components:
+        lines.append(components["audio"])
+
+    if "size" in components:
+        lines.append(components["size"])
+
+    if not lines:
+        return "Empty result format configuration"
+
+    return "\\n".join(lines)
+"""
+    if replacement_format_title not in rendered:
+        original_format_title = re.compile(
+            r"def format_title\(components: dict\):\n"
+            r"(?:    .*\n|\n)+?"
+            r'    return "\\n"\.join\(lines\)\n',
+            re.MULTILINE,
+        )
+        if not original_format_title.search(rendered):
+            raise RuntimeError(
+                "Unable to apply managed Comet formatter patch; upstream "
+                "title formatting block has changed."
+            )
+        rendered = original_format_title.sub(
+            lambda _match: replacement_format_title, rendered, count=1
+        )
+
     return rendered
 
 
@@ -85,6 +172,12 @@ def _hdr_badge(formatted_components: dict | None) -> str:
         return ""
     video_info = str(formatted_components.get("video", "") or "").upper()
     return "HDR" if "HDR" in video_info or "DV" in video_info else ""
+
+
+def _series_pack_badge(media_type: str | None, pack_backed: bool) -> str:
+    if media_type != "series" or not pack_backed:
+        return ""
+    return "P"
 
 
 def _display_resolution_label(resolution) -> str:
@@ -134,6 +227,35 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
                 "stream helper signature has changed."
             )
         content = content.replace(helper_marker, helper + helper_marker, 1)
+    original_signature = """def _build_stream_name(
+    kodi: bool,
+    service: str,
+    resolution,
+    icon: str = "",
+    formatted_components: dict | None = None,
+    seeders: int | None = None,
+    status: str = "",
+):
+"""
+    replacement_signature = """def _build_stream_name(
+    kodi: bool,
+    service: str,
+    resolution,
+    icon: str = "",
+    formatted_components: dict | None = None,
+    seeders: int | None = None,
+    status: str = "",
+    media_type: str | None = None,
+    pack_backed: bool = False,
+):
+"""
+    if "pack_backed: bool = False" not in content:
+        if original_signature not in content:
+            raise RuntimeError(
+                "Unable to apply managed Comet stream-name patch; upstream "
+                "stream helper signature has changed."
+            )
+        content = content.replace(original_signature, replacement_signature, 1)
     original_base_url = """    base_playback_host = (
         settings.PUBLIC_BASE_URL
         if settings.PUBLIC_BASE_URL
@@ -157,7 +279,13 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
     replacement = (
         "        primary = _display_primary_label(resolution, formatted_components)\n"
         "        hdr = _hdr_badge(formatted_components)\n"
-        '        return f"{primary} | {hdr}" if hdr else primary'
+        "        pack = _series_pack_badge(media_type, pack_backed)\n"
+        "        parts = [primary]\n"
+        "        if hdr:\n"
+        "            parts.append(hdr)\n"
+        "        if pack:\n"
+        "            parts.append(pack)\n"
+        '        return " | ".join(parts)'
     )
     if replacement not in content:
         if original not in content:
@@ -165,6 +293,20 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
                 "Unable to apply managed Comet stream-name patch; upstream name format has changed."
             )
         content = content.replace(original, replacement, 1)
+    call_replacements = {
+        '                status="C" if is_cached else "U",\n': (
+            '                status="C" if is_cached else "U",\n'
+            "                media_type=media_type,\n"
+            '                pack_backed=torrent.get("packBacked", False),\n'
+        ),
+        '                status="P2P",\n': (
+            '                status="P2P",\n'
+            "                media_type=media_type,\n"
+            '                pack_backed=torrent.get("packBacked", False),\n'
+        ),
+    }
+    for before, after in call_replacements.items():
+        content = content.replace(before, after)
     return content
 
 
@@ -490,6 +632,82 @@ def render_orchestration_override(repo_dir: Path) -> str:
     if not orchestration_file.exists():
         raise RuntimeError(f"Comet orchestration file not found at {orchestration_file}.")
     content = orchestration_file.read_text(encoding="utf-8")
+    init_marker = "        self.primary_cached = False\n"
+    if "self.pack_backed_hashes = set()" not in content:
+        if init_marker not in content:
+            raise RuntimeError(
+                "Unable to apply managed Comet orchestration patch; upstream "
+                "initializer has changed."
+            )
+        content = content.replace(
+            init_marker,
+            init_marker
+            + "        self.pack_backed_hashes = set()\n"
+            + "        self._pack_backed_candidates = {}\n",
+            1,
+        )
+
+    helper_marker = """    def _matches_requested_scope(
+        self,
+        parsed: ParsedData,
+        *,
+        reject_unknown_override: bool | None = None,
+    ) -> bool:
+"""
+    helper_block = """    def _record_pack_backed_candidate(
+        self,
+        info_hash: str,
+        *,
+        episode: int | None = None,
+        file_index: int | None = None,
+    ) -> None:
+        if self.media_type != "series" or self.search_episode is None:
+            return
+
+        candidate = self._pack_backed_candidates.setdefault(
+            info_hash, {"episodes": set(), "indexes": set()}
+        )
+        if episode is not None:
+            candidate["episodes"].add(str(episode))
+        if file_index is not None:
+            candidate["indexes"].add(str(file_index))
+        if (
+            len(candidate["episodes"]) > 1
+            or len(candidate["indexes"]) > 1
+        ):
+            self.pack_backed_hashes.add(info_hash)
+
+    def _is_pack_backed_candidate(
+        self,
+        parsed: ParsedData,
+        *,
+        info_hash: str,
+        file_index: int | None = None,
+    ) -> bool:
+        if self.media_type != "series" or self.search_episode is None:
+            return False
+        if info_hash in self.pack_backed_hashes:
+            return True
+
+        parsed_episodes = parsed.episodes or []
+        if len(parsed_episodes) > 1:
+            return True
+        if isinstance(file_index, int):
+            return file_index > 0 or not parsed_episodes
+        if isinstance(file_index, str) and file_index.isdigit():
+            return int(file_index) > 0 or not parsed_episodes
+        if file_index is None:
+            return False
+        return not parsed_episodes
+
+"""
+    if "_record_pack_backed_candidate(" not in content:
+        if helper_marker not in content:
+            raise RuntimeError(
+                "Unable to apply managed Comet orchestration patch; upstream "
+                "scope matcher has changed."
+            )
+        content = content.replace(helper_marker, helper_block + helper_marker, 1)
 
     original_method = """    def _matches_requested_scope(
         self,
@@ -552,7 +770,15 @@ def render_orchestration_override(repo_dir: Path) -> str:
             reject_unknown_episode_files=False,
         )
 """
-    if "file_index: int | None = None" not in content:
+    replacement_signature = """    def _matches_requested_scope(
+        self,
+        parsed: ParsedData,
+        *,
+        file_index: int | None = None,
+        reject_unknown_override: bool | None = None,
+    ) -> bool:
+"""
+    if replacement_signature not in content:
         if original_method not in content:
             raise RuntimeError(
                 "Unable to apply managed Comet orchestration patch; upstream "
@@ -561,14 +787,46 @@ def render_orchestration_override(repo_dir: Path) -> str:
         content = content.replace(original_method, replacement_method, 1)
 
     replacements = {
+        "        for torrent in self.ready_to_cache:\n": (
+            "        for torrent in self.ready_to_cache:\n"
+            "            self._record_pack_backed_candidate(\n"
+            '                torrent["infoHash"],\n'
+            "                episode=self.search_episode,\n"
+            '                file_index=torrent["fileIndex"],\n'
+            "            )\n"
+        ),
         'if not self._matches_requested_scope(torrent["parsed"]):': (
             "if not self._matches_requested_scope("
             'torrent["parsed"], file_index=torrent["fileIndex"]):'
+        ),
+        '                "parsed": torrent["parsed"],\n': (
+            '                "parsed": torrent["parsed"],\n'
+            '                "packBacked": self._is_pack_backed_candidate(\n'
+            '                    torrent["parsed"],\n'
+            "                    info_hash=info_hash,\n"
+            '                    file_index=torrent["fileIndex"],\n'
+            "                ),\n"
+        ),
+        '            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))\n': (
+            "            self._record_pack_backed_candidate(\n"
+            '                row["info_hash"],\n'
+            '                episode=row["episode"],\n'
+            '                file_index=row["file_index"],\n'
+            "            )\n"
+            '            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))\n'
         ),
         "parsed_data, reject_unknown_override=reject_unknown_override": (
             "parsed_data, "
             'file_index=row["file_index"], '
             "reject_unknown_override=reject_unknown_override"
+        ),
+        '                "parsed": parsed_data,\n': (
+            '                "parsed": parsed_data,\n'
+            '                "packBacked": self._is_pack_backed_candidate(\n'
+            "                    parsed_data,\n"
+            "                    info_hash=info_hash,\n"
+            '                    file_index=row["file_index"],\n'
+            "                ),\n"
         ),
         "parsed, reject_unknown_override=True": (
             'parsed, file_index=torrent["fileIndex"], reject_unknown_override=True'

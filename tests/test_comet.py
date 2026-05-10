@@ -50,6 +50,18 @@ def _write_upstream_patch_sources(cfg) -> None:
     filtering_file.parent.mkdir(parents=True, exist_ok=True)
     orchestration_file.parent.mkdir(parents=True, exist_ok=True)
     formatting_file.write_text(
+        "COMPONENTS = {\n"
+        '    "title": "{}",\n'
+        '    "video": "{}",\n'
+        '    "audio": "{}",\n'
+        '    "quality": "{}",\n'
+        '    "group": "{}",\n'
+        '    "seeders": "Seeders: {}",\n'
+        '    "size": "Size: {}",\n'
+        '    "tracker": "Source: {}",\n'
+        '    "tracker_clean": "Source: Comet|{}",\n'
+        '    "languages": "Languages: {}",\n'
+        "}\n\n"
         "def get_formatted_components(\n"
         "    data: ParsedData,\n"
         "    ttitle: str,\n"
@@ -60,7 +72,29 @@ def _write_upstream_patch_sources(cfg) -> None:
         "):\n"
         "    return _get_formatted_components(\n"
         "        data, ttitle, seeders, size, tracker, result_format, _STYLE_EMOJI\n"
-        "    )\n",
+        "    )\n\n"
+        "def format_video_info(data: ParsedData):\n"
+        '    video_parts = ["hevc", "DV", "HDR"]\n'
+        '    return " • ".join(video_parts) if video_parts else ""\n\n'
+        "def format_title(components: dict):\n"
+        "    lines = []\n\n"
+        '    if "title" in components:\n'
+        '        lines.append(components["title"])\n\n'
+        '    video_audio = [components[k] for k in ["video", "audio"] if k in components]\n'
+        "    if video_audio:\n"
+        '        lines.append(" | ".join(video_audio))\n\n'
+        '    quality_group = [components[k] for k in ["quality", "group"] if k in components]\n'
+        "    if quality_group:\n"
+        '        lines.append(" | ".join(quality_group))\n\n'
+        '    info = [components[k] for k in ["seeders", "size", "tracker"] '
+        "if k in components]\n"
+        "    if info:\n"
+        '        lines.append(" ".join(info))\n\n'
+        '    if "languages" in components:\n'
+        '        lines.append(components["languages"])\n\n'
+        "    if not lines:\n"
+        '        return "Empty result format configuration"\n\n'
+        '    return "\\n".join(lines)\n',
         encoding="utf-8",
     )
     stream_file.write_text(
@@ -189,6 +223,23 @@ def _write_upstream_patch_sources(cfg) -> None:
         "from comet.utils.parsing import parsed_matches_target\n"
         "\n"
         "class TorrentManager:\n"
+        "    def __init__(self):\n"
+        '        self.media_type = "series"\n'
+        "        self.search_episode = None\n"
+        "        self.search_season = None\n"
+        "        self.season = None\n"
+        "        self.title = ''\n"
+        "        self.year = 0\n"
+        "        self.year_end = 0\n"
+        "        self.aliases = {}\n"
+        "        self.remove_adult_content = False\n"
+        "        self.ready_to_cache = []\n"
+        "        self.torrents = {}\n"
+        "        self.seen_hashes = set()\n"
+        "        self.primary_cached = False\n"
+        "        self.target_air_date = None\n"
+        "        self.reject_unknown_episode_files = False\n"
+        "\n"
         "    def _matches_requested_scope(\n"
         "        self,\n"
         "        parsed: ParsedData,\n"
@@ -354,8 +405,8 @@ class CometManagerTests(unittest.TestCase):
             root_override = tmp_path / ".stremio" / "docker-compose.bindings.yml"
             content = root_override.read_text(encoding="utf-8")
             self.assertIn('"127.0.0.1:18000:8000"', content)
-            self.assertIn('"10.0.0.5:18001:8080"', content)
-            self.assertIn('"100.64.0.8:18001:8080"', content)
+            self.assertIn('"10.0.0.5:18001:8090"', content)
+            self.assertIn('"100.64.0.8:18001:8090"', content)
             self.assertNotIn('"10.0.0.5:18000:8000"', content)
             self.assertIn(str(cfg.runtime_env_file), content)
             self.assertIn(
@@ -399,11 +450,40 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn('"title": display_title,', torrentio_override)
             self.assertIn("fallback_filename", torrentio_override)
             self.assertIn('"resolvedFileName": resolved_filename,', torrentio_override)
+            formatting_override = (cfg.state_dir / "formatting.py").read_text(encoding="utf-8")
+            self.assertIn("def _strip_redundant_hdr_tokens(", formatting_override)
+            self.assertIn("def _normalize_video_token(", formatting_override)
+            self.assertIn('return "HEVC"', formatting_override)
+            self.assertIn("return _strip_redundant_hdr_tokens(info)", formatting_override)
+            self.assertIn('if "video" in components:', formatting_override)
+            self.assertIn('if "audio" in components:', formatting_override)
+            self.assertIn('if "size" in components:', formatting_override)
+            self.assertIn('return "\\n".join(lines)', formatting_override)
+            self.assertNotIn(
+                'video_audio = [components[k] for k in ["video", "audio"] if k in components]',
+                formatting_override,
+            )
             stream_override = (cfg.state_dir / "stream.py").read_text(encoding="utf-8")
             self.assertIn("def _hdr_badge(", stream_override)
+            self.assertIn("def _series_pack_badge(", stream_override)
             self.assertIn("def _display_primary_label(", stream_override)
             self.assertIn("def _forwarded_external_base(", stream_override)
+            self.assertIn("pack_backed: bool = False", stream_override)
+            self.assertIn("pack = _series_pack_badge(media_type, pack_backed)", stream_override)
+            self.assertIn('return " | ".join(parts)', stream_override)
             self.assertIn("else _forwarded_external_base(request)", stream_override)
+            orchestration_override = (cfg.state_dir / "orchestration.py").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("self.pack_backed_hashes = set()", orchestration_override)
+            self.assertIn("def _record_pack_backed_candidate(", orchestration_override)
+            self.assertIn("def _is_pack_backed_candidate(", orchestration_override)
+            self.assertIn("file_index: int | None = None", orchestration_override)
+            self.assertIn(
+                'info_hash, {"episodes": set(), "indexes": set()}',
+                orchestration_override,
+            )
+            self.assertIn("self.pack_backed_hashes.add(info_hash)", orchestration_override)
             config_override = (cfg.state_dir / "config.py").read_text(encoding="utf-8")
             template_override = (cfg.state_dir / "index.html").read_text(encoding="utf-8")
             self.assertIn("def _prefixed_path(", config_override)
@@ -506,7 +586,7 @@ class CometManagerTests(unittest.TestCase):
                         "gluetun",
                     ): completed(
                         ["docker", "compose", "ps"],
-                        "gluetun  running  127.0.0.1:18000->8000/tcp, 127.0.0.1:18001->8080/tcp\n",
+                        "gluetun  running  127.0.0.1:18000->8000/tcp, 127.0.0.1:18001->8090/tcp\n",
                     ),
                     ("docker", "compose", "version"): completed(["docker", "compose", "version"]),
                     ("docker", "ps", "--format", "{{.ID}}"): completed(
@@ -589,7 +669,7 @@ class CometManagerTests(unittest.TestCase):
                         "gluetun",
                     ): completed(
                         ["docker", "compose", "ps"],
-                        "gluetun  running  127.0.0.1:18000->8000/tcp, 127.0.0.1:18001->8080/tcp\n",
+                        "gluetun  running  127.0.0.1:18000->8000/tcp, 127.0.0.1:18001->8090/tcp\n",
                     ),
                     ("docker", "compose", "version"): completed(["docker", "compose", "version"]),
                     ("docker", "ps", "--format", "{{.ID}}"): completed(
