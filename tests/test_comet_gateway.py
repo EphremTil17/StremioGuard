@@ -145,8 +145,8 @@ class TestCometGatewayPublishing:
         )
 
         assert '"127.0.0.1:18000:8000"' in content
-        assert '"10.0.0.1:18001:8080"' in content
-        assert '"100.64.0.1:18001:8080"' in content
+        assert '"10.0.0.1:18001:8090"' in content
+        assert '"100.64.0.1:18001:8090"' in content
         assert '"10.0.0.1:18000:8000"' not in content
         assert "comet-gateway:" in content
         assert str(gateway.nginx_conf_file) in content

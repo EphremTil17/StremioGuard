@@ -18,7 +18,9 @@ from stremioguard.env import env_file_value
 
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
 DEFAULT_COMET_GATEWAY_TOKEN_LENGTH = 8
-COMET_GATEWAY_CONTAINER_PORT = 8080
+# NOTE: the gateway runs in gluetun's network namespace, where Stremio's own
+# nginx already owns 8080 (web UI) and Comet owns 8000. 8090 is free there.
+COMET_GATEWAY_CONTAINER_PORT = 8090
 
 
 @dataclass(frozen=True)
