@@ -98,10 +98,27 @@ class Config:
     run_id: str
     log_file: Path | None
     log_session: bool
+    stremio_enabled: bool
 
     @classmethod
     def from_env(cls) -> Config:
         root_dir = Path(__file__).resolve().parent.parent.parent
+        env_file = root_dir / ".env"
+        stremio_enabled = (
+            env_file_value(env_file, "STREMIO_ENABLED") or "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        comet_enabled = (env_file_value(env_file, "COMET_ENABLED") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not stremio_enabled and not comet_enabled:
+            raise RuntimeError(
+                "Invalid configuration: both STREMIO_ENABLED and COMET_ENABLED are set to 0. "
+                "At least one service must be enabled in your .env file."
+            )
+
         run_id = os.environ.get("STREMIO_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
         log_file = os.environ.get("STREMIO_LOG_FILE")
         return cls(
@@ -127,6 +144,7 @@ class Config:
             run_id=run_id,
             log_file=Path(log_file) if log_file else None,
             log_session=os.environ.get("STREMIO_LOG_SESSION", "1") != "0",
+            stremio_enabled=stremio_enabled,
             ip_check_urls=tuple(
                 url.strip()
                 for url in os.environ.get(
