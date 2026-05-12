@@ -28,11 +28,13 @@ def render_stack_compose_override(
     bind_addresses: list[str],
     stremio_host_port: int,
     stremio_container_port: int,
+    stremio_enabled: bool,
     comet_config: CometConfig | None,
     comet_gateway_config: CometGatewayConfig | None = None,
 ) -> str:
     port_mappings: list[tuple[int, int]] = []
-    port_mappings.append((stremio_host_port, stremio_container_port))
+    if stremio_enabled:
+        port_mappings.append((stremio_host_port, stremio_container_port))
     comet_gateway_enabled = bool(comet_gateway_config and comet_gateway_config.enabled)
 
     extra_gluetun_ports = []
