@@ -51,18 +51,19 @@ class Orchestrator:
         self.guard.log(
             "Session metadata "
             f"run_id={cfg.run_id} "
-            f"service={cfg.service_name} "
-            f"container={cfg.container_name} "
+            f"deployment_profile={self.guard.deployment_profile()} "
             f"gluetun_container={cfg.gluetun_container_name} "
             f"watch_interval_seconds={cfg.watch_interval_seconds} "
             f"watchdog_log_interval_seconds={cfg.watchdog_log_interval_seconds}"
         )
 
-    def setup_stremio(self, *, reset: bool = True) -> None:
+    def setup_active_services(self, *, reset: bool = True) -> None:
         g = self.guard
-        g.ensure_data_dir()
+        if g.config.stremio_enabled:
+            g.ensure_data_dir()
+        services = g.enabled_runtime_services()
         if reset:
-            g.log("Resetting Compose instance without deleting stremio-data.")
+            g.log("Resetting Compose instance.")
             g.compose(
                 "down",
                 "--remove-orphans",
@@ -73,40 +74,32 @@ class Orchestrator:
             )
             time.sleep(2)
         g.preflight()
-        g.log(
-            f"Running: docker compose -f {g.config.compose_file} "
-            f"-f {g.config.compose_override_file} build {g.config.service_name}"
-        )
-        g.compose("build", g.config.service_name, capture=False)
-        g.log(f"Starting {g.config.service_name}.")
-        g.log(
-            f"Running: docker compose -f {g.config.compose_file} "
-            f"-f {g.config.compose_override_file} up -d {g.config.service_name}"
-        )
-        g.compose("up", "-d", g.config.service_name, capture=False)
-        g.success("Stremio is running behind gluetun.")
+        g.log(f"Building services: {', '.join(services)}.")
+        g.compose("build", *services, capture=False)
+        g.log(f"Starting services: {', '.join(services)}.")
+        g.compose("up", "-d", *services, capture=False)
+        g.success("Active services are running behind gluetun.")
 
-    def start_stremio(self) -> None:
+    def start_active_services(self) -> None:
         if not self.guard.compose_instance_exists():
             self.guard.log("No Compose instance found; running first-time setup.")
-            self.setup_stremio(reset=False)
+            self.setup_active_services(reset=False)
             return
 
         g = self.guard
-        g.ensure_data_dir()
+        if g.config.stremio_enabled:
+            g.ensure_data_dir()
         g.preflight()
-        g.log(f"Starting {g.config.service_name}.")
-        g.log(
-            f"Running: docker compose -f {g.config.compose_file} "
-            f"-f {g.config.compose_override_file} up -d {g.config.service_name}"
-        )
-        g.compose("up", "-d", g.config.service_name, capture=False)
-        g.success("Stremio is running behind gluetun.")
+        services = g.enabled_runtime_services()
+        g.log(f"Starting services: {', '.join(services)}.")
+        g.compose("up", "-d", *services, capture=False)
+        g.success("Active services are running behind gluetun.")
 
     def watch_stremio(self) -> None:
         self.guard.require_commands()
         self.guard.log(
-            f"Watching gluetun and {self.guard.config.container_name} "
+            "Watching gluetun and active services: "
+            f"{', '.join(self.guard.enabled_public_services())} "
             f"every {self.guard.config.watch_interval_seconds}s."
         )
         while True:
@@ -118,28 +111,28 @@ class Orchestrator:
         self.checks_since_summary += 1
 
         if not g.gluetun_healthy():
-            g.warn("Gluetun is not healthy. Stopping Stremio.")
+            g.warn("Gluetun is not healthy. Stopping active services.")
             self.vpn_drop_count += 1
             self.vpn_drops_since_summary += 1
-            g.stop_stremio()
+            g.stop_active_services()
             self._maybe_log_summary()
             return
 
         if not g.public_ip_safe():
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
-            g.warn("Public IP check failed. Stopping Stremio.")
+            g.warn("Public IP check failed. Stopping active services.")
             self.public_ip_failure_count += 1
             self.public_ip_failures_since_summary += 1
-            g.stop_stremio()
+            g.stop_active_services()
             self._maybe_log_summary()
             return
 
         self.last_public_ip = g.last_observed_ip or self.last_public_ip
 
         if not g.container_running():
-            g.log("Gluetun healthy; starting Stremio.")
+            g.log("Gluetun healthy; starting active services.")
             self.auto_starts_since_summary += 1
-            g.compose("up", "-d", g.config.service_name, capture=False)
+            g.compose("up", "-d", *g.enabled_runtime_services(), capture=False)
 
         self._maybe_log_summary()
 
@@ -171,23 +164,29 @@ class Orchestrator:
     def show_status(self) -> None:
         g = self.guard
         g.require_commands()
+        logger.info(f"--- Active Profile: {g.deployment_profile()} ---")
         logger.info("--- Gluetun ---")
         logger.info("healthy" if g.gluetun_healthy() else "not healthy / not running")
         logger.info("--- Public IP (via gluetun) ---")
         logger.info(g.public_ip_via_gluetun() or "unavailable")
-        logger.info("--- Container ---")
-        result = g.runner.run(
-            [
-                "docker",
-                "ps",
-                "--filter",
-                f"name=^/{g.config.container_name}$",
-                "--format",
-                "table {{.Names}}\t{{.Status}}\t{{.Ports}}",
-            ],
-            check=False,
-        )
-        g.log_lines((result.stdout or "").rstrip())
+        logger.info("--- Containers ---")
+        for service in g.enabled_runtime_services():
+            container_name = service
+            if service == "stremio":
+                container_name = g.config.container_name
+            result = g.runner.run(
+                [
+                    "docker",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    f"name=^/{container_name}$",
+                    "--format",
+                    "table {{.Names}}\t{{.Status}}\t{{.Ports}}",
+                ],
+                check=False,
+            )
+            g.log_lines((result.stdout or "").rstrip())
 
     def record_home_ip(self) -> None:
         g = self.guard
@@ -264,8 +263,8 @@ def _run_command(action: Callable[[Orchestrator], None]) -> None:
 
 @app.command(hidden=True)
 def reset() -> None:
-    """Reset/build/start the Compose instance safely."""
-    _run_command(lambda o: o.setup_stremio(reset=True))
+    """Reset/build/start active services safely."""
+    _run_command(lambda o: o.setup_active_services(reset=True))
 
 
 @app.command(hidden=True)
@@ -282,23 +281,23 @@ def pull() -> None:
 
 @app.command()
 def start() -> None:
-    """Initialize if needed and start Stremio."""
-    _run_command(lambda o: o.start_stremio())
+    """Initialize if needed and start active services."""
+    _run_command(lambda o: o.start_active_services())
 
 
 @app.command(hidden=True)
 def watchdog() -> None:
-    """Run the watchdog loop and auto-start Stremio when gluetun is healthy."""
+    """Run the watchdog loop and auto-start active services when gluetun is healthy."""
     _run_command(lambda o: o.watch_stremio())
 
 
 @app.command()
 def stop() -> None:
-    """Stop Stremio."""
+    """Stop active services."""
 
     def _stop(o: Orchestrator) -> None:
         o.guard.require_commands()
-        o.guard.stop_stremio()
+        o.guard.stop_active_services()
 
     _run_command(_stop)
 
