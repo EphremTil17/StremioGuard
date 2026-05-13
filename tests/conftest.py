@@ -75,6 +75,7 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
         "run_id": "test-run",
         "log_file": None,
         "log_session": True,
+        "stremio_enabled": True,
     }
     values.update(overrides)
     return Config(**values)  # type: ignore[arg-type]

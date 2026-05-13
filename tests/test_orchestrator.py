@@ -11,7 +11,14 @@ from stremioguard import guard as guard_mod
 from stremioguard.guard import GluetunGuard
 from stremioguard.orchestrator import Orchestrator
 
-from .conftest import FakeRunner, completed, compose_args_prefix, make_config
+from .conftest import (
+    FakeRunner,
+    completed,
+    compose_args_prefix,
+    make_comet_config,
+    make_comet_gateway_config,
+    make_config,
+)
 
 GLUETUN_HEALTH_INSPECT = (
     "docker",
@@ -36,7 +43,7 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(guard, "require_commands", return_value=None),
                 mock.patch.object(guard, "preflight", return_value=None),
             ):
-                orch.setup_stremio(reset=True)
+                orch.setup_active_services(reset=True)
 
             prefix = compose_args_prefix(tmp_path)
             self.assertIn([*prefix, "down", "--remove-orphans", "--timeout", "10"], runner.calls)
@@ -55,7 +62,7 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(guard, "require_commands", return_value=None),
                 mock.patch.object(guard, "preflight", return_value=None),
             ):
-                orch.start_stremio()
+                orch.start_active_services()
 
             prefix = compose_args_prefix(tmp_path)
             self.assertIn([*prefix, "build", "stremio"], runner.calls)
@@ -191,6 +198,107 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(
                 guard.config.home_ip_file.read_text(encoding="utf-8").strip(), "198.51.100.10"
             )
+
+    def test_setup_active_services_comet_only_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
+            )
+            # Create a Stremio-disabled config
+            cfg = make_config(tmp_path, stremio_enabled=False)
+            guard = GluetunGuard(cfg, runner)
+            orch = Orchestrator(guard)
+
+            comet_cfg = make_comet_config(tmp_path, enabled=True)
+            gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
+
+            with (
+                mock.patch.object(guard, "require_commands", return_value=None),
+                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
+                mock.patch(
+                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
+                ),
+                mock.patch(
+                    "stremioguard.comet_gateway.CometGatewayConfig.from_env",
+                    return_value=gateway_cfg,
+                ),
+            ):
+                orch.setup_active_services(reset=True)
+
+            prefix = compose_args_prefix(tmp_path)
+            self.assertIn([*prefix, "down", "--remove-orphans", "--timeout", "10"], runner.calls)
+            self.assertIn(
+                [*prefix, "build", "comet", "comet-postgres", "comet-gateway"], runner.calls
+            )
+            self.assertIn(
+                [*prefix, "up", "-d", "comet", "comet-postgres", "comet-gateway"], runner.calls
+            )
+            self.assertNotIn([*prefix, "build", "stremio"], runner.calls)
+
+    def test_watch_once_stops_comet_only_services_when_gluetun_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            cfg = make_config(tmp_path, stremio_enabled=False)
+            guard = GluetunGuard(cfg, runner)
+            orch = Orchestrator(guard)
+
+            comet_cfg = make_comet_config(tmp_path, enabled=True)
+            gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
+
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=False),
+                mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
+                mock.patch(
+                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
+                ),
+                mock.patch(
+                    "stremioguard.comet_gateway.CometGatewayConfig.from_env",
+                    return_value=gateway_cfg,
+                ),
+            ):
+                orch.watch_once()
+
+            prefix = compose_args_prefix(tmp_path)
+            self.assertIn(
+                [*prefix, "stop", "comet", "comet-postgres", "comet-gateway"], runner.calls
+            )
+            self.assertNotIn([*prefix, "stop", "stremio"], runner.calls)
+            self.assertEqual(orch.vpn_drop_count, 1)
+
+    def test_watch_once_auto_starts_comet_only_services_when_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            cfg = make_config(tmp_path, stremio_enabled=False)
+            guard = GluetunGuard(cfg, runner)
+            orch = Orchestrator(guard)
+
+            comet_cfg = make_comet_config(tmp_path, enabled=True)
+            gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
+
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "container_running", return_value=False),
+                mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
+                mock.patch(
+                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
+                ),
+                mock.patch(
+                    "stremioguard.comet_gateway.CometGatewayConfig.from_env",
+                    return_value=gateway_cfg,
+                ),
+            ):
+                orch.watch_once()
+
+            prefix = compose_args_prefix(tmp_path)
+            self.assertIn(
+                [*prefix, "up", "-d", "comet", "comet-postgres", "comet-gateway"], runner.calls
+            )
+            self.assertNotIn([*prefix, "up", "-d", "stremio"], runner.calls)
 
 
 if __name__ == "__main__":

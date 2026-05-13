@@ -99,6 +99,7 @@ class GluetunGuard:
             bind_addresses=addresses,
             stremio_host_port=host_port,
             stremio_container_port=container_port,
+            stremio_enabled=self.config.stremio_enabled,
             comet_config=comet_config if comet_config.enabled else None,
             comet_gateway_config=(
                 comet_gateway_config
@@ -108,6 +109,41 @@ class GluetunGuard:
         )
         self.config.compose_override_file.parent.mkdir(parents=True, exist_ok=True)
         self.config.compose_override_file.write_text(content, encoding="utf-8")
+
+    def deployment_profile(self) -> str:
+        comet_config = CometConfig.from_env(self.config.root_dir)
+        if self.config.stremio_enabled and comet_config.enabled:
+            return "Unified"
+        elif comet_config.enabled:
+            return "Comet-Only"
+        elif self.config.stremio_enabled:
+            return "Stremio-Only"
+        return "Unknown"
+
+    def enabled_runtime_services(self) -> list[str]:
+        services = []
+        if self.config.stremio_enabled:
+            services.append("stremio")
+        comet_config = CometConfig.from_env(self.config.root_dir)
+        if comet_config.enabled:
+            services.extend(["comet", "comet-postgres"])
+            gateway_config = CometGatewayConfig.from_env(self.config.root_dir)
+            if gateway_config.enabled:
+                services.append("comet-gateway")
+        return services
+
+    def enabled_public_services(self) -> list[str]:
+        services = []
+        if self.config.stremio_enabled:
+            services.append("stremio")
+        comet_config = CometConfig.from_env(self.config.root_dir)
+        if comet_config.enabled:
+            gateway_config = CometGatewayConfig.from_env(self.config.root_dir)
+            if gateway_config.enabled:
+                services.append("comet-gateway")
+            else:
+                services.append("comet")
+        return services
 
     def require_commands(self) -> None:
         require_docker(
@@ -257,11 +293,19 @@ class GluetunGuard:
                 "chosen VPN credentials manually (see README.md → First-time setup)."
             )
         self.check_bind_addresses()
+
+        comet_config = CometConfig.from_env(self.config.root_dir)
+        if comet_config.enabled:
+            from stremioguard.comet import CometManager
+
+            comet_manager = CometManager(comet_config, self.runner)
+            comet_manager.prepare_runtime()
+
         self.log(f"Ensuring {self.config.gluetun_container_name} is running.")
         self.compose("up", "-d", self.config.gluetun_container_name, capture=False)
         self.wait_for_gluetun_healthy()
         if not self.public_ip_safe(log_observation=True):
-            raise RuntimeError("Public IP check failed via gluetun; refusing to start Stremio.")
+            raise RuntimeError("Public IP check failed via gluetun; refusing to start services.")
 
     def ensure_data_dir(self) -> None:
         data_dir = self.config.root_dir / "stremio-data"
@@ -270,19 +314,27 @@ class GluetunGuard:
 
     def compose_instance_exists(self) -> bool:
         self.write_compose_override()
-        result = self.runner.run(
-            self._compose_command("ps", "-a", "-q", self.config.service_name), check=False
-        )
-        return bool((result.stdout or "").strip())
+        for service in self.enabled_runtime_services():
+            result = self.runner.run(self._compose_command("ps", "-a", "-q", service), check=False)
+            if bool((result.stdout or "").strip()):
+                return True
+        return False
 
     def container_running(self) -> bool:
-        result = self.runner.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", self.config.container_name],
-            check=False,
-        )
-        return result.returncode == 0 and (result.stdout or "").strip() == "true"
+        for service in self.enabled_runtime_services():
+            container_name = service
+            if service == "stremio":
+                container_name = self.config.container_name
+            result = self.runner.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+                check=False,
+            )
+            if result.returncode != 0 or (result.stdout or "").strip().lower() != "true":
+                return False
+        return True
 
-    def stop_stremio(self) -> None:
-        self.log(f"Stopping {self.config.service_name}.")
-        self.compose("stop", self.config.service_name, check=False)
-        self.success(f"{self.config.service_name} is stopped.")
+    def stop_active_services(self) -> None:
+        services = self.enabled_runtime_services()
+        self.log(f"Stopping active services: {', '.join(services)}.")
+        self.compose("stop", *services, check=False)
+        self.success("Active services are stopped.")
