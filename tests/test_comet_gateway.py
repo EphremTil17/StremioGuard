@@ -142,6 +142,7 @@ class TestCometGatewayPublishing:
             stremio_container_port=11470,
             comet_config=comet,
             comet_gateway_config=gateway,
+            stremio_enabled=True,
         )
 
         assert '"127.0.0.1:18000:8000"' in content
@@ -161,6 +162,7 @@ class TestCometGatewayPublishing:
             stremio_container_port=11470,
             comet_config=comet,
             comet_gateway_config=gateway,
+            stremio_enabled=True,
         )
 
         assert '"10.0.0.1:18000:8000"' in content
