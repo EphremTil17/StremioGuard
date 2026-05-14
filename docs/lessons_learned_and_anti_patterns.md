@@ -113,6 +113,54 @@ Generated URLs can fall back to `http://` even when users connect over HTTPS.
 An inner proxy can overwrite `X-Forwarded-Proto` with its own upstream scheme
 instead of preserving the client-facing scheme.
 
+---
+
+## 8. Pyright Type Narrowing for Containment Checks
+
+### The Mistake / Issue
+Using set containment checks such as `if value not in {None, ""}` fails to narrow the type of `value` from `str | None` to `str` under Pyright, causing type-checker errors when passing `value` to functions that require a non-Optional string/integer.
+
+### The Root Cause
+Pyright's static analysis does not automatically perform type narrowing on member containment checks for sets.
+
 ### The Core Corrective Rule
-Gateway proxy config should forward an existing `X-Forwarded-Proto` when present
-and only fall back to `$scheme` when it is missing.
+Use explicit comparison operators like `if value is not None and value != ""` to narrow types from `Optional` values to concrete ones.
+
+---
+
+## 9. Stdin Mocks for CLI Prompts
+
+### The Mistake / Issue
+Introducing interactive CLI prompts (like deployment profile selection in `init()`) causes unit tests that run in captured output environments to crash with `OSError: pytest: reading from stdin while output is captured`.
+
+### The Root Cause
+Interactive `typer.prompt` or `click.prompt` statements attempt to read from standard input (`sys.stdin`), which is intercepted/disabled by pytest output capture.
+
+### The Core Corrective Rule
+Ensure all CLI command tests patch `typer.prompt` (or supply mocked side effects/inputs) to represent the user choice, avoiding attempts to read from real stdin during unit testing.
+
+---
+
+## 10. Raw Comet Base URL Sourcing
+
+### The Mistake / Issue
+Disabling the Comet gateway on a reverse-proxied setup left the deployment without a configured public base URL, as the wizard only prompted for `COMET_GATEWAY_PUBLIC_BASE_URL` when the gateway was enabled.
+
+### The Root Cause
+Raw Comet runs under a different environment variable (`COMET_PUBLIC_BASE_URL`) than the token gateway (`COMET_GATEWAY_PUBLIC_BASE_URL`).
+
+### The Core Corrective Rule
+If the gateway is disabled but the deployment is reverse-proxied, the setup wizard must prompt for and record `COMET_PUBLIC_BASE_URL` to ensure Comet runs with its correct public-facing routing prefix.
+
+---
+
+## 11. Robust Proxy Auto-Detection
+
+### The Mistake / Issue
+Detecting a public proxy configuration by checking interface bindings (e.g. `STREMIO_BIND_ADDRS != "127.0.0.1"`) falsely classified LAN setups as proxied and loopback-bound proxied setups as local.
+
+### The Root Cause
+Interface bindings are orthogonal to external domain routing. An NPM-proxied deployment can safely bind to `127.0.0.1`, while a private LAN binding is not internet-accessible.
+
+### The Core Corrective Rule
+Detect proxy status by parsing existing configured public URLs (`EXTERNAL_BASE_URL`, `COMET_GATEWAY_PUBLIC_BASE_URL`, or `COMET_PUBLIC_BASE_URL`). If none are present, prompt the operator explicitly instead of guessing based on IP/port bindings.
