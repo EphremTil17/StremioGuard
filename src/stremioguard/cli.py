@@ -19,6 +19,7 @@ from stremioguard.comet import CometManager, prompt_comet_setup
 from stremioguard.comet_gateway import CometGatewayConfig, CometGatewayManager
 from stremioguard.config import CometConfig, Config
 from stremioguard.env import (
+    env_file_value,
     env_flag_enabled,
     env_needs_init,
     fail,
@@ -280,17 +281,47 @@ def init() -> None:
     else:
         logger.info(f"{ENV_FILE.name} already exists.")
 
-    configure_external_access(ENV_FILE)
-    configure_optional_stremio_settings(ENV_FILE)
-    existing_comet = CometConfig.from_env(ROOT_DIR).enabled
-    if typer.confirm(
-        "Configure the optional Comet playback-proxy subsystem?",
-        default=existing_comet,
-    ):
-        prompt_comet_setup(CometConfig.from_env(ROOT_DIR))
-    elif existing_comet:
-        write_env_setting(ENV_FILE, "COMET_ENABLED", "0")
-        logger.info("Comet disabled in .env. The unified stack will skip it on the next start.")
+    profile_choice = "1"
+    while True:
+        typer.echo("Select your deployment profile:")
+        typer.echo("  1) Unified: Run both Stremio and Comet  [default]")
+        typer.echo("  2) Comet-Only: Run only the Comet proxy & gateway")
+        typer.echo("  3) Stremio-Only: Run only the Stremio server")
+        profile_choice = typer.prompt("Choose [1-3]", default="1").strip()
+        if profile_choice in {"1", "2", "3"}:
+            break
+        typer.echo("Invalid choice. Please select 1, 2, or 3.")
+
+    stremio_enabled = True
+    comet_enabled = True
+    if profile_choice == "2":
+        stremio_enabled = False
+    elif profile_choice == "3":
+        comet_enabled = False
+
+    write_env_setting(ENV_FILE, "STREMIO_ENABLED", "1" if stremio_enabled else "0")
+    write_env_setting(ENV_FILE, "COMET_ENABLED", "1" if comet_enabled else "0")
+
+    # Prompt for proxy deployment choice upfront:
+    if stremio_enabled:
+        typer.echo("How will clients reach Stremio?")
+    else:
+        typer.echo("How will clients reach your Comet proxy?")
+    typer.echo("  1) LAN + Tailscale only — no public domain  [default]")
+    typer.echo("  2) Reverse-proxied behind a domain (NPM, Caddy, Traefik, raw nginx)")
+    choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
+    is_proxied = choice in {"2", "proxy", "domain", "reverse-proxy"}
+
+    # 1. Configure Stremio optional settings first if enabled:
+    if stremio_enabled:
+        configure_optional_stremio_settings(ENV_FILE)
+
+    # 2. Configure Comet settings next if enabled:
+    if comet_enabled:
+        prompt_comet_setup(CometConfig.from_env(ROOT_DIR), is_proxied=is_proxied)
+
+    # 3. Configure inbound external access guidance last, using correct ports/gateway status:
+    configure_external_access(ENV_FILE, is_proxied=is_proxied, comet_only=not stremio_enabled)
 
     logger.info("Pulling the latest VPN container image...")
     run_guard("pull", file_logging=False)
@@ -299,7 +330,7 @@ def init() -> None:
     if provider == "nordvpn":
         logger.info("Walking through NordVPN credential setup.")
         configure_nordvpn(ENV_FILE)
-        logger.info("Setup complete. Restarting Stremio so Docker reloads the updated VPN config.")
+        logger.info("Setup complete. Restarting stack so Docker reloads the updated VPN config.")
         restart()
         return
 
@@ -308,39 +339,27 @@ def init() -> None:
 
 @APP.command()
 def start() -> None:
-    """Initialize if needed, start Stremio, and launch the watchdog."""
+    """Initialize if needed, start active services, and launch the watchdog."""
     _warn_for_optional_stremio_settings()
-    comet_manager = _comet_manager() if _comet_enabled() else None
-    if comet_manager is not None:
-        comet_manager.prepare_runtime()
     context = RunContext.create()
     run_guard("start", context=context)
-    if comet_manager is not None:
-        comet_manager.start()
     _start_watchdog(context)
 
 
 @APP.command()
 def restart() -> None:
-    """Reset/build/start Stremio and relaunch the watchdog."""
+    """Reset/build/start active services and relaunch the watchdog."""
     _warn_for_optional_stremio_settings()
-    comet_manager = _comet_manager() if _comet_enabled() else None
-    if comet_manager is not None:
-        comet_manager.prepare_runtime()
     context = RunContext.create()
     _stop_watchdog()
     run_guard("reset", context=context)
-    if comet_manager is not None:
-        comet_manager.start()
     _start_watchdog(context)
 
 
 @APP.command()
 def stop() -> None:
-    """Stop the watchdog and Stremio."""
+    """Stop the watchdog and all active services."""
     _stop_watchdog()
-    if _comet_enabled():
-        _comet_manager().stop()
     run_guard("stop", file_logging=False)
 
 
@@ -385,7 +404,26 @@ def comet_install() -> None:
     config = CometConfig.from_env(ROOT_DIR)
     if not is_interactive():
         fail("`./stremio comet install` needs an interactive terminal.")
-    prompt_comet_setup(config)
+    # Detect if reverse-proxied from existing env values:
+    env_file = ROOT_DIR / ".env"
+    ext_url = env_file_value(env_file, "EXTERNAL_BASE_URL")
+    comet_gateway_url = env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL")
+    comet_url = env_file_value(env_file, "COMET_PUBLIC_BASE_URL")
+
+    if (
+        (ext_url is not None and ext_url.strip() != "")
+        or (comet_gateway_url is not None and comet_gateway_url.strip() != "")
+        or (comet_url is not None and comet_url.strip() != "")
+    ):
+        is_proxied = True
+    else:
+        typer.echo("How will clients reach your Comet proxy?")
+        typer.echo("  1) LAN + Tailscale only — no public domain  [default]")
+        typer.echo("  2) Reverse-proxied behind a domain (NPM, Caddy, Traefik, raw nginx)")
+        choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
+        is_proxied = choice in {"2", "proxy", "domain", "reverse-proxy"}
+
+    prompt_comet_setup(config, is_proxied=is_proxied)
     manager = CometManager(CometConfig.from_env(ROOT_DIR))
     manager.install()
     logger.success("Comet is installed and configured locally.")

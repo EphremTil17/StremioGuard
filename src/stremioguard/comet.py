@@ -235,10 +235,14 @@ class CometManager:
             patch_episode_pack_results=self.config.patch_episode_pack_results,
             gateway_addon_base_url=self.gateway_addon_base_url(),
         )
+        stremio_enabled = (
+            env_file_value(self.config.env_file, "STREMIO_ENABLED") or "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
         content = render_stack_compose_override(
             bind_addresses=list(self.config.bind_addresses),
             stremio_host_port=self.stremio_host_port(),
             stremio_container_port=self.stremio_container_port(),
+            stremio_enabled=stremio_enabled,
             comet_config=self.config,
             comet_gateway_config=gateway_config if gateway_config.enabled else None,
         )
@@ -615,7 +619,7 @@ def classify_playback_response(
     return "unexpected"
 
 
-def prompt_comet_setup(config: CometConfig) -> None:
+def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
     if not config.env_file.exists():
         fail(f"{config.env_file} is missing. Run `./stremio init` first.")
 
@@ -694,7 +698,23 @@ def prompt_comet_setup(config: CometConfig) -> None:
         "Comet gateway access: public addon, stream, and playback URLs are protected by "
         "a short token while /configure remains protected by the Comet password."
     )
-    gateway_enabled = typer.confirm("Enable the token-managed Comet gateway?", default=True)
+    gateway_enabled = True
+    if is_proxied:
+        typer.echo("")
+        typer.echo("WARNING: You have selected a public domain / reverse-proxy deployment profile.")
+        typer.echo(
+            "Disabling the Comet gateway will expose raw Comet (and your private "
+            "debrid keys/credentials) directly to the public internet without authentication."
+        )
+        if not typer.confirm("Keep the Comet gateway enabled for security?", default=True):
+            typer.echo("CRITICAL: Exposing raw Comet is highly discouraged and insecure.")
+            if typer.confirm(
+                "Are you absolutely sure you want to disable the gateway and expose raw Comet?",
+                default=False,
+            ):
+                gateway_enabled = False
+    else:
+        gateway_enabled = typer.confirm("Enable the token-managed Comet gateway?", default=True)
     write_env_setting(config.env_file, "COMET_GATEWAY_ENABLED", "1" if gateway_enabled else "0")
     if gateway_enabled:
         gateway_config = CometGatewayConfig.from_env(config.root_dir)
@@ -735,6 +755,21 @@ def prompt_comet_setup(config: CometConfig) -> None:
             token_id, token_value = refreshed_gateway.add_token("Shared Addon")
             logger.success(f"Created default Comet gateway token {token_id}.")
             typer.echo(f"  Addon base: {refreshed_gateway.addon_base_url(token_value)}")
+    elif is_proxied:
+        comet_public_base_url = typer.prompt(
+            "Comet public base URL (e.g. https://comet.example.com)",
+            default=config.public_base_url or "",
+        ).strip()
+        if not comet_public_base_url:
+            fail(
+                "A Comet public base URL is required when the gateway is disabled "
+                "for a reverse-proxied deployment."
+            )
+        write_env_setting(
+            config.env_file,
+            "COMET_PUBLIC_BASE_URL",
+            comet_public_base_url.rstrip("/"),
+        )
 
     typer.echo("")
     typer.echo(

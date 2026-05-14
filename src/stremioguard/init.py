@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+from contextlib import suppress
 from pathlib import Path
 
 import typer
@@ -10,23 +11,58 @@ from loguru import logger
 
 from stremioguard.env import (
     DEFAULT_STREMIO_HOST_PORT,
+    env_file_value,
     env_port_value,
     write_env_setting,
 )
 
 
-def configure_external_access(env_path: Path) -> None:
+def configure_external_access(env_path: Path, is_proxied: bool, comet_only: bool = False) -> None:
     logger.info("Inbound access:")
     typer.echo("")
-    typer.echo("How will clients reach Stremio?")
-    typer.echo("  1) LAN + Tailscale only — no public domain  [default]")
-    typer.echo("  2) Reverse-proxied behind a domain (NPM, Caddy, Traefik, raw nginx)")
-    choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
-    proxied = choice in {"2", "proxy", "domain", "reverse-proxy"}
+    if comet_only:
+        gateway_enabled = env_file_value(env_path, "COMET_GATEWAY_ENABLED") or "1"
+        gateway_active = gateway_enabled.strip().lower() not in {"0", "false", "no", "off"}
+        default_port = 18001 if gateway_active else 18000
+        port_raw = env_file_value(
+            env_path, "COMET_GATEWAY_HOST_PORT" if gateway_active else "COMET_HOST_PORT"
+        )
+        host_port = default_port
+        if port_raw is not None and port_raw != "":
+            with suppress(ValueError):
+                host_port = int(port_raw)
+
+        if is_proxied:
+            bind_addrs = _prompt_proxy_bind_address(host_port=host_port)
+        else:
+            bind_addrs = _prompt_direct_bind_addresses(host_port=host_port)
+
+        bind_value = ",".join(bind_addrs)
+        write_env_setting(env_path, "STREMIO_BIND_ADDRS", bind_value)
+        if bind_addrs:
+            logger.info(f"Comet will bind {host_port} on {bind_value}.")
+        else:
+            logger.info(f"Comet will not publish {host_port} on any host interface.")
+
+        if is_proxied:
+            bind_addr = bind_addrs[0] if bind_addrs else "<this-host-LAN-IP>"
+            upstream = bind_addr if bind_addr != "0.0.0.0" else "<this-host-LAN-IP>"
+            comet_url = (
+                env_file_value(
+                    env_path,
+                    "COMET_GATEWAY_PUBLIC_BASE_URL" if gateway_active else "COMET_PUBLIC_BASE_URL",
+                )
+                or ""
+            )
+            if comet_url:
+                logger.info(f"Clients will reach Comet via {comet_url}.")
+            logger.info(f"Point your reverse proxy upstream at http://{upstream}:{host_port}.")
+        return
+
     host_port = env_port_value(env_path, "STREMIO_HOST_PORT", DEFAULT_STREMIO_HOST_PORT)
     write_env_setting(env_path, "STREMIO_HOST_PORT", str(host_port))
 
-    if proxied:
+    if is_proxied:
         bind_addrs = _prompt_proxy_bind_address(host_port=host_port)
     else:
         bind_addrs = _prompt_direct_bind_addresses(host_port=host_port)
@@ -38,7 +74,7 @@ def configure_external_access(env_path: Path) -> None:
     else:
         logger.info(f"Stremio will not publish {host_port} on any host interface.")
 
-    if proxied:
+    if is_proxied:
         domain = _prompt_public_domain()
         external_url = f"https://{domain}"
         write_env_setting(env_path, "EXTERNAL_BASE_URL", external_url)

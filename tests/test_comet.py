@@ -511,6 +511,7 @@ class CometManagerTests(unittest.TestCase):
             stremio_host_port=11470,
             stremio_container_port=11470,
             comet_config=None,
+            stremio_enabled=True,
         )
         self.assertIn('"127.0.0.1:11470:11470"', content)
         self.assertNotIn("comet-postgres", content)
@@ -758,6 +759,7 @@ class CometCliTests(unittest.TestCase):
             with (
                 mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
                 mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "prompt", return_value="1"),
                 mock.patch.object(cli_mod, "prompt_comet_setup") as setup,
                 mock.patch.object(cli_mod, "CometManager") as manager_cls,
                 mock.patch.object(cli_mod, "logger"),
@@ -765,6 +767,53 @@ class CometCliTests(unittest.TestCase):
                 cli_mod.comet_install()
             setup.assert_called_once()
             manager_cls.return_value.install.assert_called_once()
+
+    def test_cli_comet_install_detects_proxied_from_env_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            env_file = temp_root / ".env"
+            env_file.write_text("EXTERNAL_BASE_URL=https://stremio.example.com\n", encoding="utf-8")
+            with (
+                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(cli_mod, "prompt_comet_setup") as setup,
+                mock.patch.object(cli_mod, "CometManager"),
+                mock.patch.object(cli_mod, "logger"),
+            ):
+                cli_mod.comet_install()
+            setup.assert_called_once_with(mock.ANY, is_proxied=True)
+
+    def test_cli_comet_install_prompts_for_proxy_when_no_url_in_env(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            env_file = temp_root / ".env"
+            env_file.write_text("COMET_ENABLED=0\n", encoding="utf-8")
+            with (
+                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "prompt", return_value="2"),
+                mock.patch.object(cli_mod, "prompt_comet_setup") as setup,
+                mock.patch.object(cli_mod, "CometManager"),
+                mock.patch.object(cli_mod, "logger"),
+            ):
+                cli_mod.comet_install()
+            setup.assert_called_once_with(mock.ANY, is_proxied=True)
+
+    def test_cli_comet_install_prompts_for_lan_only_when_no_url_in_env(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            env_file = temp_root / ".env"
+            env_file.write_text("COMET_ENABLED=0\n", encoding="utf-8")
+            with (
+                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "prompt", return_value="1"),
+                mock.patch.object(cli_mod, "prompt_comet_setup") as setup,
+                mock.patch.object(cli_mod, "CometManager"),
+                mock.patch.object(cli_mod, "logger"),
+            ):
+                cli_mod.comet_install()
+            setup.assert_called_once_with(mock.ANY, is_proxied=False)
 
     def test_cli_comet_install_requires_tty(self) -> None:
         with (
@@ -880,6 +929,119 @@ class CometCliTests(unittest.TestCase):
                 self.assertRaises(typer.Exit) as ctx,
             ):
                 comet_mod.prompt_comet_setup(cfg)
+            self.assertEqual(ctx.exception.exit_code, 1)
+
+    def test_prompt_comet_setup_public_domain_gateway_disabled_declined_remains_enabled(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            cfg = make_comet_config(temp_root)
+            cfg.env_file.write_text("COMET_ENABLED=0\n", encoding="utf-8")
+            # Scenario A: first confirm = False (wants to disable),
+            # second confirm = False (aborts disabling) -> gateway remains enabled
+            with (
+                mock.patch.object(
+                    typer,
+                    "prompt",
+                    side_effect=[
+                        "18000",  # host port
+                        "cfg-pass",  # configure password
+                        "-1",  # max connections
+                        "18001",  # gateway port
+                        "https://comet.example.com",  # gateway public base URL
+                    ],
+                ),
+                mock.patch.object(
+                    typer,
+                    "confirm",
+                    side_effect=[
+                        True,  # episode pack patch
+                        True,  # proxy enabled
+                        False,  # Keep gateway enabled? (user declines keeping it enabled)
+                        False,  # Are you sure you want to disable? (user says No, aborts)
+                        False,  # do not create token
+                        False,  # do not set fallback debrid defaults
+                    ],
+                ),
+                mock.patch.object(typer, "echo"),
+            ):
+                comet_mod.prompt_comet_setup(cfg, is_proxied=True)
+
+            self.assertEqual(env_file_value(cfg.env_file, "COMET_GATEWAY_ENABLED"), "1")
+
+    def test_prompt_comet_setup_public_domain_gateway_disabled_confirmed_gets_disabled(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            cfg = make_comet_config(temp_root)
+            cfg.env_file.write_text("COMET_ENABLED=0\n", encoding="utf-8")
+            # Scenario B: first confirm = False (wants to disable),
+            # second confirm = True (confirm disable) -> gateway gets disabled
+            with (
+                mock.patch.object(
+                    typer,
+                    "prompt",
+                    side_effect=[
+                        "18000",  # host port
+                        "cfg-pass",  # configure password
+                        "-1",  # max connections
+                        "https://comet.example.com",  # comet public base URL
+                    ],
+                ),
+                mock.patch.object(
+                    typer,
+                    "confirm",
+                    side_effect=[
+                        True,  # episode pack patch
+                        True,  # proxy enabled
+                        False,  # Keep gateway enabled? (user declines keeping it enabled)
+                        True,  # Are you sure you want to disable? (user confirms)
+                        False,  # do not set fallback debrid defaults
+                    ],
+                ),
+                mock.patch.object(typer, "echo"),
+            ):
+                comet_mod.prompt_comet_setup(cfg, is_proxied=True)
+
+            self.assertEqual(env_file_value(cfg.env_file, "COMET_GATEWAY_ENABLED"), "0")
+            self.assertEqual(
+                env_file_value(cfg.env_file, "COMET_PUBLIC_BASE_URL"),
+                "https://comet.example.com",
+            )
+
+    def test_prompt_comet_setup_public_domain_gateway_disabled_blank_url_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            cfg = make_comet_config(temp_root)
+            cfg.env_file.write_text("COMET_ENABLED=0\n", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    typer,
+                    "prompt",
+                    side_effect=[
+                        "18000",
+                        "cfg-pass",
+                        "-1",
+                        "",
+                    ],
+                ),
+                mock.patch.object(
+                    typer,
+                    "confirm",
+                    side_effect=[
+                        True,
+                        True,
+                        False,
+                        True,
+                    ],
+                ),
+                mock.patch.object(typer, "echo"),
+                self.assertRaises(typer.Exit) as ctx,
+            ):
+                comet_mod.prompt_comet_setup(cfg, is_proxied=True)
+
             self.assertEqual(ctx.exception.exit_code, 1)
 
 

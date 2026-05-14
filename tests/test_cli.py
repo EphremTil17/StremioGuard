@@ -127,11 +127,11 @@ class InitPromptTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with (
-                mock.patch.object(typer, "prompt", side_effect=["1", "1", "10.0.0.5"]),
+                mock.patch.object(typer, "prompt", side_effect=["1", "10.0.0.5"]),
                 mock.patch.object(typer, "echo"),
                 mock.patch.object(init_mod, "logger"),
             ):
-                init_mod.configure_external_access(env)
+                init_mod.configure_external_access(env, is_proxied=False)
             self.assertEqual(env_file_value(env, "EXTERNAL_BASE_URL"), "")
             self.assertEqual(env_file_value(env, "STREMIO_BIND_ADDRS"), "10.0.0.5")
             self.assertEqual(env_file_value(env, "STREMIO_HOST_PORT"), "11470")
@@ -142,12 +142,12 @@ class InitPromptTests(unittest.TestCase):
             env.write_text("EXTERNAL_BASE_URL=\nSTREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
             with (
                 mock.patch.object(
-                    typer, "prompt", side_effect=["2", "1", "10.0.0.5", "stremio.example.com"]
+                    typer, "prompt", side_effect=["1", "10.0.0.5", "stremio.example.com"]
                 ),
                 mock.patch.object(typer, "echo"),
                 mock.patch.object(init_mod, "logger"),
             ):
-                init_mod.configure_external_access(env)
+                init_mod.configure_external_access(env, is_proxied=True)
             self.assertEqual(
                 env_file_value(env, "EXTERNAL_BASE_URL"), "https://stremio.example.com"
             )
@@ -161,12 +161,12 @@ class InitPromptTests(unittest.TestCase):
                 mock.patch.object(
                     typer,
                     "prompt",
-                    side_effect=["2", "127.0.0.1", "y", "stremio.example.com"],
+                    side_effect=["127.0.0.1", "y", "stremio.example.com"],
                 ),
                 mock.patch.object(typer, "echo") as echo,
                 mock.patch.object(init_mod, "logger"),
             ):
-                init_mod.configure_external_access(env)
+                init_mod.configure_external_access(env, is_proxied=True)
             echo_msgs = [call.args[0] for call in echo.call_args_list if call.args]
             self.assertTrue(
                 any("not in Docker" in m for m in echo_msgs),
@@ -180,11 +180,11 @@ class InitPromptTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with (
-                mock.patch.object(typer, "prompt", side_effect=["1", "1", "10.0.0.5"]),
+                mock.patch.object(typer, "prompt", side_effect=["1", "10.0.0.5"]),
                 mock.patch.object(typer, "echo") as echo,
                 mock.patch.object(init_mod, "logger"),
             ):
-                init_mod.configure_external_access(env)
+                init_mod.configure_external_access(env, is_proxied=False)
             echo_msgs = [call.args[0] for call in echo.call_args_list if call.args]
             self.assertTrue(
                 any("12470" in m for m in echo_msgs),
@@ -262,33 +262,25 @@ class InitPromptTests(unittest.TestCase):
 
 
 class UnifiedCliTests(unittest.TestCase):
-    def test_start_auto_manages_comet_when_enabled(self) -> None:
-        fake_manager = mock.Mock()
+    def test_start_calls_run_guard_and_starts_watchdog(self) -> None:
         with (
             mock.patch.object(cli_mod, "_warn_for_optional_stremio_settings"),
-            mock.patch.object(cli_mod, "_comet_enabled", return_value=True),
-            mock.patch.object(cli_mod, "_comet_manager", return_value=fake_manager),
             mock.patch.object(cli_mod, "RunContext") as context_cls,
             mock.patch.object(cli_mod, "run_guard") as run_guard,
             mock.patch.object(cli_mod, "_start_watchdog") as start_watchdog,
         ):
             context = context_cls.create.return_value
             cli_mod.start()
-        fake_manager.prepare_runtime.assert_called_once()
-        fake_manager.start.assert_called_once()
         run_guard.assert_called_once_with("start", context=context)
         start_watchdog.assert_called_once_with(context)
 
-    def test_stop_stops_comet_when_enabled(self) -> None:
-        fake_manager = mock.Mock()
+    def test_stop_calls_run_guard_and_stops_watchdog(self) -> None:
         with (
-            mock.patch.object(cli_mod, "_stop_watchdog"),
-            mock.patch.object(cli_mod, "_comet_enabled", return_value=True),
-            mock.patch.object(cli_mod, "_comet_manager", return_value=fake_manager),
+            mock.patch.object(cli_mod, "_stop_watchdog") as stop_watchdog,
             mock.patch.object(cli_mod, "run_guard") as run_guard,
         ):
             cli_mod.stop()
-        fake_manager.stop.assert_called_once()
+        stop_watchdog.assert_called_once()
         run_guard.assert_called_once_with("stop", file_logging=False)
 
     def test_prompt_public_domain_rejects_path_and_whitespace(self) -> None:
@@ -326,7 +318,7 @@ class CliCommandTests(unittest.TestCase):
 
             call_order: list[str] = []
 
-            def record_external_access(_: Path) -> None:
+            def record_external_access(*args: object, **kwargs: object) -> None:
                 call_order.append("access")
 
             def record_optional_settings(_: Path) -> None:
@@ -340,9 +332,11 @@ class CliCommandTests(unittest.TestCase):
                 mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
                 mock.patch.object(cli_mod, "ENV_FILE", env_file),
                 mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "prompt", return_value="1"),
                 mock.patch.object(cli_mod, "prompt_provider", return_value="nordvpn"),
                 mock.patch.object(typer, "confirm", return_value=False),
                 mock.patch.object(cli_mod, "run_guard"),
+                mock.patch.object(cli_mod, "prompt_comet_setup"),
                 mock.patch.object(
                     cli_mod, "configure_external_access", side_effect=record_external_access
                 ),
@@ -357,7 +351,7 @@ class CliCommandTests(unittest.TestCase):
             ):
                 cli_mod.init()
 
-            self.assertEqual(call_order, ["access", "optional", "key"])
+            self.assertEqual(call_order, ["optional", "access", "key"])
 
     def test_init_always_prompts_credentials_even_when_already_set(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -377,9 +371,11 @@ class CliCommandTests(unittest.TestCase):
                 mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
                 mock.patch.object(cli_mod, "ENV_FILE", env_file),
                 mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "prompt", return_value="1"),
                 mock.patch.object(cli_mod, "prompt_provider", return_value="nordvpn"),
                 mock.patch.object(cli_mod, "configure_external_access"),
                 mock.patch.object(cli_mod, "configure_optional_stremio_settings"),
+                mock.patch.object(cli_mod, "prompt_comet_setup"),
                 mock.patch.object(typer, "confirm", return_value=False),
                 mock.patch.object(cli_mod, "run_guard"),
                 mock.patch.object(cli_mod, "configure_nordvpn") as cfg_nordvpn,
@@ -411,9 +407,11 @@ class CliCommandTests(unittest.TestCase):
                 mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
                 mock.patch.object(cli_mod, "ENV_FILE", env_file),
                 mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "prompt", return_value="1"),
                 mock.patch.object(cli_mod, "prompt_provider", return_value="other") as prompt,
                 mock.patch.object(cli_mod, "configure_external_access"),
                 mock.patch.object(cli_mod, "configure_optional_stremio_settings"),
+                mock.patch.object(cli_mod, "prompt_comet_setup"),
                 mock.patch.object(typer, "confirm", return_value=False),
                 mock.patch.object(cli_mod, "run_guard"),
                 mock.patch.object(cli_mod, "configure_nordvpn") as cfg_nordvpn,
@@ -445,9 +443,11 @@ class CliCommandTests(unittest.TestCase):
                 mock.patch.object(cli_mod, "ENV_FILE", env_file),
                 mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
                 mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "prompt", return_value="3"),
                 mock.patch.object(cli_mod, "prompt_provider", return_value="other"),
                 mock.patch.object(cli_mod, "configure_external_access"),
                 mock.patch.object(cli_mod, "configure_optional_stremio_settings"),
+                mock.patch.object(cli_mod, "prompt_comet_setup"),
                 mock.patch.object(typer, "confirm", return_value=False),
                 mock.patch.object(cli_mod, "run_guard"),
                 mock.patch.object(cli_mod, "configure_nordvpn"),
@@ -457,6 +457,39 @@ class CliCommandTests(unittest.TestCase):
                 cli_mod.init()
 
             self.assertEqual(env_file_value(env_file, "COMET_ENABLED"), "0")
+
+    def test_init_invalid_profile_choice_reprompts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            env_example = temp_root / ".env.example"
+            env_file = temp_root / ".env"
+            env_example.write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\nWIREGUARD_PRIVATE_KEY=<paste-key-here>\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
+                mock.patch.object(cli_mod, "ENV_FILE", env_file),
+                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "prompt", side_effect=["invalid", "2", "1", "nordvpn"]),
+                mock.patch.object(cli_mod, "prompt_provider", return_value="nordvpn"),
+                mock.patch.object(cli_mod, "configure_external_access") as ext,
+                mock.patch.object(cli_mod, "configure_optional_stremio_settings") as opt,
+                mock.patch.object(cli_mod, "prompt_comet_setup") as comet,
+                mock.patch.object(typer, "confirm", return_value=False),
+                mock.patch.object(cli_mod, "run_guard"),
+                mock.patch.object(cli_mod, "configure_nordvpn"),
+                mock.patch.object(cli_mod, "restart"),
+                mock.patch.object(cli_mod, "logger"),
+            ):
+                cli_mod.init()
+
+            self.assertEqual(env_file_value(env_file, "STREMIO_ENABLED"), "0")
+            self.assertEqual(env_file_value(env_file, "COMET_ENABLED"), "1")
+            ext.assert_called_once()
+            opt.assert_not_called()
+            comet.assert_called_once()
 
 
 if __name__ == "__main__":
