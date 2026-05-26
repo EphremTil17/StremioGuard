@@ -56,7 +56,12 @@ def configure_external_access(env_path: Path, is_proxied: bool, comet_only: bool
             )
             if comet_url:
                 logger.info(f"Clients will reach Comet via {comet_url}.")
-            logger.info(f"Point your reverse proxy upstream at http://{upstream}:{host_port}.")
+            _print_reverse_proxy_checklist(
+                upstream=upstream,
+                host_port=host_port,
+                is_comet=True,
+                gateway_active=gateway_active,
+            )
         return
 
     host_port = env_port_value(env_path, "STREMIO_HOST_PORT", DEFAULT_STREMIO_HOST_PORT)
@@ -81,13 +86,57 @@ def configure_external_access(env_path: Path, is_proxied: bool, comet_only: bool
         logger.info(f"Clients will reach Stremio via {external_url}.")
         bind_addr = bind_addrs[0] if bind_addrs else "<this-host-LAN-IP>"
         upstream = bind_addr if bind_addr != "0.0.0.0" else "<this-host-LAN-IP>"
-        logger.info(f"Point your reverse proxy upstream at http://{upstream}:{host_port}.")
+        _print_reverse_proxy_checklist(
+            upstream=upstream,
+            host_port=host_port,
+            is_comet=False,
+            gateway_active=False,
+        )
     else:
         write_env_setting(env_path, "EXTERNAL_BASE_URL", "")
         logger.info(
             "No public domain configured. Stremio will use the same host and port clients "
             "connect to, such as a local IP and port."
         )
+
+
+def _print_reverse_proxy_checklist(
+    upstream: str,
+    host_port: int,
+    is_comet: bool,
+    gateway_active: bool,
+) -> None:
+    typer.echo("")
+    typer.echo("WARNING: REVERSE PROXY REQUIREMENTS")
+    typer.echo("To expose this service securely and ensure it functions correctly:")
+    typer.echo("")
+    typer.echo("  * Domain Name & DNS: Ensure your domain/subdomain is registered and pointing")
+    typer.echo("    to your proxy's public IP (e.g. via Cloudflare).")
+    typer.echo(
+        f"  * Upstream Destination: Point your reverse proxy to http://{upstream}:{host_port}"
+    )
+    if is_comet:
+        if gateway_active:
+            typer.echo("    (targeting the secure token gateway).")
+        else:
+            typer.echo("    (targeting raw Comet - NOT RECOMMENDED for public exposure).")
+    else:
+        typer.echo("    (targeting the Stremio Streaming Server).")
+    typer.echo(
+        "  * Custom Headers (CRITICAL): Your proxy must be configured with specific headers."
+    )
+    if is_comet:
+        typer.echo("    - Forward 'Host', 'X-Forwarded-Host', and 'X-Forwarded-Proto'.")
+        typer.echo(
+            "    - Clear 'X-Forwarded-For' and 'X-Real-IP' to protect debrid access privacy."
+        )
+        typer.echo("    - Reference Nginx configuration templates at docs/comet-gateway.md.")
+    else:
+        typer.echo(
+            "    - Forward 'Host', 'Upgrade', 'Connection' (WebSockets), and 'X-Forwarded-Proto'."
+        )
+        typer.echo("    - Reference Nginx configuration templates at docs/secure-access.md.")
+    typer.echo("")
 
 
 def _prompt_proxy_bind_address(
