@@ -14,7 +14,11 @@ from loguru import logger
 from stremioguard.config import Config, docker_daemon_help, docker_permission_help
 from stremioguard.guard import GluetunGuard
 
-app = typer.Typer(help="Guard Stremio behind the gluetun VPN container.", no_args_is_help=True)
+app = typer.Typer(
+    help="Guard Stremio behind the gluetun VPN container.",
+    no_args_is_help=True,
+    context_settings={"color": True},
+)
 
 logger.remove()
 if os.environ.get("STREMIO_BACKGROUND") != "1":
