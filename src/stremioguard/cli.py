@@ -38,9 +38,13 @@ APP = typer.Typer(
     help="Start and guard Stremio behind the gluetun VPN container.",
     no_args_is_help=False,
 )
-COMET_APP = typer.Typer(help="Manage the modular Comet playback-proxy subsystem.")
+COMET_APP = typer.Typer(
+    help="Manage the modular Comet playback-proxy subsystem.",
+)
 APP.add_typer(COMET_APP, name="comet")
-COMET_TOKEN_APP = typer.Typer(help="Manage token-gated Comet addon access.")
+COMET_TOKEN_APP = typer.Typer(
+    help="Manage token-gated Comet addon access.",
+)
 COMET_APP.add_typer(COMET_TOKEN_APP, name="token")
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -50,7 +54,7 @@ PID_FILE = STATE_DIR / "watchdog.pid"
 UV_CACHE = ROOT_DIR / ".uv-cache"
 ENV_FILE = ROOT_DIR / ".env"
 ENV_EXAMPLE = ROOT_DIR / ".env.example"
-WATCHDOG_CMDLINE_MARKER = "stremio-vpn"
+WATCHDOG_CMDLINE_MARKERS = ("stremioguard.orchestrator", "stremio-vpn")
 
 logger.remove()
 logger.add(
@@ -124,23 +128,50 @@ def _pid_is_our_watchdog(pid: int) -> bool:
         cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace")
     except (FileNotFoundError, PermissionError, OSError):
         return False
-    return WATCHDOG_CMDLINE_MARKER in cmdline and "watchdog" in cmdline
+    return "watchdog" in cmdline and any(marker in cmdline for marker in WATCHDOG_CMDLINE_MARKERS)
+
+
+def _watchdog_pids() -> list[int]:
+    discovered: list[int] = []
+    seen: set[int] = set()
+
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pid = None
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                pass
+            else:
+                if _pid_is_our_watchdog(pid):
+                    discovered.append(pid)
+                    seen.add(pid)
+
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except (FileNotFoundError, PermissionError, OSError):
+        return discovered
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in seen:
+            continue
+        if _pid_is_our_watchdog(pid):
+            discovered.append(pid)
+            seen.add(pid)
+
+    return sorted(discovered)
 
 
 def _watchdog_pid() -> int | None:
-    if not PID_FILE.exists():
-        return None
-    try:
-        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-    except ValueError:
-        return None
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return None
-    if not _pid_is_our_watchdog(pid):
-        return None
-    return pid
+    pids = _watchdog_pids()
+    return pids[0] if pids else None
 
 
 def _wait_for_exit(pid: int, timeout_seconds: float) -> bool:
@@ -163,9 +194,10 @@ def _start_watchdog(context: RunContext) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    pid = _watchdog_pid()
-    if pid:
-        logger.info(f"Watchdog already running with PID {pid}.")
+    pids = _watchdog_pids()
+    if pids:
+        PID_FILE.write_text(f"{pids[0]}\n", encoding="utf-8")
+        logger.info(f"Watchdog already running with PID {pids[0]}.")
         return
 
     logger.info(f"Starting background watchdog. Logs: {context.log_file}")
@@ -184,32 +216,45 @@ def _start_watchdog(context: RunContext) -> None:
 
 
 def _stop_watchdog() -> None:
-    pid = _watchdog_pid()
-    if not pid:
+    pids = _watchdog_pids()
+    if not pids:
         PID_FILE.unlink(missing_ok=True)
         return
 
-    logger.info(f"Stopping background watchdog PID {pid}.")
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        PID_FILE.unlink(missing_ok=True)
-        return
+    logger.info(f"Stopping background watchdog PID(s) {', '.join(str(pid) for pid in pids)}.")
+    remaining: list[int] = []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
 
-    if _wait_for_exit(pid, 5):
-        PID_FILE.unlink(missing_ok=True)
-        return
+    for pid in pids:
+        if not _wait_for_exit(pid, 5):
+            remaining.append(pid)
 
-    logger.warning(f"Watchdog PID {pid} did not exit after SIGTERM; sending SIGKILL.")
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        PID_FILE.unlink(missing_ok=True)
-        return
-
-    if not _wait_for_exit(pid, 3):
-        logger.error(f"Watchdog PID {pid} did not exit after SIGKILL; leaving PID file in place.")
-        return
+    if remaining:
+        logger.warning(
+            "Watchdog PID(s) "
+            f"{', '.join(str(pid) for pid in remaining)} did not exit after SIGTERM; "
+            "sending SIGKILL."
+        )
+        stuck: list[int] = []
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                continue
+            if not _wait_for_exit(pid, 3):
+                stuck.append(pid)
+        if stuck:
+            PID_FILE.write_text(f"{stuck[0]}\n", encoding="utf-8")
+            logger.error(
+                "Watchdog PID(s) "
+                f"{', '.join(str(pid) for pid in stuck)} did not exit after SIGKILL; "
+                "leaving PID file in place."
+            )
+            return
 
     PID_FILE.unlink(missing_ok=True)
 
@@ -267,11 +312,45 @@ def main(ctx: typer.Context) -> None:
         start()
 
 
+def print_welcome_banner() -> None:
+    from contextlib import suppress
+
+    typer.echo("")
+    typer.echo("")
+    typer.echo("")
+
+    logo_path = ROOT_DIR / "assets" / "logo.txt"
+    logo_content = ""
+    with suppress(Exception):
+        if logo_path.exists():
+            logo_content = logo_path.read_text(encoding="utf-8")
+
+    if logo_content:
+        for line in logo_content.splitlines():
+            typer.echo(line)
+    else:
+        typer.echo("=== STREMIOGUARD ===")
+
+    typer.echo("")
+    typer.echo("Welcome to StremioGuard!")
+    typer.echo("The secure, self-hosted orchestrator for Stremio Streaming Server & Comet Proxy.")
+    typer.echo("StremioGuard routes all playback, streaming, and debrid network egress through")
+    typer.echo(
+        "a hardened VPN container (Gluetun) to prevent IP/DNS leaks and secure your privacy."
+    )
+    typer.echo("")
+    typer.echo("GitHub Repository: https://github.com/EphremTil17/StremioGuard")
+    typer.echo("─" * 90)
+    typer.echo("")
+
+
 @APP.command()
 def init() -> None:
     """First-time setup: create .env, configure VPN credentials, then start."""
     if not is_interactive():
         fail("`init` needs an interactive terminal (stdin/stdout must be a TTY).")
+
+    print_welcome_banner()
 
     if not ENV_FILE.exists():
         if not ENV_EXAMPLE.exists():
@@ -283,10 +362,19 @@ def init() -> None:
 
     profile_choice = "1"
     while True:
-        typer.echo("Select your deployment profile:")
+        typer.echo("")
+        typer.echo("1. Deployment Profile")
+        typer.echo("Select the architectural components you want to enable:")
         typer.echo("  1) Unified: Run both Stremio and Comet  [default]")
+        typer.echo(
+            "     Deploys both Stremio Streaming Server and the Comet metadata/playback proxy."
+        )
         typer.echo("  2) Comet-Only: Run only the Comet proxy & gateway")
+        typer.echo(
+            "     Deploys only Comet (with optional gateway). Best if hosting Stremio elsewhere."
+        )
         typer.echo("  3) Stremio-Only: Run only the Stremio server")
+        typer.echo("     Deploys only the Stremio server. Best if you do not use Comet add-ons.")
         profile_choice = typer.prompt("Choose [1-3]", default="1").strip()
         if profile_choice in {"1", "2", "3"}:
             break
@@ -303,14 +391,36 @@ def init() -> None:
     write_env_setting(ENV_FILE, "COMET_ENABLED", "1" if comet_enabled else "0")
 
     # Prompt for proxy deployment choice upfront:
+    typer.echo("")
+    typer.echo("2. Inbound Network Access")
     if stremio_enabled:
-        typer.echo("How will clients reach Stremio?")
+        typer.echo("Determine how clients will reach Stremio:")
     else:
-        typer.echo("How will clients reach your Comet proxy?")
+        typer.echo("Determine how clients will reach your Comet proxy:")
     typer.echo("  1) LAN + Tailscale only — no public domain  [default]")
+    typer.echo("     Clients connect via local IP or Tailscale. No public ports/domains required.")
     typer.echo("  2) Reverse-proxied behind a domain (NPM, Caddy, Traefik, raw nginx)")
+    typer.echo("     Clients connect through a public domain and reverse proxy.")
     choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
     is_proxied = choice in {"2", "proxy", "domain", "reverse-proxy"}
+
+    if is_proxied:
+        typer.echo("")
+        typer.echo("WARNING: REVERSE PROXY REQUIREMENTS")
+        typer.echo("To expose your service securely behind a domain:")
+        typer.echo("  * Domain Name & DNS: Ensure your domain/subdomain is registered and pointing")
+        typer.echo("    to your proxy's public IP (e.g. via Cloudflare).")
+        typer.echo(
+            "  * Custom Headers (CRITICAL): Your proxy must be configured to forward standard"
+        )
+        typer.echo(
+            "    headers (Host, X-Forwarded-Proto) and clear client IP headers (X-Forwarded-For,"
+        )
+        typer.echo("    X-Real-IP) to protect debrid access privacy.")
+        typer.echo("  * Port target recommendations and configuration templates can be found in:")
+        typer.echo("    - docs/comet-gateway.md  (for Comet metadata/playback proxy)")
+        typer.echo("    - docs/secure-access.md   (for Stremio Streaming Server)")
+        typer.echo("")
 
     # 1. Configure Stremio optional settings first if enabled:
     if stremio_enabled:

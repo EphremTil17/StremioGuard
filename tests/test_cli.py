@@ -261,6 +261,57 @@ class InitPromptTests(unittest.TestCase):
             self.assertEqual(init_mod._prompt_public_domain(), "stremio.example.com")
 
 
+class WatchdogCliTests(unittest.TestCase):
+    def test_pid_is_our_watchdog_matches_current_orchestrator_cmdline(self) -> None:
+        cmdline = (
+            b"uv\x00--cache-dir\x00/tmp/.uv-cache\x00run\x00python\x00-m\x00"
+            b"stremioguard.orchestrator\x00watchdog\x00"
+        )
+        with mock.patch.object(Path, "read_bytes", return_value=cmdline):
+            self.assertTrue(cli_mod._pid_is_our_watchdog(123))
+
+    def test_watchdog_pids_finds_orphaned_watchdog_without_pid_file(self) -> None:
+        proc_entries = [Path("/proc/111"), Path("/proc/222"), Path("/proc/sys")]
+        with (
+            mock.patch.object(cli_mod, "PID_FILE", Path("/tmp/nonexistent-watchdog.pid")),
+            mock.patch.object(Path("/proc").__class__, "iterdir", return_value=proc_entries),
+            mock.patch.object(cli_mod, "_pid_is_our_watchdog", side_effect=lambda pid: pid == 222),
+        ):
+            self.assertEqual(cli_mod._watchdog_pids(), [222])
+
+    def test_start_watchdog_recovers_pid_file_for_orphaned_watchdog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "watchdog.pid"
+            log_file = Path(directory) / "watchdog.log"
+            context = cli_mod.RunContext(run_id="test-run", log_file=log_file)
+            with (
+                mock.patch.object(cli_mod, "PID_FILE", pid_file),
+                mock.patch.object(cli_mod, "STATE_DIR", Path(directory)),
+                mock.patch.object(cli_mod, "LOG_DIR", Path(directory)),
+                mock.patch.object(cli_mod, "_require_uv"),
+                mock.patch.object(cli_mod, "_watchdog_pids", return_value=[4321]),
+                mock.patch.object(cli_mod.subprocess, "Popen") as popen,
+                mock.patch.object(cli_mod, "logger"),
+            ):
+                cli_mod._start_watchdog(context)
+            self.assertEqual(pid_file.read_text(encoding="utf-8").strip(), "4321")
+            popen.assert_not_called()
+
+    def test_stop_watchdog_terminates_orphaned_watchdog_without_pid_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "watchdog.pid"
+            with (
+                mock.patch.object(cli_mod, "PID_FILE", pid_file),
+                mock.patch.object(cli_mod, "_watchdog_pids", return_value=[4321]),
+                mock.patch.object(cli_mod, "_wait_for_exit", return_value=True),
+                mock.patch.object(cli_mod.os, "kill") as kill,
+                mock.patch.object(cli_mod, "logger"),
+            ):
+                cli_mod._stop_watchdog()
+            kill.assert_called_once_with(4321, cli_mod.signal.SIGTERM)
+            self.assertFalse(pid_file.exists())
+
+
 class UnifiedCliTests(unittest.TestCase):
     def test_start_calls_run_guard_and_starts_watchdog(self) -> None:
         with (
