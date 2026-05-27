@@ -307,6 +307,104 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
     }
     for before, after in call_replacements.items():
         content = content.replace(before, after)
+
+    helper_marker = "def _build_stream_name(\n"
+    helper_block = """def _promote_pack_backed_within_resolution(
+    streams: list[dict], *, media_type: str | None
+):
+    if media_type != \"series\" or len(streams) < 2:
+        return streams
+
+    ordered_buckets = []
+    bucket_groups = {}
+    for stream in streams:
+        bucket = str(stream.get(\"_sg_resolution_bucket\", \"\") or \"\")
+        if bucket not in bucket_groups:
+            ordered_buckets.append(bucket)
+            bucket_groups[bucket] = {\"packs\": [], \"others\": []}
+        group = \"packs\" if stream.get(\"_sg_pack_backed\") else \"others\"
+        bucket_groups[bucket][group].append(stream)
+
+    reordered = []
+    for bucket in ordered_buckets:
+        reordered.extend(bucket_groups[bucket][\"packs\"])
+        reordered.extend(bucket_groups[bucket][\"others\"])
+    return reordered
+
+
+"""
+    if "def _promote_pack_backed_within_resolution(" not in content:
+        if helper_marker not in content:
+            raise RuntimeError(
+                "Unable to apply managed Comet stream ordering patch; stream helper "
+                "signature has changed."
+            )
+        content = content.replace(helper_marker, helper_block + helper_marker, 1)
+
+    debrid_stream_block = """            the_stream = {
+                "name": stream_name,
+                "description": formatted_title,
+                "behaviorHints": behavior_hints,
+            }
+"""
+    debrid_stream_replacement = """            the_stream = {
+                "name": stream_name,
+                "description": formatted_title,
+                "behaviorHints": behavior_hints,
+            }
+            the_stream["_sg_resolution_bucket"] = _display_primary_label(
+                rtn_data.resolution, formatted_components
+            )
+            the_stream["_sg_pack_backed"] = torrent.get("packBacked", False)
+"""
+    if "_sg_resolution_bucket" not in content and debrid_stream_block in content:
+        content = content.replace(debrid_stream_block, debrid_stream_replacement, 1)
+
+    torrent_stream_block = """            the_stream = {
+                "name": stream_name,
+                "description": formatted_title,
+                "behaviorHints": behavior_hints,
+                "infoHash": info_hash,
+            }
+"""
+    torrent_stream_replacement = """            the_stream = {
+                "name": stream_name,
+                "description": formatted_title,
+                "behaviorHints": behavior_hints,
+                "infoHash": info_hash,
+            }
+            the_stream["_sg_resolution_bucket"] = _display_primary_label(
+                rtn_data.resolution, formatted_components
+            )
+            the_stream["_sg_pack_backed"] = torrent.get("packBacked", False)
+"""
+    if torrent_stream_replacement not in content and torrent_stream_block in content:
+        content = content.replace(torrent_stream_block, torrent_stream_replacement, 1)
+
+    final_streams_block = """    if sort_mixed:
+        final_streams = cached_results
+    else:
+        final_streams = cached_results + non_cached_results
+
+    has_results = len(final_streams) > 0
+"""
+    final_streams_replacement = """    if sort_mixed:
+        final_streams = cached_results
+    else:
+        final_streams = cached_results + non_cached_results
+
+    final_streams = _promote_pack_backed_within_resolution(
+        final_streams,
+        media_type=media_type,
+    )
+    for stream in final_streams:
+        stream.pop("_sg_resolution_bucket", None)
+        stream.pop("_sg_pack_backed", None)
+
+    has_results = len(final_streams) > 0
+"""
+    if 'stream.pop("_sg_resolution_bucket"' not in content and final_streams_block in content:
+        content = content.replace(final_streams_block, final_streams_replacement, 1)
     return content
 
 
@@ -431,6 +529,9 @@ def render_configure_template_override(
 
           function getCometPublicBase() {
             if (cometConfiguredPublicBase) {
+              if (cometConfiguredPublicBase.startsWith("/")) {
+                return `${window.location.origin}${cometConfiguredPublicBase}`;
+              }
               return cometConfiguredPublicBase;
             }
             return `${window.location.origin}${getCometMountPath()}`;
@@ -439,6 +540,9 @@ def render_configure_template_override(
           function getCometInstallBase(host, cometMountPath) {
             if (!cometConfiguredPublicBase) {
               return `${host}${cometMountPath}`;
+            }
+            if (cometConfiguredPublicBase.startsWith("/")) {
+              return `${host}${cometConfiguredPublicBase}`;
             }
             const url = new URL(cometConfiguredPublicBase);
             return `${url.host}${url.pathname.replace(/\\/$/, "")}`;

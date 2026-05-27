@@ -466,6 +466,7 @@ class CometManagerTests(unittest.TestCase):
             stream_override = (cfg.state_dir / "stream.py").read_text(encoding="utf-8")
             self.assertIn("def _hdr_badge(", stream_override)
             self.assertIn("def _series_pack_badge(", stream_override)
+            self.assertIn("def _promote_pack_backed_within_resolution(", stream_override)
             self.assertIn("def _display_primary_label(", stream_override)
             self.assertIn("def _forwarded_external_base(", stream_override)
             self.assertIn("pack_backed: bool = False", stream_override)
