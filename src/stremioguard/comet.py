@@ -218,6 +218,8 @@ class CometManager:
         default_token = gateway_manager.default_token()
         if not default_token:
             return None
+        if not gateway_config.public_base_url:
+            return f"/comet/{default_token}"
         return gateway_manager.addon_base_url(default_token)
 
     def write_stack_override_file(self) -> None:
@@ -623,7 +625,9 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
     if not config.env_file.exists():
         fail(f"{config.env_file} is missing. Run `./stremio init` first.")
 
-    logger.info("Comet server-owned proxy setup:")
+    typer.echo("")
+    typer.echo("3. Comet Proxy Port")
+    typer.echo("Choose the internal host port where the raw Comet service will listen.")
     host_port = typer.prompt("Comet host port", default=str(config.host_port)).strip()
     try:
         parsed_port = int(host_port)
@@ -638,13 +642,15 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
     write_env_setting(config.env_file, "COMET_SCRAPE_ZILEAN", config.scrape_zilean)
     write_env_setting(config.env_file, "COMET_ZILEAN_URL", config.zilean_url)
     write_env_setting(config.env_file, "COMET_RESULT_FORMAT_STYLE", config.result_format_style)
+
     typer.echo("")
+    typer.echo("4. Comet Compatibility Patches")
     typer.echo(
-        "Optional compatibility patch: preserve more episode results from season packs "
-        "when Comet consumes Torrentio/Zilean-style scraper results."
+        "Preserve more episode results from season packs "
+        "when Comet consumes Torrentio/Zilean scraper results."
     )
     patch_episode_pack_results = typer.confirm(
-        "Apply the Comet episode-pack result preservation patch?",
+        "Apply the Comet episode-pack preservation patch?",
         default=config.patch_episode_pack_results,
     )
     write_env_setting(
@@ -654,13 +660,10 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
     )
 
     typer.echo("")
+    typer.echo("5. Comet Admin Authentication")
     typer.echo(
-        "Comet will inherit Stremio's bind addresses so both services publish on the "
-        "same host interfaces."
+        "Protect the Comet configure page (/configure) so other users cannot change settings."
     )
-
-    typer.echo("")
-    typer.echo("Protect the Comet configure page so other users cannot change settings.")
     configure_password = typer.prompt(
         "Configure page password",
         hide_input=True,
@@ -672,6 +675,12 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
         fail("A configure page password is required for shared-domain Comet access.")
     write_env_setting(config.env_file, "COMET_CONFIGURE_PAGE_PASSWORD", configure_password)
 
+    typer.echo("")
+    typer.echo("6. Comet Debrid Stream Proxying")
+    typer.echo(
+        "Optionally proxy playback streams through this server (and your VPN)\n"
+        "instead of direct client-to-debrid connections."
+    )
     proxy_enabled = typer.confirm("Enable Comet debrid stream proxying?", default=True)
     write_env_setting(config.env_file, "COMET_PROXY_DEBRID_STREAM", "1" if proxy_enabled else "0")
     max_connections = typer.prompt(
@@ -694,19 +703,21 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
     )
 
     typer.echo("")
+    typer.echo("7. Comet Token Gateway Gating")
     typer.echo(
-        "Comet gateway access: public addon, stream, and playback URLs are protected by "
-        "a short token while /configure remains protected by the Comet password."
+        "The gateway protects public addon URLs with temporary tokens "
+        "while keeping /configure locked."
     )
     gateway_enabled = True
     if is_proxied:
         typer.echo("")
-        typer.echo("WARNING: You have selected a public domain / reverse-proxy deployment profile.")
+        typer.echo("WARNING: PUBLIC DEPLOYMENT DETECTED")
         typer.echo(
-            "Disabling the Comet gateway will expose raw Comet (and your private "
-            "debrid keys/credentials) directly to the public internet without authentication."
+            "Disabling the Comet gateway exposes raw Comet (and private keys) "
+            "directly to the public internet."
         )
         if not typer.confirm("Keep the Comet gateway enabled for security?", default=True):
+            typer.echo("")
             typer.echo("CRITICAL: Exposing raw Comet is highly discouraged and insecure.")
             if typer.confirm(
                 "Are you absolutely sure you want to disable the gateway and expose raw Comet?",
@@ -718,6 +729,7 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
     write_env_setting(config.env_file, "COMET_GATEWAY_ENABLED", "1" if gateway_enabled else "0")
     if gateway_enabled:
         gateway_config = CometGatewayConfig.from_env(config.root_dir)
+        typer.echo("")
         gateway_port = typer.prompt(
             "Comet gateway host port",
             default=str(gateway_config.host_port),
@@ -732,8 +744,15 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
             )
         write_env_setting(config.env_file, "COMET_GATEWAY_HOST_PORT", str(parsed_gateway_port))
 
+        typer.echo("")
+        typer.echo("Comet Gateway Public Base URL:")
+        typer.echo(
+            "Enter the public domain proxy endpoint (e.g. https://comet.example.com).\n"
+            "If left blank, the gateway will dynamically reconstruct URLs "
+            "from Nginx request headers."
+        )
         gateway_public_base_url = typer.prompt(
-            "Comet gateway public base URL (blank to infer from host/port)",
+            "Gateway public base URL (blank to infer from Nginx headers)",
             default=gateway_config.public_base_url or "",
         ).strip()
         write_env_setting(
@@ -756,8 +775,14 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
             logger.success(f"Created default Comet gateway token {token_id}.")
             typer.echo(f"  Addon base: {refreshed_gateway.addon_base_url(token_value)}")
     elif is_proxied:
+        typer.echo("")
+        typer.echo("Comet Public Base URL:")
+        typer.echo(
+            "Enter the public domain proxy endpoint (e.g. https://comet.example.com).\n"
+            "This URL is required when exposing raw Comet without the gateway token gate."
+        )
         comet_public_base_url = typer.prompt(
-            "Comet public base URL (e.g. https://comet.example.com)",
+            "Comet public base URL",
             default=config.public_base_url or "",
         ).strip()
         if not comet_public_base_url:
@@ -772,10 +797,10 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
         )
 
     typer.echo("")
+    typer.echo("8. Fallback Debrid Setup")
     typer.echo(
-        "Optional: configure one server-owned fallback debrid account. Leave this disabled "
-        "if you plan to do all debrid setup in Comet's configure page before distributing "
-        "the finished addon or Stremio account."
+        "Optionally configure a server-owned fallback debrid account. Leave this disabled\n"
+        "if users will input their own debrid API keys in Comet's /configure page."
     )
     use_server_defaults = typer.confirm(
         "Set server-owned fallback debrid credentials now?",
