@@ -33,3 +33,6 @@ Thumbs.db
 CLAUDE.md
 certs/host.tailnet.ts.net.crt
 certs/host.tailnet.ts.net.key
+
+# Local lessons learned ledger (must not be committed to remote)
+docs/lessons_learned_and_anti_patterns.md

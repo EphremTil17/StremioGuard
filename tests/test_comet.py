@@ -437,6 +437,10 @@ class CometManagerTests(unittest.TestCase):
                 f"{cfg.state_dir / 'orchestration.py'}:/app/comet/services/orchestration.py:ro",
                 content,
             )
+            self.assertIn(
+                f"{cfg.state_dir / 'metadata_service.py'}:/app/comet/metadata_service.py:ro",
+                content,
+            )
             filtering_override = (cfg.state_dir / "filtering.py").read_text(encoding="utf-8")
             torrentio_override = (cfg.state_dir / "torrentio.py").read_text(encoding="utf-8")
             self.assertIn("TITLE_TOKEN_STOPWORDS", filtering_override)
@@ -478,13 +482,14 @@ class CometManagerTests(unittest.TestCase):
             )
             self.assertIn("self.pack_backed_hashes = set()", orchestration_override)
             self.assertIn("def _record_pack_backed_candidate(", orchestration_override)
-            self.assertIn("def _is_pack_backed_candidate(", orchestration_override)
+            self.assertIn("async def _is_pack_backed_candidate(", orchestration_override)
             self.assertIn("file_index: int | None = None", orchestration_override)
             self.assertIn(
                 'info_hash, {"episodes": set(), "indexes": set()}',
                 orchestration_override,
             )
             self.assertIn("self.pack_backed_hashes.add(info_hash)", orchestration_override)
+            self.assertTrue((cfg.state_dir / "metadata_service.py").exists())
             config_override = (cfg.state_dir / "config.py").read_text(encoding="utf-8")
             template_override = (cfg.state_dir / "index.html").read_text(encoding="utf-8")
             self.assertIn("def _prefixed_path(", config_override)

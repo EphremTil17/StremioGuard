@@ -60,6 +60,9 @@ COMET_HOST_PORT=18000
 COMET_GATEWAY_ENABLED=1
 COMET_GATEWAY_HOST_PORT=18001
 COMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.com
+# Alternatively, leave COMET_GATEWAY_PUBLIC_BASE_URL blank/empty to enable dynamic relative
+# path resolution. The gateway and configure page will automatically resolve endpoints
+# using the client browser's request window location host origin at runtime.
 ```
 
 Create a shared token:

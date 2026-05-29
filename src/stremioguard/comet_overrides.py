@@ -781,7 +781,7 @@ def render_orchestration_override(repo_dir: Path) -> str:
         ):
             self.pack_backed_hashes.add(info_hash)
 
-    def _is_pack_backed_candidate(
+    async def _is_pack_backed_candidate(
         self,
         parsed: ParsedData,
         *,
@@ -795,6 +795,13 @@ def render_orchestration_override(repo_dir: Path) -> str:
 
         parsed_episodes = parsed.episodes or []
         if len(parsed_episodes) > 1:
+            try:
+                from comet.metadata_service import get_season_episode_count
+            except ImportError:
+                from stremioguard.metadata import get_season_episode_count
+            total_eps = await get_season_episode_count(self.media_id, self.search_season)
+            if total_eps:
+                return max(parsed_episodes) >= total_eps
             return True
         if isinstance(file_index, int):
             return file_index > 0 or not parsed_episodes
@@ -905,7 +912,7 @@ def render_orchestration_override(repo_dir: Path) -> str:
         ),
         '                "parsed": torrent["parsed"],\n': (
             '                "parsed": torrent["parsed"],\n'
-            '                "packBacked": self._is_pack_backed_candidate(\n'
+            '                "packBacked": await self._is_pack_backed_candidate(\n'
             '                    torrent["parsed"],\n'
             "                    info_hash=info_hash,\n"
             '                    file_index=torrent["fileIndex"],\n'
@@ -926,7 +933,7 @@ def render_orchestration_override(repo_dir: Path) -> str:
         ),
         '                "parsed": parsed_data,\n': (
             '                "parsed": parsed_data,\n'
-            '                "packBacked": self._is_pack_backed_candidate(\n'
+            '                "packBacked": await self._is_pack_backed_candidate(\n'
             "                    parsed_data,\n"
             "                    info_hash=info_hash,\n"
             '                    file_index=row["file_index"],\n'
@@ -1093,3 +1100,10 @@ def write_override_bundle(
         orchestration_target.write_text(render_orchestration_override(repo_dir), encoding="utf-8")
     elif orchestration_target.exists():
         orchestration_target.unlink()
+
+    metadata_src = Path(__file__).parent / "metadata.py"
+    metadata_target = state_dir / "metadata_service.py"
+    if metadata_src.exists():
+        metadata_target.write_text(metadata_src.read_text(encoding="utf-8"), encoding="utf-8")
+    elif metadata_target.exists():
+        metadata_target.unlink()

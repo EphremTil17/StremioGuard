@@ -61,6 +61,7 @@ The generated files currently include:
 - `torrentio.py`
 - `filtering.py`
 - `orchestration.py`
+- `metadata_service.py`
 
 ## Current Patch Logic
 
@@ -131,7 +132,13 @@ Approach:
 
 - relax Comet's episode-scope gate when there is still strong evidence that a
   result belongs to the requested season/episode context
-- prefer concrete file-level evidence over overly strict pack-level rejection
+- query a precise Cinemeta-backed metadata lookup service (implemented in
+  [metadata_service.py](file:///app/comet/metadata_service.py)) to retrieve the total number of
+  episodes for the season, caching counts in memory and falling back to Comet's
+  local database index (`series_episode_index` table MAX episode count)
+- compare parsed episode lists against the resolved season total, ensuring only
+  complete season packs receive the `P` (Pack-backed) badge and get promoted to the
+  top of their resolution category
 
 This patch is optional in setup and is controlled by:
 

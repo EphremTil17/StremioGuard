@@ -137,7 +137,9 @@ automatically.
   a shared domain does not let other users rewrite addon settings.
 - The Comet setup flow also offers an optional episode-pack preservation patch
   so Torrentio/Zilean-backed episode results inside season packs survive more
-  like native Torrentio.
+  like native Torrentio. When enabled (`COMET_PATCH_EPISODE_PACK_RESULTS=1`), this
+  uses a precise Cinemeta-backed caching metadata service to check season episode counts,
+  ensuring only complete season packs are prioritized and badged.
 - These optional Comet compatibility patches are strongly recommended. See
   [docs/comet-patches.md](docs/comet-patches.md) for the logic, methodology,
   and tradeoffs behind them.
