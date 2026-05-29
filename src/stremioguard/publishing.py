@@ -93,6 +93,9 @@ def render_stack_compose_override(
         if comet_config.patch_episode_pack_results:
             orch_src = comet_config.state_dir / "orchestration.py"
             comet_volumes.append(f"      - {orch_src}:/app/comet/services/orchestration.py:ro")
+        metadata_src = comet_config.state_dir / "metadata_service.py"
+        if metadata_src.exists():
+            comet_volumes.append(f"      - {metadata_src}:/app/comet/metadata_service.py:ro")
         content.extend(
             [
                 "  comet:",

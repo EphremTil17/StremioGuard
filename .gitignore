@@ -33,3 +33,6 @@ Thumbs.db
 CLAUDE.md
 certs/lemons.tarpon-penny.ts.net.crt
 certs/lemons.tarpon-penny.ts.net.key
+
+# Local lessons learned ledger (must not be committed to remote)
+docs/lessons_learned_and_anti_patterns.md
