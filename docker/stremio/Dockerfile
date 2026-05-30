@@ -1,4 +1,4 @@
-FROM tsaridas/stremio-docker@sha256:e1da3d3702082a107c03e1b428554749e39ac31559a1ff933e2c7b61390f83d9
+FROM tsaridas/stremio-docker@sha256:f0de8290286b08e1c98ac875cba5c2ec62c6603f2b81b444ff850f63c2810eda
 
 ARG STREMIO_APPLY_PATCHES=1
 
