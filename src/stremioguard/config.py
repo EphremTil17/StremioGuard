@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from stremioguard.env import env_file_value
+from stremioguard.env import env_file_value, env_flag_enabled
 
 GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
 DEFAULT_STREMIO_HOST_PORT = 11470
@@ -104,15 +104,8 @@ class Config:
     def from_env(cls) -> Config:
         root_dir = Path(__file__).resolve().parent.parent.parent
         env_file = root_dir / ".env"
-        stremio_enabled = (
-            env_file_value(env_file, "STREMIO_ENABLED") or "1"
-        ).strip().lower() not in {"0", "false", "no", "off"}
-        comet_enabled = (env_file_value(env_file, "COMET_ENABLED") or "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        stremio_enabled = env_flag_enabled("STREMIO_ENABLED", True, env_path=env_file)
+        comet_enabled = env_flag_enabled("COMET_ENABLED", False, env_path=env_file)
         if not stremio_enabled and not comet_enabled:
             raise RuntimeError(
                 "Invalid configuration: both STREMIO_ENABLED and COMET_ENABLED are set to 0. "
@@ -233,9 +226,7 @@ class CometConfig:
             )
         )
         public_base_url = env_file_value(env_file, "COMET_PUBLIC_BASE_URL") or None
-        proxy_enabled = (
-            (env_file_value(env_file, "COMET_PROXY_DEBRID_STREAM") or "1").strip().lower()
-        )
+        proxy_debrid_stream = env_flag_enabled("COMET_PROXY_DEBRID_STREAM", True, env_path=env_file)
         proxy_max_connections_raw = env_file_value(env_file, "COMET_PROXY_MAX_CONNECTIONS")
         proxy_max_connections = -1
         if proxy_max_connections_raw not in {None, ""}:
@@ -280,9 +271,9 @@ class CometConfig:
                 "Invalid COMET_RESULT_FORMAT_STYLE value: "
                 f"{result_format_style!r}; expected 'plain' or 'emoji'"
             )
-        patch_episode_pack_results = (
-            env_file_value(env_file, "COMET_PATCH_EPISODE_PACK_RESULTS") or "1"
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        patch_episode_pack_results = env_flag_enabled(
+            "COMET_PATCH_EPISODE_PACK_RESULTS", True, env_path=env_file
+        )
         return cls(
             root_dir=root_dir,
             env_file=env_file,
@@ -301,7 +292,7 @@ class CometConfig:
             host_port=host_port,
             bind_addresses=bind_addresses,
             public_base_url=public_base_url,
-            proxy_debrid_stream=proxy_enabled not in {"0", "false", "no", "off"},
+            proxy_debrid_stream=proxy_debrid_stream,
             proxy_max_connections=proxy_max_connections,
             healthcheck_interval_seconds=healthcheck_interval_seconds,
             configure_page_password=configure_page_password,
@@ -315,6 +306,5 @@ class CometConfig:
                 env_file_value(env_file, "COMET_DEFAULT_DEBRID_SERVICE") or "realdebrid"
             ).strip(),
             default_debrid_apikey=env_file_value(env_file, "COMET_DEFAULT_DEBRID_APIKEY") or None,
-            enabled=(env_file_value(env_file, "COMET_ENABLED") or "0").strip().lower()
-            in {"1", "true", "yes", "on"},
+            enabled=env_flag_enabled("COMET_ENABLED", False, env_path=env_file),
         )
