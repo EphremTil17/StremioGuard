@@ -12,6 +12,7 @@ from loguru import logger
 from stremioguard.env import (
     DEFAULT_STREMIO_HOST_PORT,
     env_file_value,
+    env_flag_enabled,
     env_port_value,
     write_env_setting,
 )
@@ -21,8 +22,7 @@ def configure_external_access(env_path: Path, is_proxied: bool, comet_only: bool
     logger.info("Inbound access:")
     typer.echo("")
     if comet_only:
-        gateway_enabled = env_file_value(env_path, "COMET_GATEWAY_ENABLED") or "1"
-        gateway_active = gateway_enabled.strip().lower() not in {"0", "false", "no", "off"}
+        gateway_active = env_flag_enabled("COMET_GATEWAY_ENABLED", True, env_path=env_path)
         default_port = 18001 if gateway_active else 18000
         port_raw = env_file_value(
             env_path, "COMET_GATEWAY_HOST_PORT" if gateway_active else "COMET_HOST_PORT"
