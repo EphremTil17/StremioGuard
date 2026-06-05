@@ -113,12 +113,13 @@ class Orchestrator:
     def watch_once(self) -> None:
         g = self.guard
         self.checks_since_summary += 1
+        services = g.enabled_runtime_services()
 
         if not g.gluetun_healthy():
             g.warn("Gluetun is not healthy. Stopping active services.")
             self.vpn_drop_count += 1
             self.vpn_drops_since_summary += 1
-            g.stop_active_services()
+            g.stop_active_services(services=services)
             self._maybe_log_summary()
             return
 
@@ -127,16 +128,16 @@ class Orchestrator:
             g.warn("Public IP check failed. Stopping active services.")
             self.public_ip_failure_count += 1
             self.public_ip_failures_since_summary += 1
-            g.stop_active_services()
+            g.stop_active_services(services=services)
             self._maybe_log_summary()
             return
 
         self.last_public_ip = g.last_observed_ip or self.last_public_ip
 
-        if not g.container_running():
+        if not g.container_running(services=services):
             g.log("Gluetun healthy; starting active services.")
             self.auto_starts_since_summary += 1
-            g.compose("up", "-d", *g.enabled_runtime_services(), capture=False)
+            g.compose("up", "-d", *services, capture=False)
 
         self._maybe_log_summary()
 

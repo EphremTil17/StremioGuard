@@ -320,8 +320,10 @@ class GluetunGuard:
                 return True
         return False
 
-    def container_running(self) -> bool:
-        for service in self.enabled_runtime_services():
+    def container_running(self, services: list[str] | None = None) -> bool:
+        if services is None:
+            services = self.enabled_runtime_services()
+        for service in services:
             container_name = service
             if service == "stremio":
                 container_name = self.config.container_name
@@ -333,8 +335,9 @@ class GluetunGuard:
                 return False
         return True
 
-    def stop_active_services(self) -> None:
-        services = self.enabled_runtime_services()
+    def stop_active_services(self, services: list[str] | None = None) -> None:
+        if services is None:
+            services = self.enabled_runtime_services()
         self.log(f"Stopping active services: {', '.join(services)}.")
         self.compose("stop", *services, check=False)
         self.success("Active services are stopped.")

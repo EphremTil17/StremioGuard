@@ -14,7 +14,7 @@ from pathlib import Path
 from loguru import logger
 
 from stremioguard.config import GENERATED_COMPOSE_FILE, Runner, SubprocessRunner, _parse_ipv4_csv
-from stremioguard.env import env_file_value
+from stremioguard.env import env_file_value, env_flag_enabled
 
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
 DEFAULT_COMET_GATEWAY_TOKEN_LENGTH = 8
@@ -93,8 +93,7 @@ class CometGatewayConfig:
             ),
             public_base_url=(env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL") or None),
             token_length=token_length,
-            enabled=(env_file_value(env_file, "COMET_GATEWAY_ENABLED") or "1").strip().lower()
-            not in {"0", "false", "no", "off"},
+            enabled=env_flag_enabled("COMET_GATEWAY_ENABLED", True, env_path=env_file),
         )
 
 
