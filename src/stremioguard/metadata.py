@@ -15,8 +15,9 @@ try:
 except ImportError:
     database = None
 
-# Worker-safe in-memory cache
-_EPISODE_COUNT_CACHE: dict[tuple[str, int], int] = {}
+# Coroutine-safe in-memory cache (per process event loop)
+# Stores: (series_id, season) -> (episode_count | None, expiry_timestamp)
+_EPISODE_COUNT_CACHE: dict[tuple[str, int], tuple[int | None, float]] = {}
 
 
 async def get_season_episode_count(series_id: str, season: int) -> int | None:
@@ -29,8 +30,11 @@ async def get_season_episode_count(series_id: str, season: int) -> int | None:
         return None
 
     cache_key = (series_id, season)
+    now = time.monotonic()
     if cache_key in _EPISODE_COUNT_CACHE:
-        return _EPISODE_COUNT_CACHE[cache_key]
+        val, expiry = _EPISODE_COUNT_CACHE[cache_key]
+        if now < expiry:
+            return val
 
     # Try local database (populated by Comet's EpisodeIndexService)
     try:
@@ -43,7 +47,8 @@ async def get_season_episode_count(series_id: str, season: int) -> int | None:
             """
             db_max = await database.fetch_val(query, {"series_id": series_id, "season": season})
             if db_max is not None and db_max > 0:
-                _EPISODE_COUNT_CACHE[cache_key] = db_max
+                # Cache positive result with 24 hours TTL
+                _EPISODE_COUNT_CACHE[cache_key] = (db_max, now + 86400.0)
                 return db_max
     except Exception as exc:
         logger.warning(
@@ -60,9 +65,10 @@ async def get_season_episode_count(series_id: str, season: int) -> int | None:
 
     start_time = time.monotonic()
     try:
+        timeout = aiohttp.ClientTimeout(total=5)
         async with (
             aiohttp.ClientSession() as session,
-            session.get(url, headers=headers, timeout=5) as response,
+            session.get(url, headers=headers, timeout=timeout) as response,
         ):
             if response.status == 200:
                 payload = await response.json()
@@ -88,11 +94,14 @@ async def get_season_episode_count(series_id: str, season: int) -> int | None:
                 )
 
                 if max_ep > 0:
-                    _EPISODE_COUNT_CACHE[cache_key] = max_ep
+                    # Cache positive result with 24 hours TTL
+                    _EPISODE_COUNT_CACHE[cache_key] = (max_ep, now + 86400.0)
                     return max_ep
     except Exception as exc:
         logger.warning(
             f"StremioGuard: Failed to fetch Cinemeta fallback for {series_id} S{season}: {exc}"
         )
 
+    # Cache negative result/miss with 60 seconds TTL
+    _EPISODE_COUNT_CACHE[cache_key] = (None, now + 60.0)
     return None
