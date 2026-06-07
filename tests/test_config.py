@@ -10,15 +10,15 @@ from stremioguard.config import Config
 
 class TestConfig(unittest.TestCase):
     def test_from_env_both_disabled_raises_runtime_error(self) -> None:
-        def mock_env_file_value(env_file: object, key: str) -> str:
+        def mock_env_flag_enabled(key: str, default: bool, env_path: object) -> bool:
             if key == "STREMIO_ENABLED":
-                return "0"
+                return False
             if key == "COMET_ENABLED":
-                return "0"
-            return ""
+                return False
+            return default
 
         with (
-            mock.patch("stremioguard.config.env_file_value", side_effect=mock_env_file_value),
+            mock.patch("stremioguard.config.env_flag_enabled", side_effect=mock_env_flag_enabled),
             self.assertRaises(RuntimeError) as ctx,
         ):
             Config.from_env()
@@ -26,26 +26,26 @@ class TestConfig(unittest.TestCase):
         self.assertIn("both STREMIO_ENABLED and COMET_ENABLED are set to 0", str(ctx.exception))
 
     def test_from_env_stremio_enabled_only(self) -> None:
-        def mock_env_file_value(env_file: object, key: str) -> str:
+        def mock_env_flag_enabled(key: str, default: bool, env_path: object) -> bool:
             if key == "STREMIO_ENABLED":
-                return "1"
+                return True
             if key == "COMET_ENABLED":
-                return "0"
-            return ""
+                return False
+            return default
 
-        with mock.patch("stremioguard.config.env_file_value", side_effect=mock_env_file_value):
+        with mock.patch("stremioguard.config.env_flag_enabled", side_effect=mock_env_flag_enabled):
             config = Config.from_env()
         self.assertTrue(config.stremio_enabled)
 
     def test_from_env_comet_enabled_only(self) -> None:
-        def mock_env_file_value(env_file: object, key: str) -> str:
+        def mock_env_flag_enabled(key: str, default: bool, env_path: object) -> bool:
             if key == "STREMIO_ENABLED":
-                return "0"
+                return False
             if key == "COMET_ENABLED":
-                return "1"
-            return ""
+                return True
+            return default
 
-        with mock.patch("stremioguard.config.env_file_value", side_effect=mock_env_file_value):
+        with mock.patch("stremioguard.config.env_flag_enabled", side_effect=mock_env_flag_enabled):
             config = Config.from_env()
         self.assertFalse(config.stremio_enabled)
 

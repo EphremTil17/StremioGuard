@@ -10,9 +10,11 @@ from unittest import mock
 
 import typer
 
-from stremioguard import cli as cli_mod
 from stremioguard import init as init_mod
 from stremioguard import nordvpn as nordvpn_mod
+from stremioguard.cli import context as context_mod
+from stremioguard.cli import watchdog as watchdog_mod
+from stremioguard.cli.commands import general as general_cmd_mod
 from stremioguard.env import env_file_value
 
 
@@ -268,32 +270,34 @@ class WatchdogCliTests(unittest.TestCase):
             b"stremioguard.orchestrator\x00watchdog\x00"
         )
         with mock.patch.object(Path, "read_bytes", return_value=cmdline):
-            self.assertTrue(cli_mod._pid_is_our_watchdog(123))
+            self.assertTrue(watchdog_mod._pid_is_our_watchdog(123))
 
     def test_watchdog_pids_finds_orphaned_watchdog_without_pid_file(self) -> None:
         proc_entries = [Path("/proc/111"), Path("/proc/222"), Path("/proc/sys")]
         with (
-            mock.patch.object(cli_mod, "PID_FILE", Path("/tmp/nonexistent-watchdog.pid")),
+            mock.patch.object(watchdog_mod, "PID_FILE", Path("/tmp/nonexistent-watchdog.pid")),
             mock.patch.object(Path("/proc").__class__, "iterdir", return_value=proc_entries),
-            mock.patch.object(cli_mod, "_pid_is_our_watchdog", side_effect=lambda pid: pid == 222),
+            mock.patch.object(
+                watchdog_mod, "_pid_is_our_watchdog", side_effect=lambda pid: pid == 222
+            ),
         ):
-            self.assertEqual(cli_mod._watchdog_pids(), [222])
+            self.assertEqual(watchdog_mod._watchdog_pids(), [222])
 
     def test_start_watchdog_recovers_pid_file_for_orphaned_watchdog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             pid_file = Path(directory) / "watchdog.pid"
             log_file = Path(directory) / "watchdog.log"
-            context = cli_mod.RunContext(run_id="test-run", log_file=log_file)
+            context = context_mod.RunContext(run_id="test-run", log_file=log_file)
             with (
-                mock.patch.object(cli_mod, "PID_FILE", pid_file),
-                mock.patch.object(cli_mod, "STATE_DIR", Path(directory)),
-                mock.patch.object(cli_mod, "LOG_DIR", Path(directory)),
-                mock.patch.object(cli_mod, "_require_uv"),
-                mock.patch.object(cli_mod, "_watchdog_pids", return_value=[4321]),
-                mock.patch.object(cli_mod.subprocess, "Popen") as popen,
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(watchdog_mod, "PID_FILE", pid_file),
+                mock.patch.object(watchdog_mod, "STATE_DIR", Path(directory)),
+                mock.patch.object(watchdog_mod, "LOG_DIR", Path(directory)),
+                mock.patch.object(watchdog_mod, "_require_uv"),
+                mock.patch.object(watchdog_mod, "_watchdog_pids", return_value=[4321]),
+                mock.patch.object(watchdog_mod.subprocess, "Popen") as popen,
+                mock.patch.object(watchdog_mod, "logger"),
             ):
-                cli_mod._start_watchdog(context)
+                watchdog_mod._start_watchdog(context)
             self.assertEqual(pid_file.read_text(encoding="utf-8").strip(), "4321")
             popen.assert_not_called()
 
@@ -301,36 +305,36 @@ class WatchdogCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             pid_file = Path(directory) / "watchdog.pid"
             with (
-                mock.patch.object(cli_mod, "PID_FILE", pid_file),
-                mock.patch.object(cli_mod, "_watchdog_pids", return_value=[4321]),
-                mock.patch.object(cli_mod, "_wait_for_exit", return_value=True),
-                mock.patch.object(cli_mod.os, "kill") as kill,
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(watchdog_mod, "PID_FILE", pid_file),
+                mock.patch.object(watchdog_mod, "_watchdog_pids", return_value=[4321]),
+                mock.patch.object(watchdog_mod, "_wait_for_exit", return_value=True),
+                mock.patch.object(watchdog_mod.os, "kill") as kill,
+                mock.patch.object(watchdog_mod, "logger"),
             ):
-                cli_mod._stop_watchdog()
-            kill.assert_called_once_with(4321, cli_mod.signal.SIGTERM)
+                watchdog_mod._stop_watchdog()
+            kill.assert_called_once_with(4321, watchdog_mod.signal.SIGTERM)
             self.assertFalse(pid_file.exists())
 
 
 class UnifiedCliTests(unittest.TestCase):
     def test_start_calls_run_guard_and_starts_watchdog(self) -> None:
         with (
-            mock.patch.object(cli_mod, "_warn_for_optional_stremio_settings"),
-            mock.patch.object(cli_mod, "RunContext") as context_cls,
-            mock.patch.object(cli_mod, "run_guard") as run_guard,
-            mock.patch.object(cli_mod, "_start_watchdog") as start_watchdog,
+            mock.patch.object(general_cmd_mod, "_warn_for_optional_stremio_settings"),
+            mock.patch.object(general_cmd_mod, "RunContext") as context_cls,
+            mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
+            mock.patch.object(general_cmd_mod, "_start_watchdog") as start_watchdog,
         ):
             context = context_cls.create.return_value
-            cli_mod.start()
+            general_cmd_mod.start()
         run_guard.assert_called_once_with("start", context=context)
         start_watchdog.assert_called_once_with(context)
 
     def test_stop_calls_run_guard_and_stops_watchdog(self) -> None:
         with (
-            mock.patch.object(cli_mod, "_stop_watchdog") as stop_watchdog,
-            mock.patch.object(cli_mod, "run_guard") as run_guard,
+            mock.patch.object(general_cmd_mod, "_stop_watchdog") as stop_watchdog,
+            mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
         ):
-            cli_mod.stop()
+            general_cmd_mod.stop()
         stop_watchdog.assert_called_once()
         run_guard.assert_called_once_with("stop", file_logging=False)
 
@@ -348,13 +352,13 @@ class CliCommandTests(unittest.TestCase):
     def test_run_guard_exits_cleanly_when_guard_subprocess_fails(self) -> None:
         with (
             mock.patch.object(
-                cli_mod.subprocess,
+                watchdog_mod.subprocess,
                 "run",
                 side_effect=subprocess.CalledProcessError(1, ["uv", "run"]),
             ),
             self.assertRaises(typer.Exit) as ctx,
         ):
-            cli_mod.run_guard("start", file_logging=False)
+            watchdog_mod.run_guard("start", file_logging=False)
         self.assertEqual(ctx.exception.exit_code, 1)
 
     def test_init_manual_nordvpn_path_collects_optional_settings_before_key_prompt(self) -> None:
@@ -380,27 +384,29 @@ class CliCommandTests(unittest.TestCase):
                 raise typer.Exit(1)
 
             with (
-                mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
-                mock.patch.object(cli_mod, "ENV_FILE", env_file),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(general_cmd_mod, "ENV_EXAMPLE", env_example),
+                mock.patch.object(general_cmd_mod, "ENV_FILE", env_file),
+                mock.patch.object(general_cmd_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", return_value="1"),
-                mock.patch.object(cli_mod, "prompt_provider", return_value="nordvpn"),
+                mock.patch.object(general_cmd_mod, "prompt_provider", return_value="nordvpn"),
                 mock.patch.object(typer, "confirm", return_value=False),
-                mock.patch.object(cli_mod, "run_guard"),
-                mock.patch.object(cli_mod, "prompt_comet_setup"),
+                mock.patch.object(general_cmd_mod, "run_guard"),
+                mock.patch.object(general_cmd_mod, "prompt_comet_setup"),
                 mock.patch.object(
-                    cli_mod, "configure_external_access", side_effect=record_external_access
+                    general_cmd_mod, "configure_external_access", side_effect=record_external_access
                 ),
-                mock.patch.object(cli_mod, "configure_nordvpn", side_effect=record_protocol_setup),
                 mock.patch.object(
-                    cli_mod,
+                    general_cmd_mod, "configure_nordvpn", side_effect=record_protocol_setup
+                ),
+                mock.patch.object(
+                    general_cmd_mod,
                     "configure_optional_stremio_settings",
                     side_effect=record_optional_settings,
                 ),
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(general_cmd_mod, "logger"),
                 self.assertRaises(typer.Exit),
             ):
-                cli_mod.init()
+                general_cmd_mod.init()
 
             self.assertEqual(call_order, ["optional", "access", "key"])
 
@@ -419,21 +425,21 @@ class CliCommandTests(unittest.TestCase):
             )
 
             with (
-                mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
-                mock.patch.object(cli_mod, "ENV_FILE", env_file),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(general_cmd_mod, "ENV_EXAMPLE", env_example),
+                mock.patch.object(general_cmd_mod, "ENV_FILE", env_file),
+                mock.patch.object(general_cmd_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", return_value="1"),
-                mock.patch.object(cli_mod, "prompt_provider", return_value="nordvpn"),
-                mock.patch.object(cli_mod, "configure_external_access"),
-                mock.patch.object(cli_mod, "configure_optional_stremio_settings"),
-                mock.patch.object(cli_mod, "prompt_comet_setup"),
+                mock.patch.object(general_cmd_mod, "prompt_provider", return_value="nordvpn"),
+                mock.patch.object(general_cmd_mod, "configure_external_access"),
+                mock.patch.object(general_cmd_mod, "configure_optional_stremio_settings"),
+                mock.patch.object(general_cmd_mod, "prompt_comet_setup"),
                 mock.patch.object(typer, "confirm", return_value=False),
-                mock.patch.object(cli_mod, "run_guard"),
-                mock.patch.object(cli_mod, "configure_nordvpn") as cfg_nordvpn,
-                mock.patch.object(cli_mod, "restart") as restart,
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(general_cmd_mod, "run_guard"),
+                mock.patch.object(general_cmd_mod, "configure_nordvpn") as cfg_nordvpn,
+                mock.patch.object(general_cmd_mod, "restart") as restart,
+                mock.patch.object(general_cmd_mod, "logger"),
             ):
-                cli_mod.init()
+                general_cmd_mod.init()
 
             cfg_nordvpn.assert_called_once()
             restart.assert_called_once()
@@ -455,21 +461,23 @@ class CliCommandTests(unittest.TestCase):
             )
 
             with (
-                mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
-                mock.patch.object(cli_mod, "ENV_FILE", env_file),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(general_cmd_mod, "ENV_EXAMPLE", env_example),
+                mock.patch.object(general_cmd_mod, "ENV_FILE", env_file),
+                mock.patch.object(general_cmd_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", return_value="1"),
-                mock.patch.object(cli_mod, "prompt_provider", return_value="other") as prompt,
-                mock.patch.object(cli_mod, "configure_external_access"),
-                mock.patch.object(cli_mod, "configure_optional_stremio_settings"),
-                mock.patch.object(cli_mod, "prompt_comet_setup"),
+                mock.patch.object(
+                    general_cmd_mod, "prompt_provider", return_value="other"
+                ) as prompt,
+                mock.patch.object(general_cmd_mod, "configure_external_access"),
+                mock.patch.object(general_cmd_mod, "configure_optional_stremio_settings"),
+                mock.patch.object(general_cmd_mod, "prompt_comet_setup"),
                 mock.patch.object(typer, "confirm", return_value=False),
-                mock.patch.object(cli_mod, "run_guard"),
-                mock.patch.object(cli_mod, "configure_nordvpn") as cfg_nordvpn,
-                mock.patch.object(cli_mod, "print_manual_setup_pointer") as manual_pointer,
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(general_cmd_mod, "run_guard"),
+                mock.patch.object(general_cmd_mod, "configure_nordvpn") as cfg_nordvpn,
+                mock.patch.object(general_cmd_mod, "print_manual_setup_pointer") as manual_pointer,
+                mock.patch.object(general_cmd_mod, "logger"),
             ):
-                cli_mod.init()
+                general_cmd_mod.init()
 
             prompt.assert_called_once_with("nordvpn")
             cfg_nordvpn.assert_not_called()
@@ -490,22 +498,22 @@ class CliCommandTests(unittest.TestCase):
             )
 
             with (
-                mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
-                mock.patch.object(cli_mod, "ENV_FILE", env_file),
-                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(general_cmd_mod, "ENV_EXAMPLE", env_example),
+                mock.patch.object(general_cmd_mod, "ENV_FILE", env_file),
+                mock.patch.object(general_cmd_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(general_cmd_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", return_value="3"),
-                mock.patch.object(cli_mod, "prompt_provider", return_value="other"),
-                mock.patch.object(cli_mod, "configure_external_access"),
-                mock.patch.object(cli_mod, "configure_optional_stremio_settings"),
-                mock.patch.object(cli_mod, "prompt_comet_setup"),
+                mock.patch.object(general_cmd_mod, "prompt_provider", return_value="other"),
+                mock.patch.object(general_cmd_mod, "configure_external_access"),
+                mock.patch.object(general_cmd_mod, "configure_optional_stremio_settings"),
+                mock.patch.object(general_cmd_mod, "prompt_comet_setup"),
                 mock.patch.object(typer, "confirm", return_value=False),
-                mock.patch.object(cli_mod, "run_guard"),
-                mock.patch.object(cli_mod, "configure_nordvpn"),
-                mock.patch.object(cli_mod, "print_manual_setup_pointer"),
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(general_cmd_mod, "run_guard"),
+                mock.patch.object(general_cmd_mod, "configure_nordvpn"),
+                mock.patch.object(general_cmd_mod, "print_manual_setup_pointer"),
+                mock.patch.object(general_cmd_mod, "logger"),
             ):
-                cli_mod.init()
+                general_cmd_mod.init()
 
             self.assertEqual(env_file_value(env_file, "COMET_ENABLED"), "0")
 
@@ -519,22 +527,22 @@ class CliCommandTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with (
-                mock.patch.object(cli_mod, "ENV_EXAMPLE", env_example),
-                mock.patch.object(cli_mod, "ENV_FILE", env_file),
-                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(general_cmd_mod, "ENV_EXAMPLE", env_example),
+                mock.patch.object(general_cmd_mod, "ENV_FILE", env_file),
+                mock.patch.object(general_cmd_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(general_cmd_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", side_effect=["invalid", "2", "1", "nordvpn"]),
-                mock.patch.object(cli_mod, "prompt_provider", return_value="nordvpn"),
-                mock.patch.object(cli_mod, "configure_external_access") as ext,
-                mock.patch.object(cli_mod, "configure_optional_stremio_settings") as opt,
-                mock.patch.object(cli_mod, "prompt_comet_setup") as comet,
+                mock.patch.object(general_cmd_mod, "prompt_provider", return_value="nordvpn"),
+                mock.patch.object(general_cmd_mod, "configure_external_access") as ext,
+                mock.patch.object(general_cmd_mod, "configure_optional_stremio_settings") as opt,
+                mock.patch.object(general_cmd_mod, "prompt_comet_setup") as comet,
                 mock.patch.object(typer, "confirm", return_value=False),
-                mock.patch.object(cli_mod, "run_guard"),
-                mock.patch.object(cli_mod, "configure_nordvpn"),
-                mock.patch.object(cli_mod, "restart"),
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(general_cmd_mod, "run_guard"),
+                mock.patch.object(general_cmd_mod, "configure_nordvpn"),
+                mock.patch.object(general_cmd_mod, "restart"),
+                mock.patch.object(general_cmd_mod, "logger"),
             ):
-                cli_mod.init()
+                general_cmd_mod.init()
 
             self.assertEqual(env_file_value(env_file, "STREMIO_ENABLED"), "0")
             self.assertEqual(env_file_value(env_file, "COMET_ENABLED"), "1")

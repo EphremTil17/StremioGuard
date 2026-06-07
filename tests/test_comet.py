@@ -10,9 +10,10 @@ from unittest import mock
 
 import typer
 
-from stremioguard import cli as cli_mod
 from stremioguard import comet as comet_mod
+from stremioguard.cli.commands import comet_core as comet_core_mod
 from stremioguard.comet import CometManager
+from stremioguard.comet import manager as manager_mod
 from stremioguard.comet_gateway import CometGatewayConfig, CometGatewayManager
 from stremioguard.env import env_file_value
 from stremioguard.publishing import render_stack_compose_override
@@ -741,7 +742,7 @@ class PlaybackProbeTests(unittest.TestCase):
         manager = CometManager(make_comet_config(Path("/tmp")), FakeRunner({}))
         with (
             mock.patch.object(
-                comet_mod,
+                manager_mod,
                 "probe_playback_url",
                 return_value=comet_mod.PlaybackProbeResult(
                     status_code=302,
@@ -763,14 +764,14 @@ class CometCliTests(unittest.TestCase):
             env_file = temp_root / ".env"
             env_file.write_text("COMET_ENABLED=0\n", encoding="utf-8")
             with (
-                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(comet_core_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(comet_core_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", return_value="1"),
-                mock.patch.object(cli_mod, "prompt_comet_setup") as setup,
-                mock.patch.object(cli_mod, "CometManager") as manager_cls,
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(comet_core_mod, "prompt_comet_setup") as setup,
+                mock.patch.object(comet_core_mod, "CometManager") as manager_cls,
+                mock.patch.object(comet_core_mod, "logger"),
             ):
-                cli_mod.comet_install()
+                comet_core_mod.comet_install()
             setup.assert_called_once()
             manager_cls.return_value.install.assert_called_once()
 
@@ -780,13 +781,13 @@ class CometCliTests(unittest.TestCase):
             env_file = temp_root / ".env"
             env_file.write_text("EXTERNAL_BASE_URL=https://stremio.example.com\n", encoding="utf-8")
             with (
-                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
-                mock.patch.object(cli_mod, "prompt_comet_setup") as setup,
-                mock.patch.object(cli_mod, "CometManager"),
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(comet_core_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(comet_core_mod, "is_interactive", return_value=True),
+                mock.patch.object(comet_core_mod, "prompt_comet_setup") as setup,
+                mock.patch.object(comet_core_mod, "CometManager"),
+                mock.patch.object(comet_core_mod, "logger"),
             ):
-                cli_mod.comet_install()
+                comet_core_mod.comet_install()
             setup.assert_called_once_with(mock.ANY, is_proxied=True)
 
     def test_cli_comet_install_prompts_for_proxy_when_no_url_in_env(self) -> None:
@@ -795,14 +796,14 @@ class CometCliTests(unittest.TestCase):
             env_file = temp_root / ".env"
             env_file.write_text("COMET_ENABLED=0\n", encoding="utf-8")
             with (
-                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(comet_core_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(comet_core_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", return_value="2"),
-                mock.patch.object(cli_mod, "prompt_comet_setup") as setup,
-                mock.patch.object(cli_mod, "CometManager"),
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(comet_core_mod, "prompt_comet_setup") as setup,
+                mock.patch.object(comet_core_mod, "CometManager"),
+                mock.patch.object(comet_core_mod, "logger"),
             ):
-                cli_mod.comet_install()
+                comet_core_mod.comet_install()
             setup.assert_called_once_with(mock.ANY, is_proxied=True)
 
     def test_cli_comet_install_prompts_for_lan_only_when_no_url_in_env(self) -> None:
@@ -811,22 +812,22 @@ class CometCliTests(unittest.TestCase):
             env_file = temp_root / ".env"
             env_file.write_text("COMET_ENABLED=0\n", encoding="utf-8")
             with (
-                mock.patch.object(cli_mod, "ROOT_DIR", temp_root),
-                mock.patch.object(cli_mod, "is_interactive", return_value=True),
+                mock.patch.object(comet_core_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(comet_core_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", return_value="1"),
-                mock.patch.object(cli_mod, "prompt_comet_setup") as setup,
-                mock.patch.object(cli_mod, "CometManager"),
-                mock.patch.object(cli_mod, "logger"),
+                mock.patch.object(comet_core_mod, "prompt_comet_setup") as setup,
+                mock.patch.object(comet_core_mod, "CometManager"),
+                mock.patch.object(comet_core_mod, "logger"),
             ):
-                cli_mod.comet_install()
+                comet_core_mod.comet_install()
             setup.assert_called_once_with(mock.ANY, is_proxied=False)
 
     def test_cli_comet_install_requires_tty(self) -> None:
         with (
-            mock.patch.object(cli_mod, "is_interactive", return_value=False),
+            mock.patch.object(comet_core_mod, "is_interactive", return_value=False),
             self.assertRaises(typer.Exit) as ctx,
         ):
-            cli_mod.comet_install()
+            comet_core_mod.comet_install()
         self.assertEqual(ctx.exception.exit_code, 1)
 
     def test_prompt_debrid_provider_accepts_numeric_choice(self) -> None:
