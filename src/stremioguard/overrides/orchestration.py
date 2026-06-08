@@ -110,7 +110,12 @@ def render_orchestration_override(repo_dir: Path) -> str:
             else reject_unknown_override
         )
         return parsed_matches_target(
-"""
+            parsed,
+            self.search_season,
+            self.search_episode,
+            target_air_date=self.target_air_date,
+            reject_unknown_episode_files=reject_unknown,
+        )"""
     replacement_method = """    def _matches_requested_scope(
         self,
         parsed: ParsedData,
@@ -151,8 +156,7 @@ def render_orchestration_override(repo_dir: Path) -> str:
             self.search_episode,
             target_air_date=self.target_air_date,
             reject_unknown_episode_files=False,
-        )
-"""
+        )"""
     replacement_signature = """    def _matches_requested_scope(
         self,
         parsed: ParsedData,
