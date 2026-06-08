@@ -499,6 +499,17 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn("function getCometInstallBase(", template_override)
             self.assertIn(f"https://comet.example.com/comet/{token_value}", template_override)
 
+            # Ensure all generated Python files are syntactically valid and compile clean
+            for filename, content in [
+                ("stream.py", stream_override),
+                ("orchestration.py", orchestration_override),
+                ("config.py", config_override),
+            ]:
+                try:
+                    compile(content, filename, "exec")
+                except SyntaxError as e:
+                    self.fail(f"Generated override file {filename} is syntactically invalid: {e}")
+
     def test_write_stack_override_omits_orchestration_mount_when_patch_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
