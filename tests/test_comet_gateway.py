@@ -109,9 +109,14 @@ class TestCometGatewayManager:
         rendered = manager.render_nginx_conf()
 
         assert f"listen {COMET_GATEWAY_CONTAINER_PORT};" in rendered
-        assert "location / {" in rendered
+        assert (
+            'location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$)|admin(?:/|$))" {'
+            in rendered
+        )
+        assert "location = / {" in rendered
         assert "proxy_pass $comet_upstream$request_uri;" in rendered
-        assert "return 403" in rendered
+        assert "location / {" in rendered
+        assert 'return 403 "Forbidden\\n";' in rendered
         assert "/comet/$gateway_token" in rendered
         assert "proxy_pass $comet_upstream$comet_uri$is_args$args;" in rendered
 
