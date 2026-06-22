@@ -91,12 +91,12 @@ def _strip_redundant_hdr_tokens(info: str) -> str:
         rendered = rendered.replace(original_video_return, replacement_video_return, 1)
 
     replacements = {
-        '    "title": "{}",': '    "title": "☰  {}",',
-        '    "video": "{}",': '    "video": "📽 {}",',
-        '    "audio": "{}",': '    "audio": "🕪  {}",',
-        '    "quality": "{}",': '    "quality": "✦ {}",',
+        '    "title": "{}",': '    "title": "☰ {}",',
+        '    "video": "{}",': '    "video": "– {}",',
+        '    "audio": "{}",': '    "audio": "– {}",',
+        '    "quality": "{}",': '    "quality": "– {}",',
         '    "seeders": "Seeders: {}",': '    "seeders": "🗣 {}",',
-        '    "size": "Size: {}",': '    "size": "⛃{}",',
+        '    "size": "Size: {}",': '    "size": "– {}",',
         '    "tracker": "Source: {}",': '    "tracker": "🔍︎ {}",',
         '    "tracker_clean": "Source: Comet|{}",': '    "tracker_clean": "🔍︎ Comet|{}",',
         '    "languages": "Languages: {}",': '    "languages": "{}",',

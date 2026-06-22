@@ -168,121 +168,6 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
     for before, after in call_replacements.items():
         content = content.replace(before, after)
 
-    helper_marker = "def _build_stream_name(\n"
-    helper_block = """def _promote_pack_backed_within_resolution(
-    streams: list[dict], *, media_type: str | None
-):
-    if media_type != "series" or len(streams) < 2:
-        return streams
-
-    ordered_buckets = []
-    bucket_groups = {}
-    for stream in streams:
-        bucket = str(stream.get("_sg_resolution_bucket", "") or "")
-        if bucket not in bucket_groups:
-            ordered_buckets.append(bucket)
-            bucket_groups[bucket] = {
-                "hdr_packs": [], "hdr_others": [],
-                "sdr_packs": [], "sdr_others": [],
-            }
-        is_pack = bool(stream.get("_sg_pack_backed"))
-        is_hdr = bool(stream.get("_sg_hdr"))
-        if is_hdr and is_pack:
-            bucket_groups[bucket]["hdr_packs"].append(stream)
-        elif is_hdr:
-            bucket_groups[bucket]["hdr_others"].append(stream)
-        elif is_pack:
-            bucket_groups[bucket]["sdr_packs"].append(stream)
-        else:
-            bucket_groups[bucket]["sdr_others"].append(stream)
-
-    reordered = []
-    for bucket in ordered_buckets:
-        grp = bucket_groups[bucket]
-        reordered.extend(grp["hdr_packs"])
-        reordered.extend(grp["hdr_others"])
-        reordered.extend(grp["sdr_packs"])
-        reordered.extend(grp["sdr_others"])
-    return reordered
-
-
-"""
-    if "def _promote_pack_backed_within_resolution(" not in content:
-        if helper_marker not in content:
-            raise RuntimeError(
-                "Unable to apply managed Comet stream ordering patch; stream helper "
-                "signature has changed."
-            )
-        content = content.replace(helper_marker, helper_block + helper_marker, 1)
-
-    debrid_stream_block = """            the_stream = {
-                "name": stream_name,
-                "description": formatted_title,
-                "behaviorHints": behavior_hints,
-            }
-"""
-    debrid_stream_replacement = """            the_stream = {
-                "name": stream_name,
-                "description": formatted_title,
-                "behaviorHints": behavior_hints,
-            }
-            the_stream["_sg_resolution_bucket"] = _display_primary_label(
-                rtn_data.resolution, formatted_components
-            )
-            the_stream["_sg_pack_backed"] = torrent.get("packBacked", False)
-            the_stream["_sg_hdr"] = bool(_hdr_badge(formatted_components))
-"""
-    if debrid_stream_replacement not in content and debrid_stream_block in content:
-        content = content.replace(debrid_stream_block, debrid_stream_replacement, 1)
-
-    torrent_stream_block = """            the_stream = {
-                "name": stream_name,
-                "description": formatted_title,
-                "behaviorHints": behavior_hints,
-                "infoHash": info_hash,
-            }
-"""
-    torrent_stream_replacement = """            the_stream = {
-                "name": stream_name,
-                "description": formatted_title,
-                "behaviorHints": behavior_hints,
-                "infoHash": info_hash,
-            }
-            the_stream["_sg_resolution_bucket"] = _display_primary_label(
-                rtn_data.resolution, formatted_components
-            )
-            the_stream["_sg_pack_backed"] = torrent.get("packBacked", False)
-            the_stream["_sg_hdr"] = bool(_hdr_badge(formatted_components))
-"""
-    if torrent_stream_replacement not in content and torrent_stream_block in content:
-        content = content.replace(torrent_stream_block, torrent_stream_replacement, 1)
-
-    final_streams_block = """    if sort_mixed:
-        final_streams = cached_results
-    else:
-        final_streams = cached_results + non_cached_results
-
-    has_results = len(final_streams) > 0
-"""
-    final_streams_replacement = """    if sort_mixed:
-        final_streams = cached_results
-    else:
-        final_streams = cached_results + non_cached_results
-
-    final_streams = _promote_pack_backed_within_resolution(
-        final_streams,
-        media_type=media_type,
-    )
-    for stream in final_streams:
-        stream.pop("_sg_resolution_bucket", None)
-        stream.pop("_sg_pack_backed", None)
-        stream.pop("_sg_hdr", None)
-
-    has_results = len(final_streams) > 0
-"""
-    if 'stream.pop("_sg_resolution_bucket"' not in content and final_streams_block in content:
-        content = content.replace(final_streams_block, final_streams_replacement, 1)
-
     # Stamp each torrent dict with its RTN rank so the per-stream formatter can
     # surface it. ranked_torrents maps info_hash -> RTN Torrent (carrying .rank);
     # torrents maps info_hash -> the dict consumed during stream building.
@@ -297,8 +182,10 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
     if "_sg_rank" not in content and rank_stamp_block in content:
         content = content.replace(rank_stamp_block, rank_stamp_replacement, 1)
 
-    # Append the RTN rank next to the size component (dot-separated) before the
-    # description is rendered from formatted_components.
+    # Render technical metadata first, then the RTN rank, and finally the raw
+    # release title. The title is intentionally last because Android TV may
+    # truncate the bottom of a stream card; technical metadata and rank must
+    # remain visible above it.
     size_rank_block = """        formatted_components = format_components(
             rtn_data,
             torrent_title,
@@ -318,9 +205,16 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
             config["resultFormat"],
         )
         _sg_rank = torrent.get("_sg_rank")
-        if _sg_rank is not None and "size" in formatted_components:
-            formatted_components["size"] = f"{formatted_components['size']} • {_sg_rank}"
-        formatted_title = format_title_fn(formatted_components)
+        _sg_display_components = dict(formatted_components)
+        _sg_title = _sg_display_components.pop("title", None)
+        _sg_size = _sg_display_components.get("size")
+        if _sg_rank is not None and _sg_size:
+            _sg_display_components["size"] = f"{_sg_size} • R:{_sg_rank}"
+        formatted_title = format_title_fn(_sg_display_components)
+        if _sg_rank is not None and not _sg_size:
+            formatted_title = f"{formatted_title}\\n– R:{_sg_rank}"
+        if _sg_title is not None:
+            formatted_title = f"{formatted_title}\\n{_sg_title}"
 """
     rank_already_applied = size_rank_replacement in content
     if "_sg_rank" in content and not rank_already_applied and size_rank_block in content:

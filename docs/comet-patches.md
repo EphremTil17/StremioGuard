@@ -52,7 +52,7 @@ results without turning a secret-bearing addon URL into setup state.
 The generator entrypoints are:
 
 - `scripts/generate_comet_overrides.py`
-- `src/stremioguard/comet_overrides.py`
+- `src/stremioguard/overrides/`
 
 The generated files currently include:
 
@@ -62,6 +62,8 @@ The generated files currently include:
 - `filtering.py`
 - `orchestration.py`
 - `metadata_service.py`
+- `config.py`
+- `index.html`
 
 ## Current Patch Logic
 
@@ -132,13 +134,12 @@ Approach:
 
 - relax Comet's episode-scope gate when there is still strong evidence that a
   result belongs to the requested season/episode context
-- query a precise Cinemeta-backed metadata lookup service (implemented in
-  [metadata_service.py](file:///app/comet/metadata_service.py)) to retrieve the total number of
-  episodes for the season, caching counts in memory and falling back to Comet's
-  local database index (`series_episode_index` table MAX episode count)
-- compare parsed episode lists against the resolved season total, ensuring only
-  complete season packs receive the `P` (Pack-backed) badge and get promoted to the
-  top of their resolution category
+- retain candidates with a usable playback identity when episode metadata is
+  incomplete, malformed, cached, or only partially resolved
+- use the P badge to show credible multi-file evidence; it does not claim that
+  a complete season is present
+- preserve Comet/RTN native ranking and cached/uncached behavior. Pack status
+  never moves a lower-ranked pack ahead of another result
 
 This patch is optional in setup and is controlled by:
 

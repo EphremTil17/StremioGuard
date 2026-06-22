@@ -12,7 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from stremioguard.comet_overrides import write_override_bundle  # noqa: E402
+from stremioguard.overrides import write_override_bundle  # noqa: E402
 
 
 def main() -> int:
