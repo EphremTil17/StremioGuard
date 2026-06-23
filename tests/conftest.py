@@ -36,7 +36,10 @@ class FakeRunner:
         elif response is not None:
             result = response
         else:
-            result = subprocess.CompletedProcess(args, 0, "", "")
+            if len(args) >= 3 and args[-3:] == ["ps", "-q", args[-1]]:
+                result = subprocess.CompletedProcess(args, 0, f"{args[-1]}\n", "")
+            else:
+                result = subprocess.CompletedProcess(args, 0, "", "")
 
         if check and result.returncode != 0:
             raise subprocess.CalledProcessError(
