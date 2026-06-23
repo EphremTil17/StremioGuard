@@ -17,6 +17,7 @@ from tests.conftest import make_comet_config, make_comet_gateway_config
 
 class TestCometGatewayConfig:
     def test_defaults_to_enabled_loopback_gateway(self, tmp_path: Path) -> None:
+        (tmp_path / ".env").write_text("COMET_ENABLED=1\n", encoding="utf-8")
         config = CometGatewayConfig.from_env(tmp_path)
 
         assert config.enabled is True
@@ -26,6 +27,7 @@ class TestCometGatewayConfig:
 
     def test_reads_env_values(self, tmp_path: Path) -> None:
         (tmp_path / ".env").write_text(
+            "COMET_ENABLED=1\n"
             "COMET_GATEWAY_ENABLED=1\n"
             "COMET_GATEWAY_HOST_PORT=19001\n"
             "COMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.test\n"
@@ -42,7 +44,9 @@ class TestCometGatewayConfig:
         assert config.bind_addresses == ("10.0.0.1", "100.64.0.2")
 
     def test_rejects_invalid_port(self, tmp_path: Path) -> None:
-        (tmp_path / ".env").write_text("COMET_GATEWAY_HOST_PORT=nope\n", encoding="utf-8")
+        (tmp_path / ".env").write_text(
+            "COMET_ENABLED=1\nCOMET_GATEWAY_HOST_PORT=nope\n", encoding="utf-8"
+        )
 
         with pytest.raises(RuntimeError, match="Invalid COMET_GATEWAY_HOST_PORT"):
             CometGatewayConfig.from_env(tmp_path)
@@ -110,8 +114,7 @@ class TestCometGatewayManager:
 
         assert f"listen {COMET_GATEWAY_CONTAINER_PORT};" in rendered
         assert (
-            'location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$)|admin(?:/|$))" {'
-            in rendered
+            'location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$)|admin(?:/|$))" {' in rendered
         )
         assert "location = / {" in rendered
         assert "proxy_pass $comet_upstream$request_uri;" in rendered

@@ -11,6 +11,7 @@ from unittest import mock
 import typer
 
 from stremioguard import comet as comet_mod
+from stremioguard import config as config_mod
 from stremioguard.cli.commands import comet_core as comet_core_mod
 from stremioguard.comet import CometManager
 from stremioguard.comet import manager as manager_mod
@@ -116,7 +117,17 @@ def _write_upstream_patch_sources(cfg) -> None:
         "        settings.PUBLIC_BASE_URL\n"
         "        if settings.PUBLIC_BASE_URL\n"
         '        else f"{request.url.scheme}://{request.url.netloc}"\n'
-        "    )\n",
+        "    )\n"
+        "    torrents = torrent_manager.torrents\n"
+        "        formatted_components = format_components(\n"
+        "            rtn_data,\n"
+        "            torrent_title,\n"
+        '            torrent["seeders"],\n'
+        "            torrent_size,\n"
+        '            torrent["tracker"],\n'
+        '            config["resultFormat"],\n'
+        "        )\n"
+        "        formatted_title = format_title_fn(formatted_components)\n",
         encoding="utf-8",
     )
     config_file.write_text(
@@ -279,6 +290,38 @@ def _write_upstream_patch_sources(cfg) -> None:
     )
 
 
+class ConfigValidationTests(unittest.TestCase):
+    def test_rejects_port_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "COMET_ENABLED=1\nCOMET_HOST_PORT=11470\nSTREMIO_HOST_PORT=11470\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "Port collision"):
+                config_mod.CometConfig.from_env(Path(directory))
+
+    def test_rejects_mixed_wildcard_and_specific_binds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "COMET_ENABLED=1\nSTREMIO_BIND_ADDRS=0.0.0.0,127.0.0.1\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "cannot combine"):
+                config_mod.CometConfig.from_env(Path(directory))
+
+    def test_rejects_invalid_public_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "COMET_ENABLED=1\nCOMET_PUBLIC_BASE_URL=not-a-url\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "absolute HTTP"):
+                config_mod.CometConfig.from_env(Path(directory))
+
+
 class CometManagerTests(unittest.TestCase):
     def test_load_lock_reads_expected_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -370,7 +413,7 @@ class CometManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             (tmp_path / ".env").write_text(
-                "COMET_GATEWAY_ENABLED=1\n",
+                "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=1\n",
                 encoding="utf-8",
             )
             cfg = make_comet_config(tmp_path, public_base_url="https://comet.example.com")
@@ -393,6 +436,7 @@ class CometManagerTests(unittest.TestCase):
             make_config(tmp_path)
             cfg = make_comet_config(tmp_path, bind_addresses=("10.0.0.5", "100.64.0.8"))
             (tmp_path / ".env").write_text(
+                "COMET_ENABLED=1\n"
                 "COMET_GATEWAY_ENABLED=1\n"
                 "COMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.com\n"
                 "STREMIO_BIND_ADDRS=10.0.0.5,100.64.0.8\n",
@@ -463,6 +507,11 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn('if "video" in components:', formatting_override)
             self.assertIn('if "audio" in components:', formatting_override)
             self.assertIn('if "size" in components:', formatting_override)
+            self.assertIn('"title": "☰ {}",', formatting_override)
+            self.assertIn('"video": "– {}",', formatting_override)
+            self.assertIn('"quality": "– {}",', formatting_override)
+            self.assertIn('"audio": "– {}",', formatting_override)
+            self.assertIn('"size": "– {}",', formatting_override)
             self.assertIn('return "\\n".join(lines)', formatting_override)
             self.assertNotIn(
                 'video_audio = [components[k] for k in ["video", "audio"] if k in components]',
@@ -471,13 +520,28 @@ class CometManagerTests(unittest.TestCase):
             stream_override = (cfg.state_dir / "stream.py").read_text(encoding="utf-8")
             self.assertIn("def _hdr_badge(", stream_override)
             self.assertIn("def _series_pack_badge(", stream_override)
-            self.assertIn("def _promote_pack_backed_within_resolution(", stream_override)
+            self.assertNotIn("def _promote_pack_backed_within_resolution(", stream_override)
             self.assertIn("def _display_primary_label(", stream_override)
             self.assertIn("def _forwarded_external_base(", stream_override)
             self.assertIn("pack_backed: bool = False", stream_override)
             self.assertIn("pack = _series_pack_badge(media_type, pack_backed)", stream_override)
             self.assertIn('return " | ".join(parts)', stream_override)
             self.assertIn("else _forwarded_external_base(request)", stream_override)
+            self.assertIn("_sg_display_components = dict(formatted_components)", stream_override)
+            self.assertIn(
+                '_sg_title = _sg_display_components.pop("title", None)',
+                stream_override,
+            )
+            metadata_position = stream_override.index(
+                "formatted_title = format_title_fn(_sg_display_components)"
+            )
+            size_rank_position = stream_override.index(
+                '_sg_display_components["size"] = f"{_sg_size} • R:{_sg_rank}"'
+            )
+            title_position = stream_override.index("if _sg_title is not None:")
+            self.assertLess(size_rank_position, metadata_position)
+            self.assertLess(metadata_position, title_position)
+            self.assertNotIn("RTN rank:", stream_override)
             orchestration_override = (cfg.state_dir / "orchestration.py").read_text(
                 encoding="utf-8"
             )
@@ -621,7 +685,7 @@ class CometManagerTests(unittest.TestCase):
                         "-f",
                         "{{.HostConfig.NetworkMode}}",
                         cfg.container_name,
-                    ): completed(["docker", "inspect"], "container:gluetun-id\n"),
+                    ): completed(["docker", "inspect"], "container:gluetun\n"),
                     (
                         "docker",
                         "exec",
@@ -704,7 +768,7 @@ class CometManagerTests(unittest.TestCase):
                         "-f",
                         "{{.HostConfig.NetworkMode}}",
                         cfg.container_name,
-                    ): completed(["docker", "inspect"], "container:gluetun-id\n"),
+                    ): completed(["docker", "inspect"], "container:gluetun\n"),
                     (
                         "docker",
                         "exec",
@@ -730,6 +794,32 @@ class CometManagerTests(unittest.TestCase):
             ):
                 manager.doctor()
             self.assertIn("does not match gluetun", str(ctx.exception))
+
+
+class CompatibilityTests(unittest.TestCase):
+    def test_compatibility_cache_requires_all_runtime_fingerprint_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = make_comet_config(Path(directory))
+            manager = CometManager(cfg, FakeRunner({}))
+            cache = {
+                "status": "passed",
+                "image": cfg.image,
+                "image_digest": "sha256:image",
+                "source_commit": "commit",
+                "patch_fingerprint": "patches",
+            }
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
+            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "commit", "patches"))
+            self.assertFalse(
+                manager._compatibility_cache_valid("sha256:changed", "commit", "patches")
+            )
+            self.assertFalse(
+                manager._compatibility_cache_valid("sha256:image", "changed", "patches")
+            )
+            self.assertFalse(
+                manager._compatibility_cache_valid("sha256:image", "commit", "changed")
+            )
 
 
 class PlaybackProbeTests(unittest.TestCase):
