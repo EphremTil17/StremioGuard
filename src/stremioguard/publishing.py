@@ -99,6 +99,7 @@ def render_stack_compose_override(
         content.extend(
             [
                 "  comet:",
+                f"    image: {comet_config.image}",
                 "    env_file:",
                 f"      - {comet_config.runtime_env_file}",
                 "    volumes:",

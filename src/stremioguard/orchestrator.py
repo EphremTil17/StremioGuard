@@ -56,7 +56,7 @@ class Orchestrator:
             "Session metadata "
             f"run_id={cfg.run_id} "
             f"deployment_profile={self.guard.deployment_profile()} "
-            f"gluetun_container={cfg.gluetun_container_name} "
+            f"gluetun_service={cfg.gluetun_container_name} "
             f"watch_interval_seconds={cfg.watch_interval_seconds} "
             f"watchdog_log_interval_seconds={cfg.watchdog_log_interval_seconds}"
         )
@@ -176,21 +176,7 @@ class Orchestrator:
         logger.info(g.public_ip_via_gluetun() or "unavailable")
         logger.info("--- Containers ---")
         for service in g.enabled_runtime_services():
-            container_name = service
-            if service == "stremio":
-                container_name = g.config.container_name
-            result = g.runner.run(
-                [
-                    "docker",
-                    "ps",
-                    "-a",
-                    "--filter",
-                    f"name=^/{container_name}$",
-                    "--format",
-                    "table {{.Names}}\t{{.Status}}\t{{.Ports}}",
-                ],
-                check=False,
-            )
+            result = g.compose("ps", service, check=False)
             g.log_lines((result.stdout or "").rstrip())
 
     def record_home_ip(self) -> None:
@@ -278,8 +264,8 @@ def pull() -> None:
 
     def _pull(o: Orchestrator) -> None:
         o.guard.require_commands()
-        o.guard.log(f"Pulling latest image for {o.guard.config.gluetun_container_name}.")
-        o.guard.compose("pull", o.guard.config.gluetun_container_name, capture=False)
+        o.guard.log("Pulling latest image for the gluetun service.")
+        o.guard.compose("pull", "gluetun", capture=False)
 
     _run_command(_pull)
 
