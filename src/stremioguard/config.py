@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import subprocess
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
 DEFAULT_STREMIO_HOST_PORT = 11470
 DEFAULT_STREMIO_CONTAINER_PORT = 11470
 DEFAULT_COMET_HOST_PORT = 18000
+DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
 
 
 def parse_public_ip(text: str) -> str | None:
@@ -149,6 +151,27 @@ class Config:
         )
 
 
+def _parse_port(raw: str | None, *, key: str, default: int) -> int:
+    if raw in {None, ""}:
+        return default
+    assert raw is not None
+    try:
+        port = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"Invalid {key} value: {raw!r}") from error
+    if not 1 <= port <= 65535:
+        raise RuntimeError(f"Invalid {key} value: {raw!r}; expected 1-65535")
+    return port
+
+
+def _validate_public_url(value: str | None, *, key: str) -> None:
+    if not value:
+        return
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(f"Invalid {key} value: {value!r}; expected an absolute HTTP(S) URL")
+
+
 def _parse_ipv4_csv(raw: str | None, *, default: list[str]) -> list[str]:
     if raw is None:
         return default
@@ -201,6 +224,13 @@ class CometConfig:
     default_debrid_service: str
     default_debrid_apikey: str | None
     enabled: bool
+    image: str = "g0ldyy/comet"
+    stremio_host_port: int = DEFAULT_STREMIO_HOST_PORT
+    stremio_container_port: int = DEFAULT_STREMIO_CONTAINER_PORT
+    gateway_host_port: int = DEFAULT_COMET_GATEWAY_HOST_PORT
+    gateway_public_base_url: str | None = None
+    gateway_token_length: int = 8
+    gateway_enabled: bool = False
 
     @classmethod
     def from_env(cls, root_dir: Path | None = None) -> CometConfig:
@@ -219,13 +249,71 @@ class CometConfig:
                     f"Invalid COMET_HOST_PORT value: {raw_host_port!r}; expected 1-65535"
                 )
 
+        stremio_host_port = _parse_port(
+            env_file_value(env_file, "STREMIO_HOST_PORT"),
+            key="STREMIO_HOST_PORT",
+            default=DEFAULT_STREMIO_HOST_PORT,
+        )
+        stremio_container_port = _parse_port(
+            env_file_value(env_file, "STREMIO_CONTAINER_PORT"),
+            key="STREMIO_CONTAINER_PORT",
+            default=DEFAULT_STREMIO_CONTAINER_PORT,
+        )
+        gateway_host_port = _parse_port(
+            env_file_value(env_file, "COMET_GATEWAY_HOST_PORT"),
+            key="COMET_GATEWAY_HOST_PORT",
+            default=DEFAULT_COMET_GATEWAY_HOST_PORT,
+        )
+        comet_enabled = env_flag_enabled("COMET_ENABLED", False, env_path=env_file)
+        gateway_enabled = env_flag_enabled(
+            "COMET_GATEWAY_ENABLED", comet_enabled, env_path=env_file
+        )
+        gateway_public_base_url = env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL") or None
+        raw_gateway_token_length = env_file_value(env_file, "COMET_GATEWAY_TOKEN_LENGTH")
+        gateway_token_length = 8
+        if raw_gateway_token_length not in {None, ""}:
+            assert raw_gateway_token_length is not None
+            try:
+                gateway_token_length = int(raw_gateway_token_length)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Invalid COMET_GATEWAY_TOKEN_LENGTH value: {raw_gateway_token_length!r}"
+                ) from error
+            if not 4 <= gateway_token_length <= 32:
+                raise RuntimeError(
+                    f"Invalid COMET_GATEWAY_TOKEN_LENGTH value: {raw_gateway_token_length!r}; "
+                    "expected 4-32"
+                )
+        public_base_url = env_file_value(env_file, "COMET_PUBLIC_BASE_URL") or None
+        _validate_public_url(public_base_url, key="COMET_PUBLIC_BASE_URL")
+        _validate_public_url(
+            gateway_public_base_url,
+            key="COMET_GATEWAY_PUBLIC_BASE_URL",
+        )
+
         bind_addresses = tuple(
             _parse_ipv4_csv(
                 env_file_value(env_file, "STREMIO_BIND_ADDRS"),
                 default=["127.0.0.1"],
             )
         )
-        public_base_url = env_file_value(env_file, "COMET_PUBLIC_BASE_URL") or None
+        if "0.0.0.0" in bind_addresses and len(bind_addresses) > 1:
+            raise RuntimeError(
+                "STREMIO_BIND_ADDRS cannot combine 0.0.0.0 with specific bind addresses"
+            )
+        configured_ports = [
+            (stremio_host_port, "STREMIO_HOST_PORT"),
+            (host_port, "COMET_HOST_PORT"),
+        ]
+        if gateway_enabled:
+            configured_ports.append((gateway_host_port, "COMET_GATEWAY_HOST_PORT"))
+        for index, (port, key) in enumerate(configured_ports):
+            for other_port, other_key in configured_ports[index + 1 :]:
+                if port == other_port:
+                    raise RuntimeError(f"Port collision: {key} and {other_key} both use {port}")
+        if gateway_enabled and not comet_enabled:
+            raise RuntimeError("COMET_GATEWAY_ENABLED requires COMET_ENABLED=1")
+
         proxy_debrid_stream = env_flag_enabled("COMET_PROXY_DEBRID_STREAM", True, env_path=env_file)
         proxy_max_connections_raw = env_file_value(env_file, "COMET_PROXY_MAX_CONNECTIONS")
         proxy_max_connections = -1
@@ -306,5 +394,12 @@ class CometConfig:
                 env_file_value(env_file, "COMET_DEFAULT_DEBRID_SERVICE") or "realdebrid"
             ).strip(),
             default_debrid_apikey=env_file_value(env_file, "COMET_DEFAULT_DEBRID_APIKEY") or None,
-            enabled=env_flag_enabled("COMET_ENABLED", False, env_path=env_file),
+            enabled=comet_enabled,
+            image=(env_file_value(env_file, "COMET_IMAGE") or "g0ldyy/comet").strip(),
+            stremio_host_port=stremio_host_port,
+            stremio_container_port=stremio_container_port,
+            gateway_host_port=gateway_host_port,
+            gateway_public_base_url=gateway_public_base_url,
+            gateway_token_length=gateway_token_length,
+            gateway_enabled=gateway_enabled,
         )

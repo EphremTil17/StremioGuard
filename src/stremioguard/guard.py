@@ -170,22 +170,30 @@ class GluetunGuard:
             *args,
         ]
 
+    def service_container_id(self, service: str) -> str | None:
+        result = self.runner.run(self._compose_command("ps", "-q", service), check=False)
+        if result.returncode != 0:
+            return None
+        return next(
+            (line.strip() for line in (result.stdout or "").splitlines() if line.strip()), None
+        )
+
     def gluetun_healthy(self) -> bool:
+        container_id = self.service_container_id("gluetun")
+        if not container_id:
+            return False
         result = self.runner.run(
-            [
-                "docker",
-                "inspect",
-                "--format",
-                "{{.State.Health.Status}}",
-                self.config.gluetun_container_name,
-            ],
+            ["docker", "inspect", "--format", "{{.State.Health.Status}}", container_id],
             check=False,
         )
         return result.returncode == 0 and (result.stdout or "").strip() == "healthy"
 
     def gluetun_recent_logs(self, lines: int = 20) -> str:
+        container_id = self.service_container_id("gluetun")
+        if not container_id:
+            return ""
         result = self.runner.run(
-            ["docker", "logs", "--tail", str(lines), self.config.gluetun_container_name],
+            ["docker", "logs", "--tail", str(lines), container_id],
             check=False,
         )
         parts = [p for p in (result.stdout or "", result.stderr or "") if p.strip()]
@@ -238,7 +246,7 @@ class GluetunGuard:
                 [
                     "docker",
                     "exec",
-                    self.config.gluetun_container_name,
+                    self.service_container_id("gluetun") or "",
                     "wget",
                     "-qO-",
                     "--timeout",
@@ -301,8 +309,8 @@ class GluetunGuard:
             comet_manager = CometManager(comet_config, self.runner)
             comet_manager.prepare_runtime()
 
-        self.log(f"Ensuring {self.config.gluetun_container_name} is running.")
-        self.compose("up", "-d", self.config.gluetun_container_name, capture=False)
+        self.log("Ensuring the gluetun service is running.")
+        self.compose("up", "-d", "gluetun", capture=False)
         self.wait_for_gluetun_healthy()
         if not self.public_ip_safe(log_observation=True):
             raise RuntimeError("Public IP check failed via gluetun; refusing to start services.")
@@ -324,11 +332,11 @@ class GluetunGuard:
         if services is None:
             services = self.enabled_runtime_services()
         for service in services:
-            container_name = service
-            if service == "stremio":
-                container_name = self.config.container_name
+            container_id = self.service_container_id(service)
+            if not container_id:
+                return False
             result = self.runner.run(
-                ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+                ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
                 check=False,
             )
             if result.returncode != 0 or (result.stdout or "").strip().lower() != "true":
