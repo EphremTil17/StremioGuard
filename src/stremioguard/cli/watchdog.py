@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import signal
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import typer
@@ -18,7 +20,7 @@ from stremioguard.cli.context import (
     UV_CACHE,
     RunContext,
 )
-from stremioguard.env import fail
+from stremioguard.env import atomic_write_text, fail
 
 WATCHDOG_CMDLINE_MARKERS = ("stremioguard.orchestrator", "stremio-vpn")
 
@@ -120,14 +122,14 @@ def _wait_for_exit(pid: int, timeout_seconds: float) -> bool:
     return False
 
 
-def _start_watchdog(context: RunContext) -> None:
+def _start_watchdog_locked(context: RunContext) -> None:
     _require_uv()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     pids = _watchdog_pids()
     if pids:
-        PID_FILE.write_text(f"{pids[0]}\n", encoding="utf-8")
+        atomic_write_text(PID_FILE, f"{pids[0]}\n", mode=0o600)
         logger.info(f"Watchdog already running with PID {pids[0]}.")
         return
 
@@ -142,11 +144,11 @@ def _start_watchdog(context: RunContext) -> None:
             start_new_session=True,
         )
 
-    PID_FILE.write_text(f"{process.pid}\n", encoding="utf-8")
+    atomic_write_text(PID_FILE, f"{process.pid}\n", mode=0o600)
     logger.success(f"Watchdog started with PID {process.pid}.")
 
 
-def _stop_watchdog() -> None:
+def _stop_watchdog_locked() -> None:
     pids = _watchdog_pids()
     if not pids:
         PID_FILE.unlink(missing_ok=True)
@@ -179,7 +181,7 @@ def _stop_watchdog() -> None:
             if not _wait_for_exit(pid, 3):
                 stuck.append(pid)
         if stuck:
-            PID_FILE.write_text(f"{stuck[0]}\n", encoding="utf-8")
+            atomic_write_text(PID_FILE, f"{stuck[0]}\n", mode=0o600)
             logger.error(
                 "Watchdog PID(s) "
                 f"{', '.join(str(pid) for pid in stuck)} did not exit after SIGKILL; "
@@ -195,3 +197,25 @@ def _latest_log() -> Path | None:
         return None
     logs = sorted(LOG_DIR.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
     return logs[0] if logs else None
+
+
+@contextmanager
+def _watchdog_operation_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = STATE_DIR / "watchdog.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _start_watchdog(context: RunContext) -> None:
+    with _watchdog_operation_lock():
+        _start_watchdog_locked(context)
+
+
+def _stop_watchdog() -> None:
+    with _watchdog_operation_lock():
+        _stop_watchdog_locked()

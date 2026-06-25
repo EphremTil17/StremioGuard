@@ -14,7 +14,7 @@ into the same Docker product instead of being treated as a separate stack.
 - `src/stremioguard/guard.py` contains Docker, gluetun, and IP-safety logic.
 - `src/stremioguard/init.py` and `src/stremioguard/nordvpn.py` own guided setup.
 - `src/stremioguard/env.py` and `config.py` centralize configuration parsing.
-- `src/stremioguard/comet.py` owns vendored Comet repo management, runtime env
+- `src/stremioguard/comet/manager.py` owns vendored Comet repo management, runtime env
   generation, doctor checks, and playback probing.
 - `src/stremioguard/publishing.py` owns the shared gluetun-published service
   override generation used by both Stremio and Comet.
@@ -95,7 +95,7 @@ state remains under `.stremio/comet/`, and `probe-playback` still fails if it
 observes a direct provider redirect when proxy mode is expected.
 
 Comet patching is now standardized. Override files are generated from
-`src/stremioguard/comet_overrides.py` through
+`src/stremioguard/overrides/` through
 `scripts/generate_comet_overrides.py`, written under `.stremio/comet/`, and
 mounted read-only into the running Comet container. The main managed override
 areas today are:
@@ -107,7 +107,9 @@ areas today are:
 - title-compatibility filtering
 
 The current matching philosophy is "resolved-file-first, evidence-based
-permissiveness" rather than one-off hardcoded title exceptions.
+permissiveness" rather than one-off hardcoded title exceptions. Compatibility is
+validated automatically against the configured Comet image during setup and
+startup; successful checks are cached in `.stremio/comet/compatibility.json`.
 
 Important boundary: phase 1 proves debrid video proxy behavior only. It does
 not prove that every subtitle, manifest, or auxiliary playback request stays on
