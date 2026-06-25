@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
 import subprocess
+import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,14 +21,12 @@ from stremioguard.comet_gateway import (
     CometGatewayManager,
 )
 from stremioguard.config import (
-    DEFAULT_STREMIO_CONTAINER_PORT,
-    DEFAULT_STREMIO_HOST_PORT,
     GENERATED_COMPOSE_FILE,
     CometConfig,
     Runner,
     SubprocessRunner,
 )
-from stremioguard.env import env_file_value, env_flag_enabled
+from stremioguard.env import atomic_write_text, ensure_directory, env_file_value, env_flag_enabled
 from stremioguard.overrides import write_override_bundle
 from stremioguard.preflight import require_docker, verify_bind_addresses
 from stremioguard.publishing import render_stack_compose_override
@@ -86,18 +88,10 @@ class CometManager:
         return (result.stdout or "").strip() or None
 
     def stremio_host_port(self) -> int:
-        raw = env_file_value(self.config.env_file, "STREMIO_HOST_PORT")
-        if raw in {None, ""}:
-            return DEFAULT_STREMIO_HOST_PORT
-        assert raw is not None
-        return int(raw)
+        return self.config.stremio_host_port
 
     def stremio_container_port(self) -> int:
-        raw = env_file_value(self.config.env_file, "STREMIO_CONTAINER_PORT")
-        if raw in {None, ""}:
-            return DEFAULT_STREMIO_CONTAINER_PORT
-        assert raw is not None
-        return int(raw)
+        return self.config.stremio_container_port
 
     def root_compose_file(self) -> Path:
         return self.config.root_dir / "docker-compose.yml"
@@ -124,7 +118,7 @@ class CometManager:
         return gateway_manager.addon_base_url(default_token)
 
     def write_stack_override_file(self) -> None:
-        self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.config.state_dir)
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.config.postgres_data_dir.mkdir(parents=True, exist_ok=True)
         gateway_config = self.gateway_config()
@@ -189,8 +183,192 @@ class CometManager:
         )
 
     def write_runtime_env(self) -> None:
-        self.config.state_dir.mkdir(parents=True, exist_ok=True)
-        self.config.runtime_env_file.write_text(self.render_runtime_env(), encoding="utf-8")
+        ensure_directory(self.config.state_dir)
+        atomic_write_text(self.config.runtime_env_file, self.render_runtime_env(), mode=0o600)
+
+    def _managed_patch_fingerprint(self) -> str:
+        digest = hashlib.sha256()
+        override_root = Path(__file__).resolve().parent.parent / "overrides"
+        project_root = override_root.parent.parent
+        files = sorted(override_root.rglob("*.py")) + [
+            Path(__file__).resolve().parent.parent / "metadata.py"
+        ]
+        for path in files:
+            if not path.is_file():
+                continue
+            digest.update(str(path.relative_to(project_root)).encode())
+            digest.update(path.read_bytes())
+        return digest.hexdigest()
+
+    def _image_digest(self) -> str:
+        result = self.runner.run(
+            ["docker", "image", "inspect", self.config.image, "--format", "{{json .RepoDigests}}"],
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown Docker error").strip()
+            raise RuntimeError(f"Unable to inspect Comet image {self.config.image!r}: {detail}")
+        try:
+            digests = json.loads((result.stdout or "").strip() or "[]")
+        except json.JSONDecodeError:
+            digests = []
+        if isinstance(digests, list):
+            for value in digests:
+                if isinstance(value, str) and "@" in value:
+                    return value.rsplit("@", 1)[1]
+        image_id = self.runner.run(
+            ["docker", "image", "inspect", self.config.image, "--format", "{{.Id}}"], check=False
+        )
+        value = (image_id.stdout or "").strip()
+        if image_id.returncode == 0 and value:
+            return value
+        raise RuntimeError(
+            f"Comet image {self.config.image!r} has no inspectable digest or image ID."
+        )
+
+    def ensure_image(self) -> str:
+        result = self.runner.run(["docker", "image", "inspect", self.config.image], check=False)
+        if result.returncode != 0:
+            self.log(f"Pulling Comet image {self.config.image}.")
+            self.runner.run(["docker", "pull", self.config.image], check=True, capture=False)
+        return self._image_digest()
+
+    def _compatibility_cache_valid(
+        self, image_digest: str, source_commit: str, patch_fingerprint: str
+    ) -> bool:
+        cache_file = self.config.state_dir / "compatibility.json"
+        if not cache_file.exists():
+            return False
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (
+            all(
+                cached.get(key) == value
+                for key, value in {
+                    "image": self.config.image,
+                    "image_digest": image_digest,
+                    "source_commit": source_commit,
+                    "patch_fingerprint": patch_fingerprint,
+                }.items()
+            )
+            and cached.get("status") == "passed"
+        )
+
+    def _compatibility_diagnostic(self, error: Exception, source_root: Path) -> str:
+        text = str(error)
+        lowered = text.lower()
+        if "orchestration" in lowered or "episode-pack" in lowered:
+            patch = "episode-pack orchestration"
+            source_file = "comet/services/orchestration.py"
+            optional = True
+        elif "stream" in lowered:
+            patch = "stream formatting and playback"
+            source_file = "comet/api/endpoints/stream.py"
+            optional = False
+        elif "torrentio" in lowered:
+            patch = "Torrentio normalization"
+            source_file = "comet/scrapers/torrentio.py"
+            optional = False
+        elif "filter" in lowered:
+            patch = "torrent filtering"
+            source_file = "comet/services/filtering.py"
+            optional = False
+        else:
+            patch = "managed Comet overrides"
+            source_file = "comet/services/orchestration.py"
+            optional = False
+        actual = source_root / source_file
+        nearby = "<source file was not copied from the image>"
+        if actual.exists():
+            nearby = "".join(
+                actual.read_text(encoding="utf-8", errors="replace").splitlines(True)[:30]
+            ).rstrip()
+        action = (
+            "Update the StremioGuard patch generator for this release, or disable the optional "
+            "episode-pack patch with COMET_PATCH_EPISODE_PACK_RESULTS=0."
+            if optional
+            else (
+                "Update the required StremioGuard patch for this Comet release "
+                "before starting the deployment."
+            )
+        )
+        return (
+            "Comet compatibility check failed.\n\n"
+            f"Image: {self.config.image}\n"
+            f"Digest: {self._image_digest()}\n"
+            f"Patch: {patch}\n"
+            f"File: {source_file}\n"
+            f"Failure type: {type(error).__name__}\n"
+            f"Expected anchor or error: {text}\n\n"
+            f"Nearby upstream code:\n{nearby}\n\n"
+            f"Recommended action:\n{action}"
+        )
+
+    def validate_compatibility(self, *, force: bool = False) -> None:
+        image_digest = self.ensure_image()
+        source_commit = self.current_commit() or self.load_lock().pinned_commit
+        patch_fingerprint = self._managed_patch_fingerprint()
+        if not force and self._compatibility_cache_valid(
+            image_digest, source_commit, patch_fingerprint
+        ):
+            return
+
+        container_id: str | None = None
+        with tempfile.TemporaryDirectory(prefix="stremioguard-comet-") as directory:
+            temp_root = Path(directory)
+            source_root = temp_root / "image-root"
+            source_root.mkdir()
+            generated_root = temp_root / "generated"
+            try:
+                created = self.runner.run(["docker", "create", self.config.image], check=True)
+                container_id = (created.stdout or "").strip()
+                if not container_id:
+                    raise RuntimeError("Docker created no temporary container ID")
+                self.runner.run(
+                    ["docker", "cp", f"{container_id}:/app/comet", str(source_root)], check=True
+                )
+                image_repo = source_root / "comet"
+                if not image_repo.exists():
+                    raise RuntimeError("the image does not contain /app/comet")
+                write_override_bundle(
+                    repo_dir=source_root,
+                    state_dir=generated_root,
+                    result_format_style=self.config.result_format_style,
+                    patch_episode_pack_results=self.config.patch_episode_pack_results,
+                )
+                generated_files = sorted(generated_root.glob("*.py"))
+                for generated_file in generated_files:
+                    compile(generated_file.read_text(encoding="utf-8"), str(generated_file), "exec")
+            except Exception as error:
+                raise RuntimeError(self._compatibility_diagnostic(error, source_root)) from error
+            finally:
+                if container_id:
+                    self.runner.run(
+                        ["docker", "rm", "-f", container_id], check=False, capture=False
+                    )
+
+        cache = {
+            "status": "passed",
+            "image": self.config.image,
+            "image_digest": image_digest,
+            "source_commit": source_commit,
+            "patch_fingerprint": patch_fingerprint,
+            "patch_count": len(generated_files),
+        }
+        ensure_directory(self.config.state_dir)
+        atomic_write_text(
+            self.config.state_dir / "compatibility.json",
+            json.dumps(cache, indent=2) + "\n",
+            mode=0o600,
+        )
+        self.success(
+            "Comet compatibility check passed.\n"
+            f"Image: {self.config.image}\n"
+            f"Digest: {image_digest}\n"
+            f"Patches: {len(generated_files)} validated"
+        )
 
     def require_commands(self) -> None:
         require_docker(
@@ -219,6 +397,23 @@ class CometManager:
 
     def install(self) -> None:
         self.prepare_runtime()
+        self.ensure_image()
+        if sys.stdin.isatty():
+            import typer
+
+            if typer.confirm(
+                "The current Comet image will be checked against the installed "
+                "StremioGuard patches.\nRun compatibility check now?",
+                default=True,
+            ):
+                self.validate_compatibility()
+            else:
+                self.warn(
+                    "Skipped compatibility validation; the next Comet start will "
+                    "validate the image automatically."
+                )
+        else:
+            self.validate_compatibility()
 
     def prepare_runtime(self) -> None:
         self.fetch_and_checkout_pinned()
@@ -236,6 +431,7 @@ class CometManager:
     def start(self) -> None:
         self.require_commands()
         self.prepare_runtime()
+        self.validate_compatibility()
         self.check_bind_addresses()
         self.log("Starting Comet stack.")
         services = [self.config.postgres_service_name, self.config.service_name]
@@ -289,36 +485,33 @@ class CometManager:
             "(checked from inside the Comet container)"
         )
 
+    def service_container_id(self, service_name: str) -> str | None:
+        result = self.runner.run(self._compose_command("ps", "-q", service_name), check=False)
+        if result.returncode != 0:
+            return None
+        return next(
+            (line.strip() for line in (result.stdout or "").splitlines() if line.strip()), None
+        )
+
     def healthcheck(self) -> bool:
-        if not self.container_health_status():
+        container_id = self.service_container_id(self.config.service_name)
+        if not container_id or not self.container_health_status(container_id):
             return False
-        url = "http://127.0.0.1:8000/health"
         result = self.runner.run(
-            [
-                "docker",
-                "exec",
-                self.config.container_name,
-                "wget",
-                "-qO-",
-                url,
-            ],
+            ["docker", "exec", container_id, "wget", "-qO-", "http://127.0.0.1:8000/health"],
             check=False,
             timeout=5,
         )
         if result.returncode != 0:
             return False
-        body = (result.stdout or "").replace(" ", "")
-        return '{"status":"ok"}' in body
+        return '{"status":"ok"}' in (result.stdout or "").replace(" ", "")
 
-    def container_health_status(self) -> str | None:
+    def container_health_status(self, container_id: str | None = None) -> str | None:
+        container_id = container_id or self.service_container_id(self.config.service_name)
+        if not container_id:
+            return None
         result = self.runner.run(
-            [
-                "docker",
-                "inspect",
-                "--format",
-                "{{.State.Health.Status}}",
-                self.config.container_name,
-            ],
+            ["docker", "inspect", "--format", "{{.State.Health.Status}}", container_id],
             check=False,
         )
         if result.returncode != 0:
@@ -337,17 +530,17 @@ class CometManager:
         return None
 
     def gluetun_container_id(self) -> str | None:
-        result = self.runner.run(
-            ["docker", "inspect", "-f", "{{.Id}}", "gluetun"],
-            check=False,
-        )
-        if result.returncode != 0:
-            return None
-        return (result.stdout or "").strip() or None
+        return self.service_container_id("gluetun")
 
     def network_mode(self) -> str | None:
         result = self.runner.run(
-            ["docker", "inspect", "-f", "{{.HostConfig.NetworkMode}}", self.config.container_name],
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{.HostConfig.NetworkMode}}",
+                self.service_container_id(self.config.service_name) or "",
+            ],
             check=False,
         )
         if result.returncode != 0:
@@ -440,8 +633,10 @@ class CometManager:
                 "Comet is not sharing gluetun's network namespace "
                 f"(observed network mode: {network_mode or 'unknown'})."
             )
-        gluetun_ip = self.public_ip("gluetun")
-        comet_ip = self.public_ip(self.config.container_name)
+        gluetun_id = self.gluetun_container_id()
+        comet_id = self.service_container_id(self.config.service_name)
+        gluetun_ip = self.public_ip(gluetun_id) if gluetun_id else None
+        comet_ip = self.public_ip(comet_id) if comet_id else None
         if not gluetun_ip or not comet_ip:
             raise RuntimeError("Could not compare Comet and gluetun public egress IPs.")
         if gluetun_ip != comet_ip:

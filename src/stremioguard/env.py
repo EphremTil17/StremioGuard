@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import NoReturn
 
@@ -39,7 +42,31 @@ def write_env_setting(env_path: Path, key: str, value: str) -> None:
         content = pattern.sub(new_line, content, count=1)
     else:
         content = content.rstrip("\n") + f"\n{new_line}\n"
-    env_path.write_text(content, encoding="utf-8")
+    atomic_write_text(env_path, content, mode=0o600)
+
+
+def ensure_directory(path: Path, *, mode: int = 0o700) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=mode)
+    os.chmod(path, mode)
+
+
+def atomic_write_text(path: Path, content: str, *, mode: int = 0o644) -> None:
+    """Write a generated file without exposing partial contents."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(path)
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def write_wireguard_key(env_path: Path, key: str) -> None:
