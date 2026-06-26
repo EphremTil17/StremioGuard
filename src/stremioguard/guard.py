@@ -13,18 +13,19 @@ from loguru import logger
 
 from stremioguard.comet_gateway import CometGatewayConfig
 from stremioguard.config import (
+    DEFAULT_STREMIO_CONTAINER_PORT,
+    DEFAULT_STREMIO_HOST_PORT,
     CometConfig,
     Config,
     Runner,
     SubprocessRunner,
     parse_public_ip,
 )
-from stremioguard.env import env_file_value
+from stremioguard.env import env_file_value, env_int_value
 from stremioguard.preflight import require_docker, verify_bind_addresses
 from stremioguard.publishing import render_stack_compose_override
 
-DEFAULT_STREMIO_HOST_PORT = 11470
-DEFAULT_STREMIO_CONTAINER_PORT = 11470
+HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
 
 
 class GluetunGuard:
@@ -33,6 +34,7 @@ class GluetunGuard:
         self.runner = runner or SubprocessRunner()
         self._env_path = self.config.root_dir / ".env"
         self.last_observed_ip: str | None = None
+        self._warned_stale_home_ip = False
 
     def log(self, message: str) -> None:
         logger.info(message)
@@ -71,23 +73,19 @@ class GluetunGuard:
 
         return addresses
 
-    def env_port(self, key: str, default: int) -> int:
-        raw = env_file_value(self._env_path, key)
-        if raw is None or raw == "":
-            return default
-        try:
-            port = int(raw)
-        except ValueError as error:
-            raise RuntimeError(f"Invalid {key} value: {raw!r}") from error
-        if port < 1 or port > 65535:
-            raise RuntimeError(f"Invalid {key} value: {raw!r}; expected 1-65535")
-        return port
-
     def stremio_host_port(self) -> int:
-        return self.env_port("STREMIO_HOST_PORT", DEFAULT_STREMIO_HOST_PORT)
+        return env_int_value(
+            self._env_path, "STREMIO_HOST_PORT", DEFAULT_STREMIO_HOST_PORT, minimum=1, maximum=65535
+        )
 
     def stremio_container_port(self) -> int:
-        return self.env_port("STREMIO_CONTAINER_PORT", DEFAULT_STREMIO_CONTAINER_PORT)
+        return env_int_value(
+            self._env_path,
+            "STREMIO_CONTAINER_PORT",
+            DEFAULT_STREMIO_CONTAINER_PORT,
+            minimum=1,
+            maximum=65535,
+        )
 
     def write_compose_override(self) -> None:
         addresses = self.bind_addresses()
@@ -279,12 +277,30 @@ class GluetunGuard:
             return False
 
         if self.config.home_ip_file.exists():
+            self._warn_if_home_ip_stale()
             home_ip = self.config.home_ip_file.read_text(encoding="utf-8").strip()
             if home_ip and ip == home_ip:
                 self.warn(f"Public IP matches saved home IP baseline ({home_ip}); possible leak.")
                 return False
 
         return True
+
+    def home_ip_age_seconds(self) -> float | None:
+        if not self.config.home_ip_file.exists():
+            return None
+        return max(0.0, time.time() - self.config.home_ip_file.stat().st_mtime)
+
+    def _warn_if_home_ip_stale(self) -> None:
+        if self._warned_stale_home_ip:
+            return
+        age = self.home_ip_age_seconds()
+        if age is not None and age > HOME_IP_STALE_AFTER_SECONDS:
+            self.warn(
+                f"home-IP baseline is {int(age // 86400)} days old; residential IPs rotate, "
+                "so a stale baseline weakens leak detection. Re-run "
+                "`./stremio record-home-ip` while gluetun is stopped to refresh it."
+            )
+            self._warned_stale_home_ip = True
 
     def check_bind_addresses(self) -> None:
         if os.environ.get("SKIP_BIND_PREFLIGHT") == "1":

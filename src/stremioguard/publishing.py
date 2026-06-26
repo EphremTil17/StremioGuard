@@ -110,6 +110,8 @@ def render_stack_compose_override(
                 "      retries: 5",
                 "      start_period: 10s",
                 "  comet-postgres:",
+                "    env_file:",
+                f"      - {comet_config.state_dir / 'postgres.env'}",
                 "    volumes:",
                 f"      - {comet_config.postgres_data_dir}:/var/lib/postgresql/",
             ]

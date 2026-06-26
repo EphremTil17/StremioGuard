@@ -61,7 +61,19 @@ def _pid_is_our_watchdog(pid: int) -> bool:
         cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace")
     except (FileNotFoundError, PermissionError, OSError):
         return False
-    return "watchdog" in cmdline and any(marker in cmdline for marker in WATCHDOG_CMDLINE_MARKERS)
+    if "watchdog" not in cmdline or not any(m in cmdline for m in WATCHDOG_CMDLINE_MARKERS):
+        return False
+    # Require the process to be running out of this repo, so `./stremio stop`
+    # cannot kill an unrelated process (e.g. `tail -f ... | grep watchdog`) that
+    # merely mentions the marker strings in its argv.
+    try:
+        cwd = Path(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        return False
+    try:
+        return cwd.resolve() == ROOT_DIR.resolve()
+    except OSError:
+        return False
 
 
 def _watchdog_pids() -> list[int]:

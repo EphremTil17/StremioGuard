@@ -132,6 +132,53 @@ class TestCometGatewayManager:
         assert f'"{token}" 1;' in rendered
         assert "default 0;" in rendered
 
+    def test_render_nginx_rate_limits_auth_failures_not_valid_tokens(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
+        manager.add_token("Shared Addon")
+        rendered = manager.render_nginx_conf()
+
+        # Invalid tokens must NOT be rejected by a rewrite-phase `return 403`
+        # (which would run before limit_req's preaccess phase and bypass the
+        # limiter); they are rewritten into an internal location whose
+        # access-phase `deny all` rejects AFTER limit_req has counted them.
+        assert "limit_req_zone $binary_remote_addr zone=gateway_auth:1m rate=5r/s;" in rendered
+        assert "limit_req_zone $binary_remote_addr zone=gateway_admin:1m rate=10r/s;" in rendered
+        assert rendered.count("rewrite ^ /__sg_invalid_token last;") == 2
+        assert "location = /__sg_invalid_token {" in rendered
+        assert "limit_req zone=gateway_auth burst=10 nodelay;" in rendered
+        assert "deny all;" in rendered
+        # Valid-token proxying must carry no limiter — playback seeking is bursty.
+        token_location = rendered.split('location ~ "^/comet/')[1]
+        assert "limit_req" not in token_location.split("}")[0]
+        # No rewrite-phase return 403 remains in the token locations.
+        assert "if ($token_valid = 0) {\n                return 403;" not in rendered
+        # Configure/admin and root proxy get the human-paced admin limiter.
+        assert rendered.count("limit_req zone=gateway_admin burst=20 nodelay;") == 2
+
+    def test_render_nginx_masks_token_in_access_log(self, tmp_path: Path) -> None:
+        manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
+        _, token = manager.add_token("Shared Addon")
+        rendered = manager.render_nginx_conf()
+
+        # The access log uses the masked request variable, never the raw one.
+        assert 'log_format main \'$remote_addr [$time_local] "$request_masked"' in rendered
+        assert '"$request" $status' not in rendered
+        assert "map $request $request_masked {" in rendered
+        # The concrete token value must never appear anywhere in the rendered conf.
+        assert token not in rendered
+
+    def test_write_nginx_configs_writes_secret_files_at_0600(self, tmp_path: Path) -> None:
+        manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
+        manager.add_token("Shared Addon")
+
+        manager.write_nginx_configs()
+
+        assert manager.config.nginx_conf_file.stat().st_mode & 0o777 == 0o600
+        assert manager.config.tokens_map_file.stat().st_mode & 0o777 == 0o600
+
 
 class TestCometGatewayPublishing:
     def test_gateway_publishes_on_gluetun_and_raw_comet_is_loopback_only(
