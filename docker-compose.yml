@@ -39,7 +39,10 @@ services:
 
   comet-gateway:
     image: nginx:alpine
-    restart: unless-stopped
+    # restart: "no" like stremio: nothing that fronts debrid traffic should be
+    # revived by Docker before the watchdog has re-verified the VPN path. The
+    # watchdog auto-starts the Comet trio once gluetun is healthy.
+    restart: "no"
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -53,11 +56,10 @@ services:
 
   comet-postgres:
     image: postgres:18-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: comet
-      POSTGRES_PASSWORD: comet
-      POSTGRES_DB: comet
+    restart: "no"
+    # Credentials are supplied through a generated env_file (.stremio/comet/
+    # postgres.env) added by the compose override, so the password is not a
+    # hardcoded default in this file.
     command:
       - "postgres"
       - "-c"
@@ -90,7 +92,7 @@ services:
 
   comet:
     image: ${COMET_IMAGE:-g0ldyy/comet}
-    restart: unless-stopped
+    restart: "no"
     environment:
       DATABASE_TYPE: postgresql
     network_mode: "service:gluetun"

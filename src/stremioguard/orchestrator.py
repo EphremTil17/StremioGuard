@@ -174,6 +174,12 @@ class Orchestrator:
         logger.info("healthy" if g.gluetun_healthy() else "not healthy / not running")
         logger.info("--- Public IP (via gluetun) ---")
         logger.info(g.public_ip_via_gluetun() or "unavailable")
+        logger.info("--- Home IP baseline ---")
+        age = g.home_ip_age_seconds()
+        if age is None:
+            logger.info("not recorded (run `./stremio record-home-ip`)")
+        else:
+            logger.info(f"{int(age // 86400)} days old")
         logger.info("--- Containers ---")
         for service in g.enabled_runtime_services():
             result = g.compose("ps", service, check=False)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -223,6 +225,38 @@ class GluetunGuardTests(unittest.TestCase):
             guard = GluetunGuard(cfg, FakeRunner({}))
             with mock.patch.object(guard, "public_ip_via_gluetun", return_value="198.51.100.10"):
                 self.assertFalse(guard.public_ip_safe())
+
+    def test_public_ip_safe_warns_once_on_stale_home_ip_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_config(tmp_path)
+            cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
+            old = time.time() - (40 * 24 * 3600)
+            os.utime(cfg.home_ip_file, (old, old))
+            guard = GluetunGuard(cfg, FakeRunner({}))
+            warnings: list[str] = []
+            with (
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
+                mock.patch.object(guard, "warn", side_effect=warnings.append),
+            ):
+                self.assertTrue(guard.public_ip_safe())
+                self.assertTrue(guard.public_ip_safe())
+            stale_warnings = [w for w in warnings if "days old" in w]
+            self.assertEqual(len(stale_warnings), 1)
+
+    def test_public_ip_safe_does_not_warn_on_fresh_home_ip_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_config(tmp_path)
+            cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
+            guard = GluetunGuard(cfg, FakeRunner({}))
+            warnings: list[str] = []
+            with (
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
+                mock.patch.object(guard, "warn", side_effect=warnings.append),
+            ):
+                self.assertTrue(guard.public_ip_safe())
+            self.assertFalse(any("days old" in w for w in warnings))
 
     def test_compose_override_uses_bind_address_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

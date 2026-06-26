@@ -17,6 +17,7 @@ OPENVPN_USER_PLACEHOLDER = "<paste-service-username-here>"
 OPENVPN_PASSWORD_PLACEHOLDER = "<paste-service-password-here>"
 ENV_LINE_TEMPLATE = r"^{key}=.*$"
 DEFAULT_STREMIO_HOST_PORT = 11470
+DEFAULT_STREMIO_CONTAINER_PORT = 11470
 
 
 def fail(message: str) -> NoReturn:
@@ -85,17 +86,41 @@ def env_flag_enabled(key: str, default: bool, *, env_path: Path) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
-def env_port_value(env_path: Path, key: str, default: int) -> int:
-    value = env_file_value(env_path, key)
-    if value is None or value == "":
+def env_int_value(
+    env_path: Path,
+    key: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Read and validate an integer .env value, raising RuntimeError on error.
+
+    This is the single integer/port parser for the project; callers that want a
+    clean interactive exit (e.g. the guided setup) wrap it via env_port_value.
+    """
+    raw = env_file_value(env_path, key)
+    if raw in {None, ""}:
         return default
+    assert raw is not None
     try:
-        port = int(value)
-    except ValueError:
-        fail(f"{key} must be a TCP port number; got {value!r}.")
-    if port < 1 or port > 65535:
-        fail(f"{key} must be between 1 and 65535; got {value!r}.")
-    return port
+        value = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"Invalid {key} value: {raw!r}") from error
+    if minimum is not None and value < minimum:
+        expected = f"{minimum}-{maximum}" if maximum is not None else f">= {minimum}"
+        raise RuntimeError(f"Invalid {key} value: {raw!r}; expected {expected}")
+    if maximum is not None and value > maximum:
+        expected = f"{minimum}-{maximum}" if minimum is not None else f"<= {maximum}"
+        raise RuntimeError(f"Invalid {key} value: {raw!r}; expected {expected}")
+    return value
+
+
+def env_port_value(env_path: Path, key: str, default: int) -> int:
+    try:
+        return env_int_value(env_path, key, default, minimum=1, maximum=65535)
+    except RuntimeError as error:
+        fail(str(error))
 
 
 def env_needs_init(env_path: Path) -> bool:

@@ -75,6 +75,28 @@ class EnvUtilTests(unittest.TestCase):
             )
             self.assertFalse(env.env_needs_init(path))
 
+    def test_env_int_value_returns_default_when_missing_or_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("COMET_HOST_PORT=\n", encoding="utf-8")
+            self.assertEqual(env.env_int_value(path, "COMET_HOST_PORT", 18000), 18000)
+            self.assertEqual(env.env_int_value(path, "MISSING_KEY", 42), 42)
+
+    def test_env_int_value_parses_and_range_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("PORT=9000\nLEN=2\n", encoding="utf-8")
+            self.assertEqual(env.env_int_value(path, "PORT", 1, minimum=1, maximum=65535), 9000)
+            with self.assertRaisesRegex(RuntimeError, "Invalid LEN value: '2'; expected 4-32"):
+                env.env_int_value(path, "LEN", 8, minimum=4, maximum=32)
+
+    def test_env_int_value_rejects_non_integer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("PORT=nope\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Invalid PORT value: 'nope'"):
+                env.env_int_value(path, "PORT", 1, minimum=1, maximum=65535)
+
     def test_write_env_setting_replaces_existing_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"

@@ -252,9 +252,25 @@ events {{
 http {{
     include /etc/nginx/tokens.map;
 
+    # Rate-limit only invalid-token requests. A plain `return 403` inside the
+    # token locations would run in the rewrite phase, BEFORE limit_req's
+    # preaccess phase, so the limiter would never fire; instead invalid tokens
+    # are rewritten to an internal location whose `deny all` rejects in the
+    # access phase, which runs AFTER limit_req. Valid tokens never enter that
+    # location, so authenticated playback (with its bursty range requests
+    # during seeks) is never throttled.
+    limit_req_zone $binary_remote_addr zone=gateway_auth:1m rate=5r/s;
+    limit_req_zone $binary_remote_addr zone=gateway_admin:1m rate=10r/s;
     limit_req_zone $binary_remote_addr zone=gateway_fail:1m rate=5r/s;
 
-    log_format main '$remote_addr [$time_local] "$request" $status $body_bytes_sent';
+    # Mask the token path segment before it reaches the access log; the raw
+    # request line carries the gateway token (and any config blob after it).
+    map $request $request_masked {{
+        ~^(?<mrh>\\S+\\s/comet/)[A-Za-z0-9_-]+(?<mrt>\\S*) "${{mrh}}***${{mrt}}";
+        default $request;
+    }}
+
+    log_format main '$remote_addr [$time_local] "$request_masked" $status $body_bytes_sent';
     access_log /var/log/nginx/access.log main;
 
     map $http_x_forwarded_proto $pass_x_forwarded_proto {{
@@ -269,7 +285,7 @@ http {{
 
         location ~ "^/comet/(?<gateway_token>{token_re})(?<comet_uri>/.*)$" {{
             if ($token_valid = 0) {{
-                return 403;
+                rewrite ^ /__sg_invalid_token last;
             }}
 
             proxy_pass $comet_upstream$comet_uri$is_args$args;
@@ -289,11 +305,18 @@ http {{
         }}
 
         location ~ "^/comet/(?<gateway_token>{token_re})$" {{
-            if ($token_valid = 0) {{ return 403; }}
+            if ($token_valid = 0) {{ rewrite ^ /__sg_invalid_token last; }}
             return 301 $scheme://$host/comet/$gateway_token/;
         }}
 
+        location = /__sg_invalid_token {{
+            internal;
+            limit_req zone=gateway_auth burst=10 nodelay;
+            deny all;
+        }}
+
         location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$)|admin(?:/|$))" {{
+            limit_req zone=gateway_admin burst=20 nodelay;
             proxy_pass $comet_upstream$request_uri;
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
@@ -310,6 +333,7 @@ http {{
         }}
 
         location = / {{
+            limit_req zone=gateway_admin burst=20 nodelay;
             proxy_pass $comet_upstream$request_uri;
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
@@ -335,8 +359,10 @@ http {{
 
     def write_nginx_configs(self) -> None:
         ensure_directory(self.config.state_dir)
-        self.config.nginx_conf_file.write_text(self.render_nginx_conf(), encoding="utf-8")
-        self.config.tokens_map_file.write_text(self.render_tokens_map(), encoding="utf-8")
+        # These files carry live gateway tokens; write them atomically at 0600
+        # (the nginx container runs as root and can still read the bind mounts).
+        atomic_write_text(self.config.nginx_conf_file, self.render_nginx_conf(), mode=0o600)
+        atomic_write_text(self.config.tokens_map_file, self.render_tokens_map(), mode=0o600)
 
     # ── Compose lifecycle ──────────────────────────────────────────
 

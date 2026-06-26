@@ -269,8 +269,22 @@ class WatchdogCliTests(unittest.TestCase):
             b"uv\x00--cache-dir\x00/tmp/.uv-cache\x00run\x00python\x00-m\x00"
             b"stremioguard.orchestrator\x00watchdog\x00"
         )
-        with mock.patch.object(Path, "read_bytes", return_value=cmdline):
+        with (
+            mock.patch.object(Path, "read_bytes", return_value=cmdline),
+            mock.patch.object(watchdog_mod.os, "readlink", return_value=str(watchdog_mod.ROOT_DIR)),
+        ):
             self.assertTrue(watchdog_mod._pid_is_our_watchdog(123))
+
+    def test_pid_is_our_watchdog_rejects_process_outside_repo(self) -> None:
+        cmdline = (
+            b"uv\x00--cache-dir\x00/tmp/.uv-cache\x00run\x00python\x00-m\x00"
+            b"stremioguard.orchestrator\x00watchdog\x00"
+        )
+        with (
+            mock.patch.object(Path, "read_bytes", return_value=cmdline),
+            mock.patch.object(watchdog_mod.os, "readlink", return_value="/some/other/dir"),
+        ):
+            self.assertFalse(watchdog_mod._pid_is_our_watchdog(123))
 
     def test_watchdog_pids_finds_orphaned_watchdog_without_pid_file(self) -> None:
         proc_entries = [Path("/proc/111"), Path("/proc/222"), Path("/proc/sys")]

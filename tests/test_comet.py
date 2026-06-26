@@ -401,7 +401,8 @@ class CometManagerTests(unittest.TestCase):
             )
             manager = CometManager(cfg, FakeRunner({}))
             rendered = manager.render_runtime_env()
-            self.assertIn("DATABASE_URL=comet:comet@127.0.0.1:5432/comet", rendered)
+            self.assertIn("DATABASE_URL=comet:", rendered)
+            self.assertIn("@127.0.0.1:5432/comet", rendered)
             self.assertIn("PUBLIC_BASE_URL=https://comet.example.com", rendered)
             self.assertIn("CONFIGURE_PAGE_PASSWORD=cfg-password", rendered)
             self.assertIn("PROXY_DEBRID_STREAM=True", rendered)
@@ -429,6 +430,47 @@ class CometManagerTests(unittest.TestCase):
             manager = CometManager(cfg, FakeRunner({}))
             rendered = manager.render_runtime_env()
             self.assertIn("PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY=", rendered)
+
+    def test_write_runtime_env_generates_consistent_postgres_password(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_comet_config(tmp_path)
+            manager = CometManager(cfg, FakeRunner({}))
+            manager.write_runtime_env()
+
+            postgres_env = manager.postgres_env_file()
+            self.assertTrue(postgres_env.exists())
+            self.assertEqual(postgres_env.stat().st_mode & 0o777, 0o600)
+            password = env_file_value(postgres_env, "POSTGRES_PASSWORD")
+            self.assertIsNotNone(password)
+            assert password is not None
+            self.assertNotEqual(password, "comet")
+            # DATABASE_URL in the runtime env must use the same generated password.
+            runtime = cfg.runtime_env_file.read_text(encoding="utf-8")
+            self.assertIn(f"DATABASE_URL=comet:{password}@127.0.0.1:5432/comet", runtime)
+
+    def test_resolve_postgres_password_reuses_existing_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_comet_config(tmp_path)
+            manager = CometManager(cfg, FakeRunner({}))
+            manager._write_postgres_env("preset-password")
+            self.assertEqual(manager._resolve_postgres_password(), "preset-password")
+
+    def test_resolve_postgres_password_keeps_legacy_when_data_dir_predates_env(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_comet_config(tmp_path)
+            # Simulate a legacy data dir initialized before postgres.env existed.
+            cfg.postgres_data_dir.mkdir(parents=True, exist_ok=True)
+            (cfg.postgres_data_dir / "PG_VERSION").write_text("18\n", encoding="utf-8")
+            manager = CometManager(cfg, FakeRunner({}))
+            with mock.patch.object(manager, "warn") as warn:
+                first = manager._resolve_postgres_password()
+                second = manager._resolve_postgres_password()
+            self.assertEqual(first, "comet")
+            self.assertEqual(second, "comet")
+            warn.assert_called_once()
 
     def test_write_stack_override_mounts_runtime_files_through_root_override(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

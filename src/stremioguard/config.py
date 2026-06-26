@@ -11,11 +11,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from stremioguard.env import env_file_value, env_flag_enabled
+from stremioguard.env import (
+    DEFAULT_STREMIO_CONTAINER_PORT,
+    DEFAULT_STREMIO_HOST_PORT,
+    env_file_value,
+    env_flag_enabled,
+    env_int_value,
+)
 
 GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
-DEFAULT_STREMIO_HOST_PORT = 11470
-DEFAULT_STREMIO_CONTAINER_PORT = 11470
 DEFAULT_COMET_HOST_PORT = 18000
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
 
@@ -151,19 +155,6 @@ class Config:
         )
 
 
-def _parse_port(raw: str | None, *, key: str, default: int) -> int:
-    if raw in {None, ""}:
-        return default
-    assert raw is not None
-    try:
-        port = int(raw)
-    except ValueError as error:
-        raise RuntimeError(f"Invalid {key} value: {raw!r}") from error
-    if not 1 <= port <= 65535:
-        raise RuntimeError(f"Invalid {key} value: {raw!r}; expected 1-65535")
-    return port
-
-
 def _validate_public_url(value: str | None, *, key: str) -> None:
     if not value:
         return
@@ -236,54 +227,34 @@ class CometConfig:
     def from_env(cls, root_dir: Path | None = None) -> CometConfig:
         root_dir = root_dir or Path(__file__).resolve().parent.parent.parent
         env_file = root_dir / ".env"
-        raw_host_port = env_file_value(env_file, "COMET_HOST_PORT")
-        host_port = DEFAULT_COMET_HOST_PORT
-        if raw_host_port not in {None, ""}:
-            assert raw_host_port is not None
-            try:
-                host_port = int(raw_host_port)
-            except ValueError as error:
-                raise RuntimeError(f"Invalid COMET_HOST_PORT value: {raw_host_port!r}") from error
-            if host_port < 1 or host_port > 65535:
-                raise RuntimeError(
-                    f"Invalid COMET_HOST_PORT value: {raw_host_port!r}; expected 1-65535"
-                )
-
-        stremio_host_port = _parse_port(
-            env_file_value(env_file, "STREMIO_HOST_PORT"),
-            key="STREMIO_HOST_PORT",
-            default=DEFAULT_STREMIO_HOST_PORT,
+        host_port = env_int_value(
+            env_file, "COMET_HOST_PORT", DEFAULT_COMET_HOST_PORT, minimum=1, maximum=65535
         )
-        stremio_container_port = _parse_port(
-            env_file_value(env_file, "STREMIO_CONTAINER_PORT"),
-            key="STREMIO_CONTAINER_PORT",
-            default=DEFAULT_STREMIO_CONTAINER_PORT,
+        stremio_host_port = env_int_value(
+            env_file, "STREMIO_HOST_PORT", DEFAULT_STREMIO_HOST_PORT, minimum=1, maximum=65535
         )
-        gateway_host_port = _parse_port(
-            env_file_value(env_file, "COMET_GATEWAY_HOST_PORT"),
-            key="COMET_GATEWAY_HOST_PORT",
-            default=DEFAULT_COMET_GATEWAY_HOST_PORT,
+        stremio_container_port = env_int_value(
+            env_file,
+            "STREMIO_CONTAINER_PORT",
+            DEFAULT_STREMIO_CONTAINER_PORT,
+            minimum=1,
+            maximum=65535,
+        )
+        gateway_host_port = env_int_value(
+            env_file,
+            "COMET_GATEWAY_HOST_PORT",
+            DEFAULT_COMET_GATEWAY_HOST_PORT,
+            minimum=1,
+            maximum=65535,
         )
         comet_enabled = env_flag_enabled("COMET_ENABLED", False, env_path=env_file)
         gateway_enabled = env_flag_enabled(
             "COMET_GATEWAY_ENABLED", comet_enabled, env_path=env_file
         )
         gateway_public_base_url = env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL") or None
-        raw_gateway_token_length = env_file_value(env_file, "COMET_GATEWAY_TOKEN_LENGTH")
-        gateway_token_length = 8
-        if raw_gateway_token_length not in {None, ""}:
-            assert raw_gateway_token_length is not None
-            try:
-                gateway_token_length = int(raw_gateway_token_length)
-            except ValueError as error:
-                raise RuntimeError(
-                    f"Invalid COMET_GATEWAY_TOKEN_LENGTH value: {raw_gateway_token_length!r}"
-                ) from error
-            if not 4 <= gateway_token_length <= 32:
-                raise RuntimeError(
-                    f"Invalid COMET_GATEWAY_TOKEN_LENGTH value: {raw_gateway_token_length!r}; "
-                    "expected 4-32"
-                )
+        gateway_token_length = env_int_value(
+            env_file, "COMET_GATEWAY_TOKEN_LENGTH", 8, minimum=4, maximum=32
+        )
         public_base_url = env_file_value(env_file, "COMET_PUBLIC_BASE_URL") or None
         _validate_public_url(public_base_url, key="COMET_PUBLIC_BASE_URL")
         _validate_public_url(
@@ -315,32 +286,10 @@ class CometConfig:
             raise RuntimeError("COMET_GATEWAY_ENABLED requires COMET_ENABLED=1")
 
         proxy_debrid_stream = env_flag_enabled("COMET_PROXY_DEBRID_STREAM", True, env_path=env_file)
-        proxy_max_connections_raw = env_file_value(env_file, "COMET_PROXY_MAX_CONNECTIONS")
-        proxy_max_connections = -1
-        if proxy_max_connections_raw not in {None, ""}:
-            assert proxy_max_connections_raw is not None
-            try:
-                proxy_max_connections = int(proxy_max_connections_raw)
-            except ValueError as error:
-                raise RuntimeError(
-                    f"Invalid COMET_PROXY_MAX_CONNECTIONS value: {proxy_max_connections_raw!r}"
-                ) from error
-        healthcheck_interval_raw = env_file_value(env_file, "COMET_HEALTHCHECK_INTERVAL_SECONDS")
-        healthcheck_interval_seconds = 300
-        if healthcheck_interval_raw not in {None, ""}:
-            assert healthcheck_interval_raw is not None
-            try:
-                healthcheck_interval_seconds = int(healthcheck_interval_raw)
-            except ValueError as error:
-                raise RuntimeError(
-                    "Invalid COMET_HEALTHCHECK_INTERVAL_SECONDS value: "
-                    f"{healthcheck_interval_raw!r}"
-                ) from error
-            if healthcheck_interval_seconds < 1:
-                raise RuntimeError(
-                    "Invalid COMET_HEALTHCHECK_INTERVAL_SECONDS value: "
-                    f"{healthcheck_interval_raw!r}; expected >= 1"
-                )
+        proxy_max_connections = env_int_value(env_file, "COMET_PROXY_MAX_CONNECTIONS", -1)
+        healthcheck_interval_seconds = env_int_value(
+            env_file, "COMET_HEALTHCHECK_INTERVAL_SECONDS", 300, minimum=1
+        )
         configure_page_password = env_file_value(env_file, "COMET_CONFIGURE_PAGE_PASSWORD") or None
         scrape_torrentio = (env_file_value(env_file, "COMET_SCRAPE_TORRENTIO") or "live").strip()
         torrentio_url = (
