@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import subprocess
 import time
 import urllib.error
 import urllib.request
+from enum import Enum
 
 from loguru import logger
 
@@ -23,9 +25,15 @@ from stremioguard.config import (
 )
 from stremioguard.env import env_file_value, env_int_value
 from stremioguard.preflight import require_docker, verify_bind_addresses
-from stremioguard.publishing import render_stack_compose_override
+from stremioguard.publishing import ensure_gluetun_auth_config, render_stack_compose_override
 
 HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
+
+
+class PublicIPAssessment(Enum):
+    SAFE = "SAFE"
+    UNSAFE_DEFINITIVE = "UNSAFE_DEFINITIVE"
+    UNKNOWN = "UNKNOWN"
 
 
 class GluetunGuard:
@@ -35,6 +43,8 @@ class GluetunGuard:
         self._env_path = self.config.root_dir / ".env"
         self.last_observed_ip: str | None = None
         self._warned_stale_home_ip = False
+        self._control_server_failed = False
+        self._last_crosscheck_time = 0.0
 
     def log(self, message: str) -> None:
         logger.info(message)
@@ -104,6 +114,7 @@ class GluetunGuard:
                 if comet_config.enabled and comet_gateway_config.enabled
                 else None
             ),
+            gluetun_auth_config_file=ensure_gluetun_auth_config(self.config.root_dir),
         )
         self.config.compose_override_file.parent.mkdir(parents=True, exist_ok=True)
         self.config.compose_override_file.write_text(content, encoding="utf-8")
@@ -260,30 +271,101 @@ class GluetunGuard:
                     return ip
         return None
 
-    def public_ip_safe(self, *, log_observation: bool = False) -> bool:
-        ip = self.public_ip_via_gluetun()
-        if not ip:
-            self.warn("Could not determine public IP via gluetun.")
-            return False
+    def public_ip_via_control_server(self) -> str | None:
+        if self._control_server_failed:
+            return None
+
+        container_id = self.service_container_id("gluetun")
+        if not container_id:
+            return None
+
+        # No -q: quiet mode suppresses the HTTP status line on stderr, which is
+        # the only way to distinguish an auth/route failure (permanent) from a
+        # transient one. The response body still arrives alone on stdout.
+        result = self.runner.run(
+            [
+                "docker",
+                "exec",
+                container_id,
+                "wget",
+                "-O-",
+                "--timeout",
+                str(self.config.public_ip_timeout_seconds),
+                "http://127.0.0.1:18080/v1/publicip/ip",
+            ],
+            check=False,
+            timeout=self.config.public_ip_timeout_seconds + 2,
+        )
+
+        if result.returncode != 0:
+            output = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+            # GNU wget exits 6 on auth failure; busybox wget always exits 1 but
+            # prints the status line, so match the text as well.
+            if result.returncode == 6 or "401" in output or "404" in output:
+                self.warn(
+                    "Gluetun control server rejected the public-IP route (auth is "
+                    "required on gluetun v3.40+). StremioGuard mounts "
+                    ".stremio/gluetun-auth.toml to allow it; run `./stremio restart` "
+                    "so gluetun picks it up. Using external IP probes for this run."
+                )
+                self._control_server_failed = True
+            return None
+
+        body = (result.stdout or "").strip()
+        if not body:
+            return None
+
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict) and "public_ip" in data:
+                return parse_public_ip(str(data["public_ip"]))
+        except json.JSONDecodeError:
+            pass
+
+        return None
+
+    def public_ip_assessment(self, *, log_observation: bool = False) -> PublicIPAssessment:
+        control_ip = self.public_ip_via_control_server()
+        resolved_ip = control_ip
+
+        if not control_ip:
+            resolved_ip = self.public_ip_via_gluetun()
+            if not resolved_ip:
+                self.warn("Could not determine public IP via gluetun or control server.")
+                return PublicIPAssessment.UNKNOWN
+        else:
+            now = time.monotonic()
+            if now - self._last_crosscheck_time >= self.config.ip_crosscheck_interval_seconds:
+                self._last_crosscheck_time = now
+                external_ip = self.public_ip_via_gluetun()
+                if external_ip and external_ip != control_ip:
+                    self.warn(
+                        f"IP mismatch detected during cross-check: control server IP={control_ip}, "
+                        f"external probe IP={external_ip}. Threat vector possible, marking unsafe."
+                    )
+                    return PublicIPAssessment.UNSAFE_DEFINITIVE
 
         if log_observation:
-            self.log(f"Observed public IP: {ip}")
-        elif self.last_observed_ip and self.last_observed_ip != ip:
-            self.log(f"Public IP changed from {self.last_observed_ip} to {ip}.")
-        self.last_observed_ip = ip
+            self.log(f"Observed public IP: {resolved_ip}")
+        elif self.last_observed_ip and self.last_observed_ip != resolved_ip:
+            self.log(f"Public IP changed from {self.last_observed_ip} to {resolved_ip}.")
+        self.last_observed_ip = resolved_ip
 
-        if self.config.expected_vpn_ip and ip != self.config.expected_vpn_ip:
+        if self.config.expected_vpn_ip and resolved_ip != self.config.expected_vpn_ip:
             self.warn(f"Public IP does not match EXPECTED_VPN_IP={self.config.expected_vpn_ip}.")
-            return False
+            return PublicIPAssessment.UNSAFE_DEFINITIVE
 
         if self.config.home_ip_file.exists():
             self._warn_if_home_ip_stale()
             home_ip = self.config.home_ip_file.read_text(encoding="utf-8").strip()
-            if home_ip and ip == home_ip:
+            if home_ip and resolved_ip == home_ip:
                 self.warn(f"Public IP matches saved home IP baseline ({home_ip}); possible leak.")
-                return False
+                return PublicIPAssessment.UNSAFE_DEFINITIVE
 
-        return True
+        return PublicIPAssessment.SAFE
+
+    def public_ip_safe(self, *, log_observation: bool = False) -> bool:
+        return self.public_ip_assessment(log_observation=log_observation) == PublicIPAssessment.SAFE
 
     def home_ip_age_seconds(self) -> float | None:
         if not self.config.home_ip_file.exists():

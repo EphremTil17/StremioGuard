@@ -85,6 +85,30 @@ def docker_daemon_help(runner: Runner) -> str | None:
     return docker_permission_help(detail)
 
 
+def _tunable_int(env_file: Path, key: str, default: int, *, minimum: int = 1) -> int:
+    """Read a watchdog tunable from the environment or .env, first match wins.
+
+    Accepts both the STREMIO_-prefixed and bare names so `KEY=5 ./stremio start`
+    and a persistent .env line both work.
+    """
+    raw = (
+        os.environ.get(f"STREMIO_{key}")
+        or os.environ.get(key)
+        or env_file_value(env_file, f"STREMIO_{key}")
+        or env_file_value(env_file, key)
+    )
+    if raw in {None, ""}:
+        return default
+    assert raw is not None
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"Invalid {key} value: {raw!r}") from error
+    if value < minimum:
+        raise RuntimeError(f"Invalid {key} value: {raw!r}; expected >= {minimum}")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     root_dir: Path
@@ -105,6 +129,8 @@ class Config:
     log_file: Path | None
     log_session: bool
     stremio_enabled: bool
+    ip_crosscheck_interval_seconds: int
+    public_ip_failure_threshold: int
 
     @classmethod
     def from_env(cls) -> Config:
@@ -120,6 +146,7 @@ class Config:
 
         run_id = os.environ.get("STREMIO_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
         log_file = os.environ.get("STREMIO_LOG_FILE")
+
         return cls(
             root_dir=root_dir,
             compose_file=Path(os.environ.get("COMPOSE_FILE", root_dir / "docker-compose.yml")),
@@ -152,6 +179,10 @@ class Config:
                 ).split(",")
                 if url.strip()
             ),
+            ip_crosscheck_interval_seconds=_tunable_int(
+                env_file, "IP_CROSSCHECK_INTERVAL_SECONDS", 300
+            ),
+            public_ip_failure_threshold=_tunable_int(env_file, "PUBLIC_IP_FAILURE_THRESHOLD", 3),
         )
 
 
