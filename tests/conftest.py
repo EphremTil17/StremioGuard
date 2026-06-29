@@ -79,6 +79,8 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
         "log_file": None,
         "log_session": True,
         "stremio_enabled": True,
+        "ip_crosscheck_interval_seconds": 300,
+        "public_ip_failure_threshold": 3,
     }
     values.update(overrides)
     return Config(**values)  # type: ignore[arg-type]

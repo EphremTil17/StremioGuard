@@ -12,7 +12,7 @@ from unittest import mock
 from stremioguard import config as config_mod
 from stremioguard import guard as guard_mod
 from stremioguard import preflight as preflight_mod
-from stremioguard.guard import GluetunGuard
+from stremioguard.guard import GluetunGuard, PublicIPAssessment
 
 from .conftest import FakeRunner, completed, make_config
 
@@ -346,6 +346,119 @@ class GluetunGuardTests(unittest.TestCase):
                 guard.check_bind_addresses()
             self.assertIn("Configured bind IP 100.0.0.5 is missing", str(ctx.exception))
             self.assertIn("check tailscaled / tailscale status", str(ctx.exception))
+
+    def test_public_ip_via_control_server_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cmd = [
+                "docker",
+                "exec",
+                "gluetun-id",
+                "wget",
+                "-O-",
+                "--timeout",
+                "1",
+                "http://127.0.0.1:18080/v1/publicip/ip",
+            ]
+            runner = FakeRunner({tuple(cmd): completed(cmd, '{"public_ip": "203.0.113.5"}')})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            with mock.patch.object(guard, "service_container_id", return_value="gluetun-id"):
+                ip = guard.public_ip_via_control_server()
+            self.assertEqual(ip, "203.0.113.5")
+            self.assertFalse(guard._control_server_failed)
+
+    def test_public_ip_via_control_server_401_permanent_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cmd = [
+                "docker",
+                "exec",
+                "gluetun-id",
+                "wget",
+                "-O-",
+                "--timeout",
+                "1",
+                "http://127.0.0.1:18080/v1/publicip/ip",
+            ]
+            # BusyBox wget shape: exit 1 with the status line on stderr.
+            runner = FakeRunner(
+                {
+                    tuple(cmd): completed(
+                        cmd,
+                        stdout="",
+                        stderr="wget: server returned error: HTTP/1.1 401 Unauthorized\n",
+                        returncode=1,
+                    )
+                }
+            )
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            with mock.patch.object(guard, "service_container_id", return_value="gluetun-id"):
+                ip = guard.public_ip_via_control_server()
+            self.assertIsNone(ip)
+            self.assertTrue(guard._control_server_failed)
+
+    def test_public_ip_via_control_server_gnu_wget_exit6_permanent_fallback(self) -> None:
+        # GNU wget exits 6 on auth failure; detection must not depend on stderr
+        # text, which -q used to suppress entirely (the original Phase 1 bug).
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cmd = [
+                "docker",
+                "exec",
+                "gluetun-id",
+                "wget",
+                "-O-",
+                "--timeout",
+                "1",
+                "http://127.0.0.1:18080/v1/publicip/ip",
+            ]
+            runner = FakeRunner({tuple(cmd): completed(cmd, stdout="", returncode=6)})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            with mock.patch.object(guard, "service_container_id", return_value="gluetun-id"):
+                ip = guard.public_ip_via_control_server()
+            self.assertIsNone(ip)
+            self.assertTrue(guard._control_server_failed)
+
+    def test_public_ip_via_control_server_transient_error_keeps_retrying(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cmd = [
+                "docker",
+                "exec",
+                "gluetun-id",
+                "wget",
+                "-O-",
+                "--timeout",
+                "1",
+                "http://127.0.0.1:18080/v1/publicip/ip",
+            ]
+            runner = FakeRunner(
+                {
+                    tuple(cmd): completed(
+                        cmd, stdout="", stderr="wget: can't connect to remote host\n", returncode=1
+                    )
+                }
+            )
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            with mock.patch.object(guard, "service_container_id", return_value="gluetun-id"):
+                ip = guard.public_ip_via_control_server()
+            self.assertIsNone(ip)
+            self.assertFalse(guard._control_server_failed)
+
+    def test_public_ip_assessment_crosscheck_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            guard = GluetunGuard(
+                make_config(tmp_path, ip_crosscheck_interval_seconds=0), FakeRunner({})
+            )
+            with (
+                mock.patch.object(
+                    guard, "public_ip_via_control_server", return_value="203.0.113.5"
+                ),
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value="198.51.100.10"),
+            ):
+                assessment = guard.public_ip_assessment()
+            self.assertEqual(assessment, PublicIPAssessment.UNSAFE_DEFINITIVE)
 
 
 if __name__ == "__main__":

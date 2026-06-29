@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from stremioguard import guard as guard_mod
-from stremioguard.guard import GluetunGuard
+from stremioguard.guard import GluetunGuard, PublicIPAssessment
 from stremioguard.orchestrator import Orchestrator
 
 from .conftest import (
@@ -93,7 +93,9 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=True),
-                mock.patch.object(guard, "public_ip_safe", return_value=False),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNSAFE_DEFINITIVE
+                ),
             ):
                 orch.watch_once()
 
@@ -109,7 +111,9 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=True),
-                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                ),
                 mock.patch.object(guard, "container_running", return_value=False),
             ):
                 orch.watch_once()
@@ -125,7 +129,9 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=True),
-                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                ),
                 mock.patch.object(guard, "container_running", return_value=True),
                 mock.patch.object(guard, "log") as log_mock,
             ):
@@ -147,7 +153,9 @@ class OrchestratorTests(unittest.TestCase):
             with (
                 mock.patch.object(guard_mod.time, "monotonic", return_value=16.0),
                 mock.patch.object(guard, "gluetun_healthy", return_value=True),
-                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                ),
                 mock.patch.object(guard, "container_running", return_value=True),
                 mock.patch.object(guard, "log") as log_mock,
             ):
@@ -281,7 +289,9 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=True),
-                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                ),
                 mock.patch.object(guard, "container_running", return_value=False),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
@@ -299,6 +309,96 @@ class OrchestratorTests(unittest.TestCase):
                 [*prefix, "up", "-d", "comet", "comet-postgres", "comet-gateway"], runner.calls
             )
             self.assertNotIn([*prefix, "up", "-d", "stremio"], runner.calls)
+
+    def test_watch_once_unknown_debounce(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path, public_ip_failure_threshold=3), runner)
+            orch = Orchestrator(guard)
+
+            # 1st UNKNOWN: should warn but NOT stop stremio
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN
+                ),
+            ):
+                orch.watch_once()
+
+            prefix = compose_args_prefix(tmp_path)
+            self.assertNotIn([*prefix, "stop", "stremio"], runner.calls)
+            self.assertEqual(orch.consecutive_ip_unknowns, 1)
+
+            # 2nd UNKNOWN: should warn but NOT stop stremio
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN
+                ),
+            ):
+                orch.watch_once()
+            self.assertNotIn([*prefix, "stop", "stremio"], runner.calls)
+            self.assertEqual(orch.consecutive_ip_unknowns, 2)
+
+            # 3rd UNKNOWN: should stop stremio
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN
+                ),
+            ):
+                orch.watch_once()
+            self.assertIn([*prefix, "stop", "stremio"], runner.calls)
+            self.assertEqual(orch.consecutive_ip_unknowns, 3)
+
+    def test_watch_once_unsafe_stops_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            orch = Orchestrator(guard)
+
+            # 1st UNSAFE: should stop stremio immediately
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNSAFE_DEFINITIVE
+                ),
+            ):
+                orch.watch_once()
+
+            prefix = compose_args_prefix(tmp_path)
+            self.assertIn([*prefix, "stop", "stremio"], runner.calls)
+            self.assertEqual(orch.consecutive_ip_unknowns, 0)
+
+    def test_watch_stremio_loop_exception_survival(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            orch = Orchestrator(guard)
+
+            call_count = 0
+
+            def mock_watch_once():
+                nonlocal call_count
+                call_count += 1
+                if call_count <= 3:
+                    raise RuntimeError("Transient loop error")
+                raise KeyboardInterrupt("Stop loop")
+
+            with (
+                mock.patch.object(orch, "watch_once", side_effect=mock_watch_once),
+                mock.patch("stremioguard.orchestrator.time.sleep", side_effect=lambda s: None),
+                mock.patch.object(guard, "stop_active_services") as stop_mock,
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                orch.watch_stremio()
+
+            self.assertEqual(orch.consecutive_loop_errors, 3)
+            self.assertEqual(orch.loop_error_count, 3)
+            stop_mock.assert_called_once()
 
 
 if __name__ == "__main__":

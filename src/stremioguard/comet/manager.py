@@ -29,7 +29,7 @@ from stremioguard.config import (
 from stremioguard.env import atomic_write_text, ensure_directory, env_file_value, env_flag_enabled
 from stremioguard.overrides import write_override_bundle
 from stremioguard.preflight import require_docker, verify_bind_addresses
-from stremioguard.publishing import render_stack_compose_override
+from stremioguard.publishing import ensure_gluetun_auth_config, render_stack_compose_override
 
 
 class CometManager:
@@ -141,6 +141,7 @@ class CometManager:
             stremio_enabled=stremio_enabled,
             comet_config=self.config,
             comet_gateway_config=gateway_config if gateway_config.enabled else None,
+            gluetun_auth_config_file=ensure_gluetun_auth_config(self.config.root_dir),
         )
         root_override = self.root_override_file()
         root_override.parent.mkdir(parents=True, exist_ok=True)

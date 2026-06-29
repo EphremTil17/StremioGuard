@@ -12,7 +12,7 @@ import typer
 from loguru import logger
 
 from stremioguard.config import Config, docker_daemon_help, docker_permission_help
-from stremioguard.guard import GluetunGuard
+from stremioguard.guard import GluetunGuard, PublicIPAssessment
 
 app = typer.Typer(
     help="Guard Stremio behind the gluetun VPN container.",
@@ -44,6 +44,10 @@ class Orchestrator:
         self.container_missing_since_summary = 0
         self.vpn_drops_since_summary = 0
         self.public_ip_failures_since_summary = 0
+        self.consecutive_loop_errors = 0
+        self.consecutive_ip_unknowns = 0
+        self.loop_error_count = 0
+        self.loop_errors_since_summary = 0
         if self.guard.config.log_session:
             self._log_session_start()
 
@@ -107,7 +111,25 @@ class Orchestrator:
             f"every {self.guard.config.watch_interval_seconds}s."
         )
         while True:
-            self.watch_once()
+            try:
+                self.watch_once()
+                self.consecutive_loop_errors = 0
+            except Exception:
+                logger.exception("Watchdog loop iteration encountered an error.")
+                self.consecutive_loop_errors += 1
+                self.loop_error_count += 1
+                self.loop_errors_since_summary += 1
+                if self.consecutive_loop_errors >= 3:
+                    self.guard.warn(
+                        f"Watchdog has encountered {self.consecutive_loop_errors} consecutive "
+                        "loop errors. Attempting to stop active services to fail closed."
+                    )
+                    try:
+                        self.guard.stop_active_services()
+                    except Exception:
+                        logger.exception(
+                            "Failed to stop active services during loop error fallback."
+                        )
             time.sleep(self.guard.config.watch_interval_seconds)
 
     def watch_once(self) -> None:
@@ -123,21 +145,43 @@ class Orchestrator:
             self._maybe_log_summary()
             return
 
-        if not g.public_ip_safe():
+        assessment = g.public_ip_assessment()
+        if assessment == PublicIPAssessment.UNSAFE_DEFINITIVE:
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
-            g.warn("Public IP check failed. Stopping active services.")
+            g.warn("Definitive leak / unsafe IP detected. Stopping active services immediately.")
             self.public_ip_failure_count += 1
             self.public_ip_failures_since_summary += 1
+            self.consecutive_ip_unknowns = 0
             g.stop_active_services(services=services)
             self._maybe_log_summary()
             return
+        elif assessment == PublicIPAssessment.UNKNOWN:
+            self.consecutive_ip_unknowns += 1
+            limit = self.guard.config.public_ip_failure_threshold
+            g.warn(
+                f"Public IP check returned UNKNOWN "
+                f"({self.consecutive_ip_unknowns}/{limit} consecutive failures)."
+            )
+            if self.consecutive_ip_unknowns >= self.guard.config.public_ip_failure_threshold:
+                self.last_public_ip = g.last_observed_ip or self.last_public_ip
+                g.warn(
+                    f"Public IP check has failed {self.consecutive_ip_unknowns} consecutive times. "
+                    "Stopping active services to fail closed."
+                )
+                self.public_ip_failure_count += 1
+                self.public_ip_failures_since_summary += 1
+                g.stop_active_services(services=services)
+            self._maybe_log_summary()
+            return
+        else:
+            self.consecutive_ip_unknowns = 0
 
         self.last_public_ip = g.last_observed_ip or self.last_public_ip
 
         if not g.container_running(services=services):
             g.log("Gluetun healthy; starting active services.")
             self.auto_starts_since_summary += 1
-            g.compose("up", "-d", *services, capture=False)
+            g.compose("up", "-d", *services, check=False, capture=False)
 
         self._maybe_log_summary()
 
@@ -157,6 +201,7 @@ class Orchestrator:
             f"container_missing={self.container_missing_since_summary} "
             f"vpn_drops={self.vpn_drops_since_summary} "
             f"public_ip_failures={self.public_ip_failures_since_summary} "
+            f"loop_errors={self.loop_errors_since_summary} "
             f"uptime_seconds={self.elapsed_seconds()}"
         )
         self.summary_started_at = now
@@ -165,6 +210,7 @@ class Orchestrator:
         self.container_missing_since_summary = 0
         self.vpn_drops_since_summary = 0
         self.public_ip_failures_since_summary = 0
+        self.loop_errors_since_summary = 0
 
     def show_status(self) -> None:
         g = self.guard
