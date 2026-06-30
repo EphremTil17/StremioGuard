@@ -25,7 +25,7 @@ from stremioguard.config import (
 )
 from stremioguard.env import env_file_value, env_int_value
 from stremioguard.preflight import require_docker, verify_bind_addresses
-from stremioguard.publishing import ensure_gluetun_auth_config, render_stack_compose_override
+from stremioguard.publishing import StackPublisher
 
 HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
 
@@ -98,26 +98,8 @@ class GluetunGuard:
         )
 
     def write_compose_override(self) -> None:
-        addresses = self.bind_addresses()
-        host_port = self.stremio_host_port()
-        container_port = self.stremio_container_port()
-        comet_config = CometConfig.from_env(self.config.root_dir)
-        comet_gateway_config = CometGatewayConfig.from_env(self.config.root_dir)
-        content = render_stack_compose_override(
-            bind_addresses=addresses,
-            stremio_host_port=host_port,
-            stremio_container_port=container_port,
-            stremio_enabled=self.config.stremio_enabled,
-            comet_config=comet_config if comet_config.enabled else None,
-            comet_gateway_config=(
-                comet_gateway_config
-                if comet_config.enabled and comet_gateway_config.enabled
-                else None
-            ),
-            gluetun_auth_config_file=ensure_gluetun_auth_config(self.config.root_dir),
-        )
-        self.config.compose_override_file.parent.mkdir(parents=True, exist_ok=True)
-        self.config.compose_override_file.write_text(content, encoding="utf-8")
+        publisher = StackPublisher(self.config.root_dir, self.config.compose_override_file)
+        publisher.publish()
 
     def deployment_profile(self) -> str:
         comet_config = CometConfig.from_env(self.config.root_dir)
@@ -163,6 +145,13 @@ class GluetunGuard:
         )
 
     def compose(
+        self, *args: str, check: bool = True, capture: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        if not self.config.compose_override_file.exists():
+            self.write_compose_override()
+        return self.runner.run(self._compose_command(*args), check=check, capture=capture)
+
+    def compose_fresh(
         self, *args: str, check: bool = True, capture: bool = True
     ) -> subprocess.CompletedProcess[str]:
         self.write_compose_override()
@@ -408,7 +397,10 @@ class GluetunGuard:
             comet_manager.prepare_runtime()
 
         self.log("Ensuring the gluetun service is running.")
-        self.compose("up", "-d", "gluetun", capture=False)
+        # Lifecycle path: gluetun must come up against a freshly rendered
+        # override so bind/mount changes apply BEFORE the VPN is verified,
+        # not via a surprise dependency-recreate during the services `up`.
+        self.compose_fresh("up", "-d", "gluetun", capture=False)
         self.wait_for_gluetun_healthy()
         if not self.public_ip_safe(log_observation=True):
             raise RuntimeError("Public IP check failed via gluetun; refusing to start services.")
@@ -419,7 +411,8 @@ class GluetunGuard:
         self.log(f"Using Stremio data directory: {data_dir}")
 
     def compose_instance_exists(self) -> bool:
-        self.write_compose_override()
+        if not self.config.compose_override_file.exists():
+            self.write_compose_override()
         for service in self.enabled_runtime_services():
             result = self.runner.run(self._compose_command("ps", "-a", "-q", service), check=False)
             if bool((result.stdout or "").strip()):

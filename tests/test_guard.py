@@ -347,6 +347,27 @@ class GluetunGuardTests(unittest.TestCase):
             self.assertIn("Configured bind IP 100.0.0.5 is missing", str(ctx.exception))
             self.assertIn("check tailscaled / tailscale status", str(ctx.exception))
 
+    def test_preflight_brings_gluetun_up_with_fresh_override(self) -> None:
+        # Regression: gluetun must start against a freshly rendered override so
+        # bind/mount changes apply before the VPN is verified — a stale-file
+        # `compose()` here lets the later services `up` recreate gluetun AFTER
+        # the IP check already passed against the old container.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            with (
+                mock.patch.object(guard, "require_commands"),
+                mock.patch.object(guard, "check_bind_addresses"),
+                mock.patch.object(guard, "wait_for_gluetun_healthy"),
+                mock.patch.object(guard, "public_ip_safe", return_value=True),
+                mock.patch.object(guard, "compose") as compose_mock,
+                mock.patch.object(guard, "compose_fresh") as compose_fresh_mock,
+            ):
+                guard.preflight()
+            compose_fresh_mock.assert_called_once_with("up", "-d", "gluetun", capture=False)
+            compose_mock.assert_not_called()
+
     def test_public_ip_via_control_server_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)

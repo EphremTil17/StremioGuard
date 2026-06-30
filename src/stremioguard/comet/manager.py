@@ -26,10 +26,10 @@ from stremioguard.config import (
     Runner,
     SubprocessRunner,
 )
-from stremioguard.env import atomic_write_text, ensure_directory, env_file_value, env_flag_enabled
+from stremioguard.env import atomic_write_text, ensure_directory, env_file_value
 from stremioguard.overrides import write_override_bundle
 from stremioguard.preflight import require_docker, verify_bind_addresses
-from stremioguard.publishing import ensure_gluetun_auth_config, render_stack_compose_override
+from stremioguard.publishing import StackPublisher
 
 
 class CometManager:
@@ -133,19 +133,8 @@ class CometManager:
             patch_episode_pack_results=self.config.patch_episode_pack_results,
             gateway_addon_base_url=self.gateway_addon_base_url(),
         )
-        stremio_enabled = env_flag_enabled("STREMIO_ENABLED", True, env_path=self.config.env_file)
-        content = render_stack_compose_override(
-            bind_addresses=list(self.config.bind_addresses),
-            stremio_host_port=self.stremio_host_port(),
-            stremio_container_port=self.stremio_container_port(),
-            stremio_enabled=stremio_enabled,
-            comet_config=self.config,
-            comet_gateway_config=gateway_config if gateway_config.enabled else None,
-            gluetun_auth_config_file=ensure_gluetun_auth_config(self.config.root_dir),
-        )
-        root_override = self.root_override_file()
-        root_override.parent.mkdir(parents=True, exist_ok=True)
-        root_override.write_text(content, encoding="utf-8")
+        publisher = StackPublisher(self.config.root_dir, self.root_override_file())
+        publisher.publish()
 
     def postgres_env_file(self) -> Path:
         return self.config.state_dir / "postgres.env"
@@ -435,6 +424,13 @@ class CometManager:
     def compose(
         self, *args: str, check: bool = True, capture: bool = True
     ) -> subprocess.CompletedProcess[str]:
+        if not self.root_override_file().exists():
+            self.write_stack_override_file()
+        return self.runner.run(self._compose_command(*args), check=check, capture=capture)
+
+    def compose_fresh(
+        self, *args: str, check: bool = True, capture: bool = True
+    ) -> subprocess.CompletedProcess[str]:
         self.write_stack_override_file()
         return self.runner.run(self._compose_command(*args), check=check, capture=capture)
 
@@ -481,7 +477,7 @@ class CometManager:
         gateway_config = self.gateway_config()
         if gateway_config.enabled:
             services.append(gateway_config.service_name)
-        self.compose("up", "-d", *services, capture=False)
+        self.compose_fresh("up", "-d", *services, capture=False)
 
     def stop(self) -> None:
         self.require_commands()

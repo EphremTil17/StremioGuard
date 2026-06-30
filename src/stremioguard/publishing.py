@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 from stremioguard.comet_gateway import COMET_GATEWAY_CONTAINER_PORT, CometGatewayConfig
-from stremioguard.config import CometConfig
-from stremioguard.env import atomic_write_text
+from stremioguard.config import GENERATED_COMPOSE_FILE, CometConfig, parse_ipv4_csv
+from stremioguard.env import (
+    DEFAULT_STREMIO_CONTAINER_PORT,
+    DEFAULT_STREMIO_HOST_PORT,
+    atomic_write_text,
+    env_file_value,
+    env_flag_enabled,
+    env_int_value,
+)
 
 # Gluetun v3.40+ requires control-server auth for every route. This managed
 # role file re-opens only the read-only public-IP route the watchdog polls,
@@ -158,3 +166,62 @@ def render_stack_compose_override(
         )
 
     return "\n".join(content) + "\n"
+
+
+class StackPublisher:
+    """Single owner of the generated compose override: gathers inputs, renders,
+    and writes atomically. Both GluetunGuard and CometManager delegate here."""
+
+    def __init__(self, root_dir: Path, override_file: Path | None = None) -> None:
+        self.root_dir = root_dir
+        self.env_file = root_dir / ".env"
+        self.compose_override_file = override_file or root_dir / GENERATED_COMPOSE_FILE
+
+    def publish(self, *, image_override: str | None = None) -> None:
+        """Gather all config parameters, render the compose override, and write it atomically."""
+        # 1. Gather bind addresses
+        raw_bind = env_file_value(self.env_file, "STREMIO_BIND_ADDRS")
+        bind_addresses = parse_ipv4_csv(raw_bind, default=["127.0.0.1"])
+        if "0.0.0.0" in bind_addresses and len(bind_addresses) > 1:
+            raise RuntimeError(
+                "STREMIO_BIND_ADDRS cannot combine 0.0.0.0 with specific bind addresses"
+            )
+
+        # 2. Gather Stremio config parameters
+        stremio_enabled = env_flag_enabled("STREMIO_ENABLED", True, env_path=self.env_file)
+        stremio_host_port = env_int_value(
+            self.env_file, "STREMIO_HOST_PORT", DEFAULT_STREMIO_HOST_PORT, minimum=1, maximum=65535
+        )
+        stremio_container_port = env_int_value(
+            self.env_file,
+            "STREMIO_CONTAINER_PORT",
+            DEFAULT_STREMIO_CONTAINER_PORT,
+            minimum=1,
+            maximum=65535,
+        )
+
+        # 3. Gather Comet & Gateway configs
+        comet_config = CometConfig.from_env(self.root_dir)
+        comet_gateway_config = CometGatewayConfig.from_env(self.root_dir)
+
+        # Allow image override (Phase 4 preparation)
+        if image_override and comet_config.enabled:
+            comet_config = dataclasses.replace(comet_config, image=image_override)
+
+        # 5. Render
+        content = render_stack_compose_override(
+            bind_addresses=bind_addresses,
+            stremio_host_port=stremio_host_port,
+            stremio_container_port=stremio_container_port,
+            stremio_enabled=stremio_enabled,
+            comet_config=comet_config if comet_config.enabled else None,
+            comet_gateway_config=(
+                comet_gateway_config
+                if comet_config.enabled and comet_gateway_config.enabled
+                else None
+            ),
+            gluetun_auth_config_file=ensure_gluetun_auth_config(self.root_dir),
+        )
+
+        # 6. Write atomically
+        atomic_write_text(self.compose_override_file, content, mode=0o644)
