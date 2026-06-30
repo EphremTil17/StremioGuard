@@ -5,13 +5,20 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from stremioguard.publishing import (
+    StackPublisher,
     ensure_gluetun_auth_config,
     render_stack_compose_override,
 )
 
-from .conftest import make_comet_config, make_comet_gateway_config
+from .conftest import (
+    FakeRunner,
+    make_comet_config,
+    make_comet_gateway_config,
+    make_config,
+)
 
 
 class TestPublishingOverride(unittest.TestCase):
@@ -110,3 +117,79 @@ class TestGluetunAuthConfig(unittest.TestCase):
                 gluetun_auth_config_file=auth_file,
             )
             self.assertIn(f"- {auth_file}:/gluetun/auth/config.toml:ro", content)
+
+
+class TestStackPublisher(unittest.TestCase):
+    def test_stack_publisher_produces_identical_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Write a dummy .env
+            env_path = root / ".env"
+            env_path.write_text(
+                "STREMIO_BIND_ADDRS=10.0.0.1\nSTREMIO_ENABLED=1\nSTREMIO_HOST_PORT=11470\nSTREMIO_CONTAINER_PORT=11470\n",
+                encoding="utf-8",
+            )
+
+            # Run publisher
+            pub = StackPublisher(root)
+            # Mock CometConfig and CometGatewayConfig to be disabled
+            comet_cfg = make_comet_config(root, enabled=False)
+            gateway_cfg = make_comet_gateway_config(root, enabled=False)
+
+            with (
+                mock.patch("stremioguard.publishing.CometConfig.from_env", return_value=comet_cfg),
+                mock.patch(
+                    "stremioguard.publishing.CometGatewayConfig.from_env", return_value=gateway_cfg
+                ),
+            ):
+                pub.publish()
+
+            override_content = pub.compose_override_file.read_text(encoding="utf-8")
+
+            # Direct rendering
+            auth_file = ensure_gluetun_auth_config(root)
+            direct_content = render_stack_compose_override(
+                bind_addresses=["10.0.0.1"],
+                stremio_host_port=11470,
+                stremio_container_port=11470,
+                stremio_enabled=True,
+                comet_config=None,
+                comet_gateway_config=None,
+                gluetun_auth_config_file=auth_file,
+            )
+            self.assertEqual(override_content, direct_content)
+
+    def test_compose_read_only_versus_fresh_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Write a dummy .env
+            env_path = root / ".env"
+            env_path.write_text(
+                "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_ENABLED=1\n", encoding="utf-8"
+            )
+
+            from unittest import mock
+
+            from stremioguard.guard import GluetunGuard
+
+            runner = FakeRunner({})
+
+            # Create a mock config
+            cfg = make_config(root)
+            guard = GluetunGuard(cfg, runner)
+
+            # Generate the first compose override
+            guard.write_compose_override()
+            mtime_before = guard.config.compose_override_file.stat().st_mtime
+
+            # 1. Calling read-only compose does NOT rewrite the override file
+            # (publish is not called)
+            with mock.patch("stremioguard.publishing.StackPublisher.publish") as publish_mock:
+                guard.compose("ps", check=False)
+                publish_mock.assert_not_called()
+            self.assertEqual(guard.config.compose_override_file.stat().st_mtime, mtime_before)
+
+            # 2. Calling compose_fresh DOES call StackPublisher.publish
+            with mock.patch("stremioguard.publishing.StackPublisher.publish") as publish_mock:
+                guard.compose_fresh("up", "-d", check=False)
+                publish_mock.assert_called_once()

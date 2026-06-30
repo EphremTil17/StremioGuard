@@ -83,9 +83,9 @@ class Orchestrator:
             time.sleep(2)
         g.preflight()
         g.log(f"Building services: {', '.join(services)}.")
-        g.compose("build", *services, capture=False)
+        g.compose_fresh("build", *services, capture=False)
         g.log(f"Starting services: {', '.join(services)}.")
-        g.compose("up", "-d", *services, capture=False)
+        g.compose_fresh("up", "-d", *services, capture=False)
         g.success("Active services are running behind gluetun.")
 
     def start_active_services(self) -> None:
@@ -100,7 +100,7 @@ class Orchestrator:
         g.preflight()
         services = g.enabled_runtime_services()
         g.log(f"Starting services: {', '.join(services)}.")
-        g.compose("up", "-d", *services, capture=False)
+        g.compose_fresh("up", "-d", *services, capture=False)
         g.success("Active services are running behind gluetun.")
 
     def watch_stremio(self) -> None:
@@ -181,7 +181,7 @@ class Orchestrator:
         if not g.container_running(services=services):
             g.log("Gluetun healthy; starting active services.")
             self.auto_starts_since_summary += 1
-            g.compose("up", "-d", *services, check=False, capture=False)
+            g.compose_fresh("up", "-d", *services, check=False, capture=False)
 
         self._maybe_log_summary()
 

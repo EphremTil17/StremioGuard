@@ -194,7 +194,7 @@ def _validate_public_url(value: str | None, *, key: str) -> None:
         raise RuntimeError(f"Invalid {key} value: {value!r}; expected an absolute HTTP(S) URL")
 
 
-def _parse_ipv4_csv(raw: str | None, *, default: list[str]) -> list[str]:
+def parse_ipv4_csv(raw: str | None, *, default: list[str]) -> list[str]:
     if raw is None:
         return default
     values: list[str] = []
@@ -294,7 +294,7 @@ class CometConfig:
         )
 
         bind_addresses = tuple(
-            _parse_ipv4_csv(
+            parse_ipv4_csv(
                 env_file_value(env_file, "STREMIO_BIND_ADDRS"),
                 default=["127.0.0.1"],
             )
