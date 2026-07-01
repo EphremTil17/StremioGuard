@@ -4,7 +4,7 @@ version = "0.2.0"
 requires-python = ">=3.12"
 dependencies = [
     "loguru>=0.7.3",
-    "typer>=0.26.7",
+    "typer>=0.26.8",
 ]
 
 [build-system]
@@ -16,9 +16,9 @@ packages = ["src/stremioguard"]
 
 [dependency-groups]
 dev = [
-    "pyright>=1.1.410",
-    "pytest>=9.1.0",
-    "ruff>=0.15.17",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
 ]
 
 [tool.pytest.ini_options]
