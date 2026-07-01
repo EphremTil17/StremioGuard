@@ -17,6 +17,7 @@ from stremioguard.comet import CometManager
 from stremioguard.comet import manager as manager_mod
 from stremioguard.comet_gateway import CometGatewayConfig, CometGatewayManager
 from stremioguard.env import env_file_value
+from stremioguard.overrides import write_override_bundle
 from stremioguard.publishing import render_stack_compose_override
 
 from .conftest import FakeRunner, completed, make_comet_config, make_config
@@ -488,6 +489,18 @@ class CometManagerTests(unittest.TestCase):
             _, token_value = gateway.add_token("Shared Addon")
             _write_upstream_patch_sources(cfg)
             manager = CometManager(cfg, FakeRunner({}))
+            # Bundle generation now lives in prepare_runtime (image-source);
+            # render here explicitly from the fixture sources, then publish.
+            write_override_bundle(
+                repo_dir=cfg.repo_dir,
+                state_dir=cfg.state_dir,
+                result_format_style=cfg.result_format_style,
+                patch_episode_pack_results=cfg.patch_episode_pack_results,
+                gateway_addon_base_url=manager.gateway_addon_base_url(),
+                gateway_enabled=True,
+                image_digest="sha256:test",
+                patch_fingerprint="fp-test",
+            )
             manager.write_stack_override_file()
             root_override = tmp_path / ".stremio" / "docker-compose.bindings.yml"
             content = root_override.read_text(encoding="utf-8")
@@ -621,11 +634,26 @@ class CometManagerTests(unittest.TestCase):
             tmp_path = Path(directory)
             make_config(tmp_path)
             cfg = make_comet_config(tmp_path, patch_episode_pack_results=False)
+            (tmp_path / ".env").write_text(
+                "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=0\nCOMET_PATCH_EPISODE_PACK_RESULTS=0\n",
+                encoding="utf-8",
+            )
             _write_upstream_patch_sources(cfg)
             manager = CometManager(cfg, FakeRunner({}))
+            write_override_bundle(
+                repo_dir=cfg.repo_dir,
+                state_dir=cfg.state_dir,
+                result_format_style=cfg.result_format_style,
+                patch_episode_pack_results=False,
+                gateway_addon_base_url=None,
+                image_digest="sha256:test",
+                patch_fingerprint="fp-test",
+            )
             manager.write_stack_override_file()
             root_override = tmp_path / ".stremio" / "docker-compose.bindings.yml"
             content = root_override.read_text(encoding="utf-8")
+            # Positive control: the comet section renders with other mounts.
+            self.assertIn("/app/comet/scrapers/torrentio.py:ro", content)
             self.assertNotIn("/app/comet/services/orchestration.py:ro", content)
             self.assertFalse((cfg.state_dir / "orchestration.py").exists())
 
@@ -747,7 +775,10 @@ class CometManagerTests(unittest.TestCase):
                 }
             )
             manager = CometManager(cfg, runner)
-            with mock.patch.object(manager, "host_healthcheck", return_value=True):
+            with (
+                mock.patch.object(manager, "host_healthcheck", return_value=True),
+                mock.patch.object(manager, "_verify_doctor_image_and_manifest"),
+            ):
                 manager.doctor()
 
     def test_doctor_fails_when_egress_differs_from_gluetun(self) -> None:
@@ -832,10 +863,70 @@ class CometManagerTests(unittest.TestCase):
             manager = CometManager(cfg, runner)
             with (
                 mock.patch.object(manager, "host_healthcheck", return_value=True),
+                mock.patch.object(manager, "_verify_doctor_image_and_manifest"),
                 self.assertRaises(RuntimeError) as ctx,
             ):
                 manager.doctor()
             self.assertIn("does not match gluetun", str(ctx.exception))
+
+    def test_verify_doctor_image_and_manifest_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            make_config(tmp_path)
+            cfg = make_comet_config(tmp_path)
+
+            runner = FakeRunner(
+                {
+                    (
+                        "docker",
+                        "compose",
+                        "-f",
+                        str(tmp_path / "docker-compose.yml"),
+                        "-f",
+                        str(tmp_path / ".stremio" / "docker-compose.bindings.yml"),
+                        "ps",
+                        "-q",
+                        "comet",
+                    ): completed(["docker", "compose", "ps"], "comet-id\n"),
+                    ("docker", "inspect", "comet-id", "--format", "{{.Image}}"): completed(
+                        ["docker", "inspect"], "sha256:active-id\n"
+                    ),
+                    ("docker", "image", "inspect", cfg.image, "--format", "{{.Id}}"): completed(
+                        ["docker", "image", "inspect"], "sha256:active-id\n"
+                    ),
+                    (
+                        "docker",
+                        "image",
+                        "inspect",
+                        cfg.image,
+                        "--format",
+                        "{{json .RepoDigests}}",
+                    ): completed(
+                        ["docker", "image", "inspect"],
+                        '["g0ldyy/comet@sha256:digest"]\n',
+                    ),
+                }
+            )
+            manager = CometManager(cfg, runner)
+
+            # 1. Manifest missing -> RuntimeError
+            with self.assertRaises(RuntimeError) as ctx:
+                manager._verify_doctor_image_and_manifest()
+            self.assertIn("Bundle manifest is missing", str(ctx.exception))
+
+            # Write manifest
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            manifest_file = cfg.state_dir / "bundle-manifest.json"
+            manifest_file.write_text('{"image_digest": "sha256:different"}', encoding="utf-8")
+
+            # 2. Digest mismatch -> RuntimeError
+            with self.assertRaises(RuntimeError) as ctx:
+                manager._verify_doctor_image_and_manifest()
+            self.assertIn("Mounted bundle manifest digest", str(ctx.exception))
+
+            # 3. Matches -> Success
+            manifest_file.write_text('{"image_digest": "sha256:digest"}', encoding="utf-8")
+            manager._verify_doctor_image_and_manifest()
 
 
 class CompatibilityTests(unittest.TestCase):

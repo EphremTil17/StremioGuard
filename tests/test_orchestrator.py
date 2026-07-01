@@ -18,6 +18,7 @@ from .conftest import (
     make_comet_config,
     make_comet_gateway_config,
     make_config,
+    write_minimal_bundle_manifest,
 )
 
 GLUETUN_HEALTH_INSPECT = (
@@ -219,6 +220,7 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             comet_cfg = make_comet_config(tmp_path, enabled=True)
+            write_minimal_bundle_manifest(comet_cfg)
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
             with (
@@ -254,6 +256,7 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             comet_cfg = make_comet_config(tmp_path, enabled=True)
+            write_minimal_bundle_manifest(comet_cfg)
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
             with (
@@ -285,6 +288,7 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             comet_cfg = make_comet_config(tmp_path, enabled=True)
+            write_minimal_bundle_manifest(comet_cfg)
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
             with (

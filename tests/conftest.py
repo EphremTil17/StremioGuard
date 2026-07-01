@@ -156,3 +156,22 @@ def make_comet_gateway_config(tmp_path: Path, **overrides: object) -> CometGatew
     }
     values.update(overrides)
     return CometGatewayConfig(**values)  # type: ignore[arg-type]
+
+
+def write_minimal_bundle_manifest(comet_config: CometConfig) -> None:
+    """Satisfy StackPublisher's fail-closed manifest check in orchestration tests."""
+    import json
+
+    comet_config.state_dir.mkdir(parents=True, exist_ok=True)
+    (comet_config.state_dir / "bundle-manifest.json").write_text(
+        json.dumps(
+            {
+                "outputs": {
+                    "stream.py": "/app/comet/api/endpoints/stream.py",
+                    "config.py": "/app/comet/api/endpoints/config.py",
+                    "index.html": "/app/comet/templates/index.html",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
