@@ -112,6 +112,13 @@ def comet_logs(
     )
 
 
+def comet_vendor_sync() -> None:
+    """Sync the Comet vendor checkout to the pinned commit (for maintainers)."""
+    manager = _comet_manager()
+    manager.fetch_and_checkout_pinned()
+    logger.success("Synced Comet vendor checkout.")
+
+
 def register(app: typer.Typer) -> None:
     app.command("install")(comet_install)
     app.command("update")(comet_update)
@@ -121,3 +128,4 @@ def register(app: typer.Typer) -> None:
     app.command("doctor")(comet_doctor)
     app.command("probe-playback")(comet_probe_playback)
     app.command("logs")(comet_logs)
+    app.command("vendor-sync", hidden=True)(comet_vendor_sync)

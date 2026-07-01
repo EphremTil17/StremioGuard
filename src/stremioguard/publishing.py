@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from pathlib import Path
 
 from stremioguard.comet_gateway import COMET_GATEWAY_CONTAINER_PORT, CometGatewayConfig
@@ -15,6 +16,7 @@ from stremioguard.env import (
     env_flag_enabled,
     env_int_value,
 )
+from stremioguard.overrides.bundle import required_output_names
 
 # Gluetun v3.40+ requires control-server auth for every route. This managed
 # role file re-opens only the read-only public-IP route the watchdog polls,
@@ -118,32 +120,13 @@ def render_stack_compose_override(
 
     if comet_config and comet_config.enabled:
         comet_volumes = [f"      - {comet_config.data_dir}:/app/data"]
-        if comet_config.result_format_style != "emoji":
-            comet_volumes.append(
-                "      - "
-                f"{comet_config.state_dir / 'formatting.py'}:/app/comet/utils/formatting.py:ro"
-            )
-        comet_volumes.append(
-            f"      - {comet_config.state_dir / 'stream.py'}:/app/comet/api/endpoints/stream.py:ro"
-        )
-        comet_volumes.append(
-            f"      - {comet_config.state_dir / 'config.py'}:/app/comet/api/endpoints/config.py:ro"
-        )
-        comet_volumes.append(
-            f"      - {comet_config.state_dir / 'index.html'}:/app/comet/templates/index.html:ro"
-        )
-        comet_volumes.append(
-            f"      - {comet_config.state_dir / 'torrentio.py'}:/app/comet/scrapers/torrentio.py:ro"
-        )
-        comet_volumes.append(
-            f"      - {comet_config.state_dir / 'filtering.py'}:/app/comet/services/filtering.py:ro"
-        )
-        if comet_config.patch_episode_pack_results:
-            orch_src = comet_config.state_dir / "orchestration.py"
-            comet_volumes.append(f"      - {orch_src}:/app/comet/services/orchestration.py:ro")
-        metadata_src = comet_config.state_dir / "metadata_service.py"
-        if metadata_src.exists():
-            comet_volumes.append(f"      - {metadata_src}:/app/comet/metadata_service.py:ro")
+        manifest_path = comet_config.state_dir / "bundle-manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for output_name, container_path in manifest.get("outputs", {}).items():
+                comet_volumes.append(
+                    f"      - {comet_config.state_dir / output_name}:{container_path}:ro"
+                )
         content.extend(
             [
                 "  comet:",
@@ -208,6 +191,16 @@ class StackPublisher:
         if image_override and comet_config.enabled:
             comet_config = dataclasses.replace(comet_config, image=image_override)
 
+        # Fail closed: never publish a Comet service without a readable bundle
+        # manifest, and never one missing a patch this deployment shape
+        # requires. A silently unpatched Comet behind the gateway would break
+        # playback URLs; a missing manifest means prepare_runtime never ran.
+        if comet_config.enabled:
+            self._require_valid_manifest(
+                comet_config,
+                gateway_enabled=comet_gateway_config.enabled,
+            )
+
         # 5. Render
         content = render_stack_compose_override(
             bind_addresses=bind_addresses,
@@ -225,3 +218,32 @@ class StackPublisher:
 
         # 6. Write atomically
         atomic_write_text(self.compose_override_file, content, mode=0o644)
+
+    def _require_valid_manifest(self, comet_config: CometConfig, *, gateway_enabled: bool) -> None:
+        manifest_path = comet_config.state_dir / "bundle-manifest.json"
+        if not manifest_path.exists():
+            raise RuntimeError(
+                "Comet is enabled but no override bundle manifest exists at "
+                f"{manifest_path}. Run `./stremio comet install` (or `./stremio start`) "
+                "to render the managed patches before publishing the stack."
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"Comet override bundle manifest at {manifest_path} is unreadable "
+                f"({error}). Re-run `./stremio comet install` to regenerate it."
+            ) from error
+        outputs = manifest.get("outputs", {})
+        missing = [
+            name
+            for name in required_output_names(gateway_enabled=gateway_enabled)
+            if name not in outputs
+        ]
+        if missing:
+            raise RuntimeError(
+                "Comet override bundle is missing patches required by this deployment "
+                f"shape: {', '.join(sorted(missing))}. Starting anyway would break "
+                "gateway playback URLs. Fix the patch compatibility (see "
+                "`./stremio comet install` output) before starting."
+            )

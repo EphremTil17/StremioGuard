@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -193,3 +194,60 @@ class TestStackPublisher(unittest.TestCase):
             with mock.patch("stremioguard.publishing.StackPublisher.publish") as publish_mock:
                 guard.compose_fresh("up", "-d", check=False)
                 publish_mock.assert_called_once()
+
+
+class TestPublisherFailClosed(unittest.TestCase):
+    def _env(self, root: Path, *, gateway: bool) -> None:
+        (root / ".env").write_text(
+            f"COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED={'1' if gateway else '0'}\n",
+            encoding="utf-8",
+        )
+
+    def test_publish_raises_when_comet_enabled_but_manifest_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._env(root, gateway=False)
+            with self.assertRaisesRegex(RuntimeError, "no override bundle manifest"):
+                StackPublisher(root).publish()
+
+    def test_publish_raises_when_gateway_requires_missing_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._env(root, gateway=True)
+            state_dir = root / ".stremio" / "comet"
+            state_dir.mkdir(parents=True)
+            # Manifest lacking the gateway-required stream/config/template outputs.
+            (state_dir / "bundle-manifest.json").write_text(
+                json.dumps({"outputs": {"torrentio.py": "/app/comet/scrapers/torrentio.py"}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "required by this deployment shape"):
+                StackPublisher(root).publish()
+
+    def test_publish_accepts_manifest_with_required_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._env(root, gateway=True)
+            state_dir = root / ".stremio" / "comet"
+            state_dir.mkdir(parents=True)
+            outputs = {
+                "stream.py": "/app/comet/api/endpoints/stream.py",
+                "config.py": "/app/comet/api/endpoints/config.py",
+                "index.html": "/app/comet/templates/index.html",
+            }
+            (state_dir / "bundle-manifest.json").write_text(
+                json.dumps({"outputs": outputs}), encoding="utf-8"
+            )
+            StackPublisher(root).publish()
+            content = (root / ".stremio" / "docker-compose.bindings.yml").read_text(
+                encoding="utf-8"
+            )
+            for output_name, container_path in outputs.items():
+                self.assertIn(f"{state_dir / output_name}:{container_path}:ro", content)
+
+    def test_publish_skips_manifest_check_when_comet_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text("COMET_ENABLED=0\n", encoding="utf-8")
+            StackPublisher(root).publish()
+            self.assertTrue((root / ".stremio" / "docker-compose.bindings.yml").exists())

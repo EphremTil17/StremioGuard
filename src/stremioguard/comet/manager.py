@@ -9,6 +9,8 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from loguru import logger
@@ -30,6 +32,25 @@ from stremioguard.env import atomic_write_text, ensure_directory, env_file_value
 from stremioguard.overrides import write_override_bundle
 from stremioguard.preflight import require_docker, verify_bind_addresses
 from stremioguard.publishing import StackPublisher
+
+
+@contextmanager
+def extract_image_source(runner: Runner, image_ref: str) -> Iterator[Path]:
+    container_id: str | None = None
+    with tempfile.TemporaryDirectory(prefix="stremioguard-comet-") as directory:
+        temp_root = Path(directory)
+        source_root = temp_root / "image-root"
+        source_root.mkdir()
+        try:
+            created = runner.run(["docker", "create", image_ref], check=True)
+            container_id = (created.stdout or "").strip()
+            if not container_id:
+                raise RuntimeError("Docker created no temporary container ID")
+            runner.run(["docker", "cp", f"{container_id}:/app/comet", str(source_root)], check=True)
+            yield source_root
+        finally:
+            if container_id:
+                runner.run(["docker", "rm", "-f", container_id], check=False, capture=False)
 
 
 class CometManager:
@@ -119,6 +140,11 @@ class CometManager:
         return gateway_manager.addon_base_url(default_token)
 
     def write_stack_override_file(self) -> None:
+        # Publishes the compose override from the existing bundle manifest.
+        # Bundle GENERATION happens only in prepare_runtime, rendered from the
+        # active image's own source — regenerating here from the vendored
+        # checkout would clobber the image-derived bundle and reopen the
+        # vendored-vs-image coherence gap.
         ensure_directory(self.config.state_dir)
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.config.postgres_data_dir.mkdir(parents=True, exist_ok=True)
@@ -126,13 +152,6 @@ class CometManager:
         gateway_manager = CometGatewayManager(gateway_config, self.runner)
         if gateway_config.enabled:
             gateway_manager.prepare_runtime()
-        write_override_bundle(
-            repo_dir=self.config.repo_dir,
-            state_dir=self.config.state_dir,
-            result_format_style=self.config.result_format_style,
-            patch_episode_pack_results=self.config.patch_episode_pack_results,
-            gateway_addon_base_url=self.gateway_addon_base_url(),
-        )
         publisher = StackPublisher(self.config.root_dir, self.root_override_file())
         publisher.publish()
 
@@ -288,6 +307,22 @@ class CometManager:
             and cached.get("status") == "passed"
         )
 
+    def _manifest_cache_valid(self, image_digest: str, patch_fingerprint: str) -> bool:
+        manifest_path = self.config.state_dir / "bundle-manifest.json"
+        if not manifest_path.exists():
+            return False
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return (
+                manifest.get("image_digest") == image_digest
+                and manifest.get("patch_fingerprint") == patch_fingerprint
+                and manifest.get("format_style") == self.config.result_format_style
+                and manifest.get("patch_episode_pack") == self.config.patch_episode_pack_results
+                and manifest.get("gateway_addon_base_url") == self.gateway_addon_base_url()
+            )
+        except Exception:
+            return False
+
     def _compatibility_diagnostic(self, error: Exception, source_root: Path) -> str:
         text = str(error)
         lowered = text.lower()
@@ -347,39 +382,34 @@ class CometManager:
         ):
             return
 
-        container_id: str | None = None
         with tempfile.TemporaryDirectory(prefix="stremioguard-comet-") as directory:
             temp_root = Path(directory)
-            source_root = temp_root / "image-root"
-            source_root.mkdir()
             generated_root = temp_root / "generated"
-            try:
-                created = self.runner.run(["docker", "create", self.config.image], check=True)
-                container_id = (created.stdout or "").strip()
-                if not container_id:
-                    raise RuntimeError("Docker created no temporary container ID")
-                self.runner.run(
-                    ["docker", "cp", f"{container_id}:/app/comet", str(source_root)], check=True
-                )
+            with extract_image_source(self.runner, self.config.image) as source_root:
                 image_repo = source_root / "comet"
                 if not image_repo.exists():
                     raise RuntimeError("the image does not contain /app/comet")
-                write_override_bundle(
-                    repo_dir=source_root,
-                    state_dir=generated_root,
-                    result_format_style=self.config.result_format_style,
-                    patch_episode_pack_results=self.config.patch_episode_pack_results,
-                )
-                generated_files = sorted(generated_root.glob("*.py"))
-                for generated_file in generated_files:
-                    compile(generated_file.read_text(encoding="utf-8"), str(generated_file), "exec")
-            except Exception as error:
-                raise RuntimeError(self._compatibility_diagnostic(error, source_root)) from error
-            finally:
-                if container_id:
-                    self.runner.run(
-                        ["docker", "rm", "-f", container_id], check=False, capture=False
+                try:
+                    write_override_bundle(
+                        repo_dir=source_root,
+                        state_dir=generated_root,
+                        result_format_style=self.config.result_format_style,
+                        patch_episode_pack_results=self.config.patch_episode_pack_results,
+                        gateway_addon_base_url=self.gateway_addon_base_url(),
+                        gateway_enabled=self.gateway_config().enabled,
+                        image_digest=image_digest,
+                        patch_fingerprint=patch_fingerprint,
                     )
+                    generated_files = sorted(generated_root.glob("*.py"))
+                    for generated_file in generated_files:
+                        compile(
+                            generated_file.read_text(encoding="utf-8"),
+                            str(generated_file),
+                            "exec",
+                        )
+                except Exception as error:
+                    diag = self._compatibility_diagnostic(error, source_root)
+                    raise RuntimeError(diag) from error
 
         cache = {
             "status": "passed",
@@ -455,8 +485,29 @@ class CometManager:
             self.validate_compatibility()
 
     def prepare_runtime(self) -> None:
-        self.fetch_and_checkout_pinned()
         self.write_runtime_env()
+        image_digest = self.ensure_image()
+        patch_fingerprint = self._managed_patch_fingerprint()
+
+        if self._manifest_cache_valid(image_digest, patch_fingerprint):
+            self.write_stack_override_file()
+            return
+
+        self.log(
+            "Cache miss for Comet override bundle. "
+            f"Extracting and rendering from image: {self.config.image}"
+        )
+        with extract_image_source(self.runner, self.config.image) as source_root:
+            write_override_bundle(
+                repo_dir=source_root,
+                state_dir=self.config.state_dir,
+                result_format_style=self.config.result_format_style,
+                patch_episode_pack_results=self.config.patch_episode_pack_results,
+                gateway_addon_base_url=self.gateway_addon_base_url(),
+                gateway_enabled=self.gateway_config().enabled,
+                image_digest=image_digest,
+                patch_fingerprint=patch_fingerprint,
+            )
         self.write_stack_override_file()
 
     def check_bind_addresses(self) -> None:
@@ -602,17 +653,46 @@ class CometManager:
         host = "127.0.0.1" if address == "0.0.0.0" else address
         return f"http://{host}:{self.config.host_port}"
 
-    def doctor(self) -> None:
-        lock = self.load_lock()
-        if not self.repo_exists():
-            raise RuntimeError("Comet repo is not installed. Run `./stremio comet install` first.")
-        current = self.current_commit()
-        if current != lock.pinned_commit:
+    def _verify_doctor_image_and_manifest(self) -> None:
+        comet_id = self.service_container_id(self.config.service_name)
+        if not comet_id:
+            raise RuntimeError("Comet container is not running.")
+
+        running_image_id = self.runner.run(
+            ["docker", "inspect", comet_id, "--format", "{{.Image}}"],
+            check=True,
+        ).stdout.strip()
+        active_image_id = self.runner.run(
+            ["docker", "image", "inspect", self.config.image, "--format", "{{.Id}}"],
+            check=True,
+        ).stdout.strip()
+        if running_image_id != active_image_id:
             raise RuntimeError(
-                "Vendored Comet checkout is at "
-                f"{current or 'unknown'}, expected {lock.pinned_commit}."
+                f"Running container's image ({running_image_id}) does not match "
+                f"active image ({active_image_id})."
             )
+
+        # Check mounted bundle manifest matches active digest
+        manifest_path = self.config.state_dir / "bundle-manifest.json"
+        if not manifest_path.exists():
+            raise RuntimeError("Bundle manifest is missing.")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_digest = manifest.get("image_digest")
+        except Exception as error:
+            raise RuntimeError(f"Failed to read bundle manifest: {error}") from error
+
+        active_digest = self._image_digest()
+        if manifest_digest != active_digest:
+            raise RuntimeError(
+                f"Mounted bundle manifest digest ({manifest_digest}) does not match "
+                f"active image digest ({active_digest})."
+            )
+
+    def doctor(self) -> None:
         self.require_commands()
+        self._verify_doctor_image_and_manifest()
+
         if not self.healthcheck():
             raise RuntimeError(
                 "Comet health endpoint is not healthy from inside the container "
@@ -624,6 +704,7 @@ class CometManager:
                 f"{self.base_url_for_checks()}/health. This can happen on WSL or "
                 "multi-interface hosts even when container health is fine."
             )
+
         gateway_config = self.gateway_config()
         comet_is_gateway_gated = gateway_config.enabled
         port_output = self.compose("ps", "gluetun", check=False).stdout or ""
