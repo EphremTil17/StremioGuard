@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import secrets
@@ -11,12 +12,14 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 from loguru import logger
 
 from stremioguard.comet.lock import CometLock
 from stremioguard.comet.probe import PlaybackProbeResult, probe_playback_url
+from stremioguard.comet.state import STATE_FILE_NAME, CandidateDigest, CometState
 from stremioguard.comet_gateway import (
     COMET_GATEWAY_CONTAINER_PORT,
     CometGatewayConfig,
@@ -70,6 +73,28 @@ class CometManager:
 
     def load_lock(self) -> CometLock:
         return CometLock.load(self.config.lock_file)
+
+    def state_file(self) -> Path:
+        return self.config.state_dir / STATE_FILE_NAME
+
+    def load_state(self) -> CometState:
+        return CometState.load(self.state_file())
+
+    def save_state(self, state: CometState) -> None:
+        ensure_directory(self.config.state_dir)
+        state.save(self.state_file())
+
+    def active_image_ref(self) -> str:
+        """The digest-pinned reference compose/validation must use.
+
+        Returns `<repo>@<digest>` once `state.json` has resolved an active
+        digest. Falls back to the floating repo/tag string only for the
+        one-time pre-migration window before `prepare_runtime` has ever run
+        for this install — never once state exists (Phase 4 / plan 4.2)."""
+        state = self.load_state()
+        if state.active_digest:
+            return f"{self.config.image}@{state.active_digest}"
+        return self.config.image
 
     def repo_exists(self) -> bool:
         return (self.config.repo_dir / ".git").exists()
@@ -251,14 +276,15 @@ class CometManager:
             digest.update(path.read_bytes())
         return digest.hexdigest()
 
-    def _image_digest(self) -> str:
+    def _image_digest(self, image_ref: str | None = None) -> str:
+        image_ref = image_ref or self.config.image
         result = self.runner.run(
-            ["docker", "image", "inspect", self.config.image, "--format", "{{json .RepoDigests}}"],
+            ["docker", "image", "inspect", image_ref, "--format", "{{json .RepoDigests}}"],
             check=False,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "unknown Docker error").strip()
-            raise RuntimeError(f"Unable to inspect Comet image {self.config.image!r}: {detail}")
+            raise RuntimeError(f"Unable to inspect Comet image {image_ref!r}: {detail}")
         try:
             digests = json.loads((result.stdout or "").strip() or "[]")
         except json.JSONDecodeError:
@@ -268,21 +294,51 @@ class CometManager:
                 if isinstance(value, str) and "@" in value:
                     return value.rsplit("@", 1)[1]
         image_id = self.runner.run(
-            ["docker", "image", "inspect", self.config.image, "--format", "{{.Id}}"], check=False
+            ["docker", "image", "inspect", image_ref, "--format", "{{.Id}}"], check=False
         )
         value = (image_id.stdout or "").strip()
         if image_id.returncode == 0 and value:
             return value
-        raise RuntimeError(
-            f"Comet image {self.config.image!r} has no inspectable digest or image ID."
-        )
+        raise RuntimeError(f"Comet image {image_ref!r} has no inspectable digest or image ID.")
 
-    def ensure_image(self) -> str:
-        result = self.runner.run(["docker", "image", "inspect", self.config.image], check=False)
+    def ensure_image(self, image_ref: str | None = None) -> str:
+        image_ref = image_ref or self.config.image
+        result = self.runner.run(["docker", "image", "inspect", image_ref], check=False)
         if result.returncode != 0:
-            self.log(f"Pulling Comet image {self.config.image}.")
-            self.runner.run(["docker", "pull", self.config.image], check=True, capture=False)
-        return self._image_digest()
+            self.log(f"Pulling Comet image {image_ref}.")
+            self.runner.run(["docker", "pull", image_ref], check=True, capture=False)
+        return self._image_digest(image_ref)
+
+    def _remote_digest(self, tag: str = "latest") -> str | None:
+        """Resolve the manifest-list digest of `<image>:<tag>` WITHOUT pulling.
+
+        Uses `docker buildx imagetools inspect`, which returns the same
+        manifest-list digest form recorded in `RepoDigests` after a pull (both
+        are index/manifest-list digests, directly comparable). Advisory only:
+        any failure (missing buildx, offline, hung registry, rate limit)
+        returns None rather than raising — callers must treat this as
+        best-effort.
+        """
+        try:
+            result = self.runner.run(
+                [
+                    "docker",
+                    "buildx",
+                    "imagetools",
+                    "inspect",
+                    f"{self.config.image}:{tag}",
+                    "--format",
+                    "{{json .Manifest.Digest}}",
+                ],
+                check=False,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if result.returncode != 0:
+            return None
+        raw = (result.stdout or "").strip().strip('"')
+        return raw or None
 
     def _compatibility_cache_valid(
         self, image_digest: str, source_commit: str, patch_fingerprint: str
@@ -364,7 +420,7 @@ class CometManager:
         return (
             "Comet compatibility check failed.\n\n"
             f"Image: {self.config.image}\n"
-            f"Digest: {self._image_digest()}\n"
+            f"Digest: {self._image_digest(self.active_image_ref())}\n"
             f"Patch: {patch}\n"
             f"File: {source_file}\n"
             f"Failure type: {type(error).__name__}\n"
@@ -374,7 +430,8 @@ class CometManager:
         )
 
     def validate_compatibility(self, *, force: bool = False) -> None:
-        image_digest = self.ensure_image()
+        image_ref = self.active_image_ref()
+        image_digest = self.ensure_image(image_ref)
         source_commit = self.current_commit() or self.load_lock().pinned_commit
         patch_fingerprint = self._managed_patch_fingerprint()
         if not force and self._compatibility_cache_valid(
@@ -385,7 +442,7 @@ class CometManager:
         with tempfile.TemporaryDirectory(prefix="stremioguard-comet-") as directory:
             temp_root = Path(directory)
             generated_root = temp_root / "generated"
-            with extract_image_source(self.runner, self.config.image) as source_root:
+            with extract_image_source(self.runner, image_ref) as source_root:
                 image_repo = source_root / "comet"
                 if not image_repo.exists():
                     raise RuntimeError("the image does not contain /app/comet")
@@ -466,7 +523,6 @@ class CometManager:
 
     def install(self) -> None:
         self.prepare_runtime()
-        self.ensure_image()
         if sys.stdin.isatty():
             import typer
 
@@ -484,9 +540,132 @@ class CometManager:
         else:
             self.validate_compatibility()
 
+    def _validate_digest(self, digest: str) -> dict[str, object]:
+        """Render + compile the override bundle from `digest`'s own image
+        source, in an isolated temp dir. Never touches the live state_dir or
+        bundle-manifest.json, and never touches running services.
+
+        Returns {"status": "passed"|"failed", "detail": str, "degraded": [...]}.
+        `degraded` lists OPTIONAL patches that failed to apply even on a
+        "passed" result (write_override_bundle only raises for a patch this
+        deployment shape actually requires; optional skips are non-fatal).
+        """
+        image_ref = f"{self.config.image}@{digest}"
+        pull_check = self.runner.run(["docker", "image", "inspect", image_ref], check=False)
+        if pull_check.returncode != 0:
+            self.runner.run(["docker", "pull", image_ref], check=True, capture=False)
+
+        patch_fingerprint = self._managed_patch_fingerprint()
+        try:
+            with tempfile.TemporaryDirectory(prefix="stremioguard-comet-") as directory:
+                generated_root = Path(directory) / "generated"
+                with extract_image_source(self.runner, image_ref) as source_root:
+                    if not (source_root / "comet").exists():
+                        raise RuntimeError("the image does not contain /app/comet")
+                    write_override_bundle(
+                        repo_dir=source_root,
+                        state_dir=generated_root,
+                        result_format_style=self.config.result_format_style,
+                        patch_episode_pack_results=self.config.patch_episode_pack_results,
+                        gateway_addon_base_url=self.gateway_addon_base_url(),
+                        gateway_enabled=self.gateway_config().enabled,
+                        image_digest=digest,
+                        patch_fingerprint=patch_fingerprint,
+                    )
+                    for generated_file in sorted(generated_root.glob("*.py")):
+                        compile(
+                            generated_file.read_text(encoding="utf-8"),
+                            str(generated_file),
+                            "exec",
+                        )
+                    manifest = json.loads(
+                        (generated_root / "bundle-manifest.json").read_text(encoding="utf-8")
+                    )
+        except Exception as error:
+            return {"status": "failed", "detail": str(error), "degraded": []}
+        return {"status": "passed", "detail": "", "degraded": manifest.get("skipped", [])}
+
+    def _bootstrap_active_digest(self) -> None:
+        """First-run digest resolution (plan 4.3): validate the newest image;
+        fall back to the maintainer-tested digest from the lock file if a
+        REQUIRED patch fails, so a new install can never be bricked by an
+        upstream release StremioGuard's patches don't cover yet."""
+        self.log(f"Resolving initial Comet image digest for {self.config.image}:latest.")
+        self.runner.run(
+            ["docker", "pull", f"{self.config.image}:latest"], check=True, capture=False
+        )
+        latest_digest = self._image_digest(f"{self.config.image}:latest")
+        report = self._validate_digest(latest_digest)
+
+        if report["status"] == "passed":
+            degraded = report.get("degraded") or []
+            accept_latest = True
+            names = ""
+            if degraded:
+                names = ", ".join(
+                    f"{d['name']} ({d['reason']})"
+                    for d in degraded  # type: ignore[union-attr]
+                )
+                if sys.stdin.isatty():
+                    import typer
+
+                    accept_latest = typer.confirm(
+                        f"Comet {self.config.image}:latest ({latest_digest}) has degraded "
+                        f"optional features: {names}\nUse it as the active version anyway? "
+                        "(Declining falls back to the last maintainer-validated image.)",
+                        default=True,
+                    )
+            if accept_latest:
+                if degraded:
+                    self.warn(
+                        f"Comet {self.config.image}@{latest_digest} is active with degraded "
+                        f"optional features: {names}"
+                    )
+                else:
+                    self.success(
+                        f"Comet image {self.config.image}@{latest_digest} fully validated "
+                        "and set as the active version."
+                    )
+                self.save_state(dataclasses.replace(self.load_state(), active_digest=latest_digest))
+                return
+            latest_problem = f"declined: degraded optional features ({names})"
+        else:
+            latest_problem = (
+                f"not yet compatible with a required StremioGuard patch:\n{report['detail']}"
+            )
+
+        lock = self.load_lock()
+        tested_digest = lock.tested_digest
+        self.warn(
+            f"The newest Comet image ({self.config.image}:latest -> {latest_digest}) is "
+            f"{latest_problem}\n\n"
+            f"Falling back to the last maintainer-validated image ({tested_digest})."
+        )
+        fallback_report = self._validate_digest(tested_digest)
+        if fallback_report["status"] != "passed":
+            raise RuntimeError(
+                "Comet compatibility check failed for the maintainer-tested fallback "
+                "digest in vendor/comet.lock.json. This indicates a bug in the "
+                "StremioGuard patch generators, not your configuration.\n\n"
+                f"Newest image ({latest_digest}): {latest_problem}\n\n"
+                f"Fallback digest ({tested_digest}) failure:\n{fallback_report['detail']}"
+            )
+        self.save_state(dataclasses.replace(self.load_state(), active_digest=tested_digest))
+        self.warn(
+            f"Comet is running on {self.config.image}@{tested_digest}, the last "
+            "maintainer-validated image — not the newest upstream release. Update "
+            "StremioGuard and run `./stremio comet update` once support ships."
+        )
+
     def prepare_runtime(self) -> None:
         self.write_runtime_env()
-        image_digest = self.ensure_image()
+        state = self.load_state()
+        if state.active_digest is None:
+            self._bootstrap_active_digest()
+            state = self.load_state()
+
+        image_ref = f"{self.config.image}@{state.active_digest}"
+        image_digest = self.ensure_image(image_ref)
         patch_fingerprint = self._managed_patch_fingerprint()
 
         if self._manifest_cache_valid(image_digest, patch_fingerprint):
@@ -495,9 +674,9 @@ class CometManager:
 
         self.log(
             "Cache miss for Comet override bundle. "
-            f"Extracting and rendering from image: {self.config.image}"
+            f"Extracting and rendering from image: {image_ref}"
         )
-        with extract_image_source(self.runner, self.config.image) as source_root:
+        with extract_image_source(self.runner, image_ref) as source_root:
             write_override_bundle(
                 repo_dir=source_root,
                 state_dir=self.config.state_dir,
@@ -518,17 +697,95 @@ class CometManager:
             warn=self.warn,
         )
 
+    def _comet_services(self) -> list[str]:
+        services = [self.config.postgres_service_name, self.config.service_name]
+        if self.gateway_config().enabled:
+            services.append(self.gateway_config().service_name)
+        return services
+
     def start(self) -> None:
         self.require_commands()
         self.prepare_runtime()
         self.validate_compatibility()
         self.check_bind_addresses()
         self.log("Starting Comet stack.")
-        services = [self.config.postgres_service_name, self.config.service_name]
-        gateway_config = self.gateway_config()
-        if gateway_config.enabled:
-            services.append(gateway_config.service_name)
-        self.compose_fresh("up", "-d", *services, capture=False)
+        self.compose_fresh("up", "-d", *self._comet_services(), capture=False)
+
+    def check_remote(self) -> str | None:
+        """Resolve the remote `:latest` digest and record the check timestamp.
+        Returns the new digest if it differs from active, else None. Never
+        pulls, never touches running services — safe to call frequently."""
+        remote_digest = self._remote_digest()
+        state = self.load_state()
+        self.save_state(
+            dataclasses.replace(
+                state, last_remote_check=datetime.now(UTC).isoformat(timespec="seconds")
+            )
+        )
+        if remote_digest is None or remote_digest == state.active_digest:
+            return None
+        return remote_digest
+
+    def validate_candidate(self, digest: str) -> dict[str, object]:
+        """Validate `digest` in isolation and record it as the candidate.
+        Never touches running services or the live bundle manifest."""
+        report = self._validate_digest(digest)
+        state = self.load_state()
+        candidate = CandidateDigest(
+            digest=digest,
+            checked_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            validation=report,
+        )
+        self.save_state(dataclasses.replace(state, candidate=candidate))
+        return report
+
+    def promote_candidate(self) -> None:
+        """Swap the candidate digest in as active and restart the Comet trio.
+
+        Re-validates in isolation first — the stored candidate report may be
+        stale (patch sources or config can change between check and apply) —
+        so a promotion can never apply a digest that hasn't passed against
+        the exact bits it will run with."""
+        state = self.load_state()
+        if state.candidate is None:
+            raise RuntimeError("No candidate digest recorded. Run a remote check first.")
+        digest = state.candidate.digest
+        report = self._validate_digest(digest)
+        if report["status"] != "passed":
+            raise RuntimeError(
+                f"Candidate {digest} failed re-validation and cannot be promoted:\n"
+                f"{report['detail']}"
+            )
+        self.save_state(
+            CometState(
+                active_digest=digest,
+                previous_digest=state.active_digest,
+                candidate=None,
+                last_remote_check=state.last_remote_check,
+            )
+        )
+        self.prepare_runtime()
+        self.validate_compatibility(force=True)
+        self.log(f"Promoted Comet to {self.config.image}@{digest}. Restarting the Comet stack.")
+        self.compose_fresh("up", "-d", *self._comet_services(), capture=False)
+
+    def rollback(self) -> None:
+        """Swap active/previous digest one level deep and restart."""
+        state = self.load_state()
+        if not state.previous_digest:
+            raise RuntimeError("No previous digest recorded; nothing to roll back to.")
+        self.save_state(
+            CometState(
+                active_digest=state.previous_digest,
+                previous_digest=state.active_digest,
+                candidate=None,
+                last_remote_check=state.last_remote_check,
+            )
+        )
+        self.prepare_runtime()
+        self.validate_compatibility(force=True)
+        self.log(f"Rolled back Comet to {self.config.image}@{state.previous_digest}. Restarting.")
+        self.compose_fresh("up", "-d", *self._comet_services(), capture=False)
 
     def stop(self) -> None:
         self.require_commands()
@@ -658,12 +915,13 @@ class CometManager:
         if not comet_id:
             raise RuntimeError("Comet container is not running.")
 
+        active_image_ref = self.active_image_ref()
         running_image_id = self.runner.run(
             ["docker", "inspect", comet_id, "--format", "{{.Image}}"],
             check=True,
         ).stdout.strip()
         active_image_id = self.runner.run(
-            ["docker", "image", "inspect", self.config.image, "--format", "{{.Id}}"],
+            ["docker", "image", "inspect", active_image_ref, "--format", "{{.Id}}"],
             check=True,
         ).stdout.strip()
         if running_image_id != active_image_id:
@@ -682,7 +940,7 @@ class CometManager:
         except Exception as error:
             raise RuntimeError(f"Failed to read bundle manifest: {error}") from error
 
-        active_digest = self._image_digest()
+        active_digest = self._image_digest(active_image_ref)
         if manifest_digest != active_digest:
             raise RuntimeError(
                 f"Mounted bundle manifest digest ({manifest_digest}) does not match "

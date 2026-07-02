@@ -194,6 +194,19 @@ def _validate_public_url(value: str | None, *, key: str) -> None:
         raise RuntimeError(f"Invalid {key} value: {value!r}; expected an absolute HTTP(S) URL")
 
 
+def _validate_image_repository(value: str, *, key: str) -> str:
+    # StremioGuard pins the Comet image by digest itself (`<repo>@<digest>`)
+    # and resolves updates against `<repo>:latest`, so a tag or digest baked
+    # into the repository override would produce invalid references.
+    name_part = value.rsplit("/", 1)[-1]
+    if "@" in value or ":" in name_part:
+        raise RuntimeError(
+            f"Invalid {key} value: {value!r}; expected a repository name without a tag "
+            "or digest (e.g. 'g0ldyy/comet'). StremioGuard manages the digest pin."
+        )
+    return value
+
+
 def parse_ipv4_csv(raw: str | None, *, default: list[str]) -> list[str]:
     if raw is None:
         return default
@@ -375,7 +388,10 @@ class CometConfig:
             ).strip(),
             default_debrid_apikey=env_file_value(env_file, "COMET_DEFAULT_DEBRID_APIKEY") or None,
             enabled=comet_enabled,
-            image=(env_file_value(env_file, "COMET_IMAGE") or "g0ldyy/comet").strip(),
+            image=_validate_image_repository(
+                (env_file_value(env_file, "COMET_IMAGE") or "g0ldyy/comet").strip(),
+                key="COMET_IMAGE",
+            ),
             stremio_host_port=stremio_host_port,
             stremio_container_port=stremio_container_port,
             gateway_host_port=gateway_host_port,

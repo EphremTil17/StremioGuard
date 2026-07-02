@@ -251,3 +251,67 @@ class TestPublisherFailClosed(unittest.TestCase):
             (root / ".env").write_text("COMET_ENABLED=0\n", encoding="utf-8")
             StackPublisher(root).publish()
             self.assertTrue((root / ".stremio" / "docker-compose.bindings.yml").exists())
+
+
+class TestStackPublisherDigestPinning(unittest.TestCase):
+    def test_publish_pins_image_to_active_digest_from_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text(
+                "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=0\n", encoding="utf-8"
+            )
+            state_dir = root / ".stremio" / "comet"
+            state_dir.mkdir(parents=True)
+            (state_dir / "bundle-manifest.json").write_text(
+                json.dumps({"outputs": {}}), encoding="utf-8"
+            )
+            from stremioguard.comet.state import CometState
+
+            digest = "sha256:" + "9" * 64
+            CometState(active_digest=digest).save(state_dir / "state.json")
+
+            StackPublisher(root).publish()
+            content = (root / ".stremio" / "docker-compose.bindings.yml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(f"image: g0ldyy/comet@{digest}", content)
+
+    def test_publish_renders_floating_tag_when_no_state_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text(
+                "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=0\n", encoding="utf-8"
+            )
+            state_dir = root / ".stremio" / "comet"
+            state_dir.mkdir(parents=True)
+            (state_dir / "bundle-manifest.json").write_text(
+                json.dumps({"outputs": {}}), encoding="utf-8"
+            )
+            StackPublisher(root).publish()
+            content = (root / ".stremio" / "docker-compose.bindings.yml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("image: g0ldyy/comet\n", content)
+            self.assertNotIn("g0ldyy/comet@", content)
+
+    def test_explicit_image_override_wins_over_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text(
+                "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=0\n", encoding="utf-8"
+            )
+            state_dir = root / ".stremio" / "comet"
+            state_dir.mkdir(parents=True)
+            (state_dir / "bundle-manifest.json").write_text(
+                json.dumps({"outputs": {}}), encoding="utf-8"
+            )
+            from stremioguard.comet.state import CometState
+
+            CometState(active_digest="sha256:" + "9" * 64).save(state_dir / "state.json")
+            override_digest = "sha256:" + "7" * 64
+
+            StackPublisher(root).publish(image_override=f"g0ldyy/comet@{override_digest}")
+            content = (root / ".stremio" / "docker-compose.bindings.yml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(f"image: g0ldyy/comet@{override_digest}", content)

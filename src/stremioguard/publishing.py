@@ -187,7 +187,16 @@ class StackPublisher:
         comet_config = CometConfig.from_env(self.root_dir)
         comet_gateway_config = CometGatewayConfig.from_env(self.root_dir)
 
-        # Allow image override (Phase 4 preparation)
+        # 4. Digest-pin the Comet image (Phase 4): once local state exists,
+        # never render a floating tag. Deferred import to avoid a circular
+        # import (publishing -> comet.__init__ -> manager -> publishing).
+        if comet_config.enabled and image_override is None:
+            from stremioguard.comet.state import STATE_FILE_NAME, CometState
+
+            comet_state = CometState.load(comet_config.state_dir / STATE_FILE_NAME)
+            if comet_state.active_digest:
+                image_override = f"{comet_config.image}@{comet_state.active_digest}"
+
         if image_override and comet_config.enabled:
             comet_config = dataclasses.replace(comet_config, image=image_override)
 

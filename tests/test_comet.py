@@ -23,7 +23,12 @@ from stremioguard.publishing import render_stack_compose_override
 from .conftest import FakeRunner, completed, make_comet_config, make_config
 
 
-def _write_lock(path: Path, commit: str = "abc123") -> None:
+def _write_lock(
+    path: Path,
+    commit: str = "abc123",
+    *,
+    tested_digest: str = "sha256:" + "a" * 64,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
@@ -31,6 +36,8 @@ def _write_lock(path: Path, commit: str = "abc123") -> None:
                 "upstream_url": "https://github.com/g0ldyy/comet",
                 "pinned_commit": commit,
                 "default_branch": "main",
+                "image": "g0ldyy/comet",
+                "tested_digest": tested_digest,
             }
         ),
         encoding="utf-8",
@@ -322,17 +329,57 @@ class ConfigValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "absolute HTTP"):
                 config_mod.CometConfig.from_env(Path(directory))
 
+    def test_rejects_comet_image_with_tag_or_digest(self) -> None:
+        # Digest pinning builds `<image>:latest` / `<image>@<digest>` refs,
+        # so COMET_IMAGE must be a bare repository name.
+        for bad in ("g0ldyy/comet:latest", "g0ldyy/comet@sha256:" + "a" * 64):
+            with tempfile.TemporaryDirectory() as directory:
+                env = Path(directory) / ".env"
+                env.write_text(f"COMET_ENABLED=1\nCOMET_IMAGE={bad}\n", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "without a tag"):
+                    config_mod.CometConfig.from_env(Path(directory))
+
+    def test_accepts_comet_image_registry_with_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "COMET_ENABLED=1\nCOMET_IMAGE=registry.local:5000/mirror/comet\n",
+                encoding="utf-8",
+            )
+            config = config_mod.CometConfig.from_env(Path(directory))
+            self.assertEqual(config.image, "registry.local:5000/mirror/comet")
+
 
 class CometManagerTests(unittest.TestCase):
     def test_load_lock_reads_expected_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
-            _write_lock(cfg.lock_file, commit="deadbeef")
+            _write_lock(cfg.lock_file, commit="deadbeef", tested_digest="sha256:" + "b" * 64)
             lock = comet_mod.CometLock.load(cfg.lock_file)
             self.assertEqual(lock.upstream_url, "https://github.com/g0ldyy/comet")
             self.assertEqual(lock.pinned_commit, "deadbeef")
             self.assertEqual(lock.default_branch, "main")
+            self.assertEqual(lock.image, "g0ldyy/comet")
+            self.assertEqual(lock.tested_digest, "sha256:" + "b" * 64)
+
+    def test_load_lock_requires_tested_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_comet_config(tmp_path)
+            cfg.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            cfg.lock_file.write_text(
+                json.dumps(
+                    {
+                        "upstream_url": "https://github.com/g0ldyy/comet",
+                        "pinned_commit": "deadbeef",
+                        "default_branch": "main",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "missing 'tested_digest'"):
+                comet_mod.CometLock.load(cfg.lock_file)
 
     def test_fetch_and_checkout_pinned_runs_clone_fetch_and_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
