@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -434,6 +435,69 @@ class RollbackTests(unittest.TestCase):
             self.assertEqual(state.active_digest, SHA_LATEST)
             self.assertEqual(state.previous_digest, SHA_OTHER)
             compose_fresh.assert_called_once()
+
+
+class AdvisoryUpdateCheckTests(unittest.TestCase):
+    """advisory_update_check is the throttled start-time nudge (plan 5.2):
+    exception-safe, throttled to once per 24h, and silent unless a new
+    digest is actually found."""
+
+    def test_skips_before_first_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            with mock.patch.object(manager, "check_remote") as check_remote:
+                manager.advisory_update_check()
+            check_remote.assert_not_called()
+
+    def test_skips_when_checked_recently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            recent = datetime.now(UTC).isoformat(timespec="seconds")
+            manager.save_state(CometState(active_digest=SHA_LATEST, last_remote_check=recent))
+            with mock.patch.object(manager, "check_remote") as check_remote:
+                manager.advisory_update_check()
+            check_remote.assert_not_called()
+
+    def test_checks_when_last_check_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            stale = (datetime.now(UTC) - timedelta(hours=25)).isoformat(timespec="seconds")
+            manager.save_state(CometState(active_digest=SHA_LATEST, last_remote_check=stale))
+            with (
+                mock.patch.object(manager, "check_remote", return_value=None) as check_remote,
+            ):
+                manager.advisory_update_check()
+            check_remote.assert_called_once()
+
+    def test_logs_one_line_when_update_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            manager.save_state(CometState(active_digest=SHA_LATEST))
+            with (
+                mock.patch.object(manager, "check_remote", return_value=SHA_OTHER),
+                mock.patch.object(manager, "log") as log,
+            ):
+                manager.advisory_update_check()
+            log.assert_called_once()
+            self.assertIn("update", log.call_args.args[0].lower())
+
+    def test_silent_when_no_update_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            manager.save_state(CometState(active_digest=SHA_LATEST))
+            with (
+                mock.patch.object(manager, "check_remote", return_value=None),
+                mock.patch.object(manager, "log") as log,
+            ):
+                manager.advisory_update_check()
+            log.assert_not_called()
+
+    def test_never_raises_on_registry_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            manager.save_state(CometState(active_digest=SHA_LATEST))
+            with mock.patch.object(manager, "check_remote", side_effect=RuntimeError("boom")):
+                manager.advisory_update_check()  # must not raise
 
 
 if __name__ == "__main__":

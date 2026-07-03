@@ -51,6 +51,59 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn([*prefix, "build", "stremio"], runner.calls)
             self.assertIn([*prefix, "up", "-d", "stremio"], runner.calls)
 
+    def test_setup_active_services_skips_comet_advisory_when_comet_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
+            )
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            orch = Orchestrator(guard)
+
+            with (
+                mock.patch.object(guard, "require_commands", return_value=None),
+                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch("stremioguard.comet.CometManager") as manager_cls,
+            ):
+                orch.setup_active_services(reset=True)
+
+            manager_cls.assert_not_called()
+
+    def test_setup_active_services_runs_comet_advisory_check_after_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
+            )
+            cfg = make_config(tmp_path, stremio_enabled=False)
+            guard = GluetunGuard(cfg, runner)
+            orch = Orchestrator(guard)
+
+            comet_cfg = make_comet_config(tmp_path, enabled=True)
+            write_minimal_bundle_manifest(comet_cfg)
+            gateway_cfg = make_comet_gateway_config(tmp_path, enabled=False)
+
+            advisory_manager = mock.MagicMock()
+            with (
+                mock.patch.object(guard, "require_commands", return_value=None),
+                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
+                mock.patch(
+                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
+                ),
+                mock.patch(
+                    "stremioguard.comet_gateway.CometGatewayConfig.from_env",
+                    return_value=gateway_cfg,
+                ),
+                mock.patch(
+                    "stremioguard.comet.CometManager", return_value=advisory_manager
+                ) as manager_cls,
+            ):
+                orch.setup_active_services(reset=True)
+
+            manager_cls.assert_called_once_with(comet_cfg, runner)
+            advisory_manager.advisory_update_check.assert_called_once()
+
     def test_start_runs_setup_when_no_compose_instance_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)

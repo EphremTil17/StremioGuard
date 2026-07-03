@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -35,6 +35,8 @@ from stremioguard.env import atomic_write_text, ensure_directory, env_file_value
 from stremioguard.overrides import write_override_bundle
 from stremioguard.preflight import require_docker, verify_bind_addresses
 from stremioguard.publishing import StackPublisher
+
+ADVISORY_CHECK_INTERVAL_SECONDS = 24 * 3600
 
 
 @contextmanager
@@ -582,8 +584,13 @@ class CometManager:
                         (generated_root / "bundle-manifest.json").read_text(encoding="utf-8")
                     )
         except Exception as error:
-            return {"status": "failed", "detail": str(error), "degraded": []}
-        return {"status": "passed", "detail": "", "degraded": manifest.get("skipped", [])}
+            return {"status": "failed", "detail": str(error), "degraded": [], "applied": []}
+        return {
+            "status": "passed",
+            "detail": "",
+            "degraded": manifest.get("skipped", []),
+            "applied": manifest.get("applied", []),
+        }
 
     def _bootstrap_active_digest(self) -> None:
         """First-run digest resolution (plan 4.3): validate the newest image;
@@ -710,6 +717,29 @@ class CometManager:
         self.check_bind_addresses()
         self.log("Starting Comet stack.")
         self.compose_fresh("up", "-d", *self._comet_services(), capture=False)
+        self.advisory_update_check()
+
+    def advisory_update_check(self) -> None:
+        """Throttled, start-time nudge (plan 5.2): compare against `:latest`
+        at most once per `ADVISORY_CHECK_INTERVAL_SECONDS` and log a single
+        line if a newer digest exists. Never pulls, never validates, never
+        raises — a registry hiccup must not affect a start/restart."""
+        try:
+            state = self.load_state()
+            if state.active_digest is None:
+                return
+            if state.last_remote_check:
+                elapsed = datetime.now(UTC) - datetime.fromisoformat(state.last_remote_check)
+                if elapsed < timedelta(seconds=ADVISORY_CHECK_INTERVAL_SECONDS):
+                    return
+            new_digest = self.check_remote()
+            if new_digest:
+                self.log(
+                    f"Comet update available ({self.config.image}@{new_digest}) — "
+                    "run `./stremio comet update`."
+                )
+        except Exception:
+            logger.debug("Comet advisory update check failed.", exc_info=True)
 
     def check_remote(self) -> str | None:
         """Resolve the remote `:latest` digest and record the check timestamp.

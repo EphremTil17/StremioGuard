@@ -42,13 +42,6 @@ def comet_install() -> None:
     logger.success("Comet is installed and configured locally.")
 
 
-def comet_update() -> None:
-    """Fetch Comet upstream refs and re-checkout the pinned commit."""
-    manager = _comet_manager()
-    manager.fetch_and_checkout_pinned()
-    logger.success("Comet checkout refreshed to the pinned commit.")
-
-
 def comet_start() -> None:
     """Start the Comet stack managed by StremioGuard."""
     manager = _comet_manager()
@@ -121,7 +114,6 @@ def comet_vendor_sync() -> None:
 
 def register(app: typer.Typer) -> None:
     app.command("install")(comet_install)
-    app.command("update")(comet_update)
     app.command("start")(comet_start)
     app.command("stop")(comet_stop)
     app.command("status")(comet_status)
