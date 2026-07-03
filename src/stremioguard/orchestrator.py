@@ -11,7 +11,7 @@ from collections.abc import Callable
 import typer
 from loguru import logger
 
-from stremioguard.config import Config, docker_daemon_help, docker_permission_help
+from stremioguard.config import CometConfig, Config, docker_daemon_help, docker_permission_help
 from stremioguard.guard import GluetunGuard, PublicIPAssessment
 
 app = typer.Typer(
@@ -87,6 +87,7 @@ class Orchestrator:
         g.log(f"Starting services: {', '.join(services)}.")
         g.compose_fresh("up", "-d", *services, capture=False)
         g.success("Active services are running behind gluetun.")
+        self._comet_update_advisory()
 
     def start_active_services(self) -> None:
         if not self.guard.compose_instance_exists():
@@ -102,6 +103,19 @@ class Orchestrator:
         g.log(f"Starting services: {', '.join(services)}.")
         g.compose_fresh("up", "-d", *services, capture=False)
         g.success("Active services are running behind gluetun.")
+        self._comet_update_advisory()
+
+    def _comet_update_advisory(self) -> None:
+        # Plan 5.2: advisory-only, runs AFTER services are up so it can never
+        # delay a start/restart. Deferred import to avoid a circular import
+        # (orchestrator -> comet.manager -> publishing -> config), matching
+        # guard.preflight()'s existing pattern.
+        comet_config = CometConfig.from_env(self.guard.config.root_dir)
+        if not comet_config.enabled:
+            return
+        from stremioguard.comet import CometManager
+
+        CometManager(comet_config, self.guard.runner).advisory_update_check()
 
     def watch_stremio(self) -> None:
         self.guard.require_commands()

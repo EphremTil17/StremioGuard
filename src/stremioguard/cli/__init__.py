@@ -18,6 +18,7 @@ __all__ = [
     "APP",
     "COMET_APP",
     "COMET_TOKEN_APP",
+    "COMET_UPDATE_APP",
 ]
 
 APP = typer.Typer(
@@ -32,6 +33,10 @@ COMET_TOKEN_APP = typer.Typer(
     help="Manage token-gated Comet addon access.",
 )
 COMET_APP.add_typer(COMET_TOKEN_APP, name="token")
+COMET_UPDATE_APP = typer.Typer(
+    help="Check for, validate, and apply Comet image updates.",
+)
+COMET_APP.add_typer(COMET_UPDATE_APP, name="update")
 
 # Setup default console logging formatting
 logger.remove()
@@ -58,7 +63,7 @@ def main(ctx: typer.Context) -> None:
 
 
 # Register subcommands on the Typer application instances
-register_all_commands(APP, COMET_APP, COMET_TOKEN_APP)
+register_all_commands(APP, COMET_APP, COMET_TOKEN_APP, COMET_UPDATE_APP)
 
 if __name__ == "__main__":
     APP()
