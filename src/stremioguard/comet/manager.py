@@ -20,6 +20,7 @@ from loguru import logger
 from stremioguard.comet.lock import CometLock
 from stremioguard.comet.probe import PlaybackProbeResult, probe_playback_url
 from stremioguard.comet.state import STATE_FILE_NAME, CandidateDigest, CometState
+from stremioguard.comet.validation import ephemeral_boot_check, import_smoke_test
 from stremioguard.comet_gateway import (
     COMET_GATEWAY_CONTAINER_PORT,
     CometGatewayConfig,
@@ -37,6 +38,12 @@ from stremioguard.preflight import require_docker, verify_bind_addresses
 from stremioguard.publishing import StackPublisher
 
 ADVISORY_CHECK_INTERVAL_SECONDS = 24 * 3600
+
+# A cached "passed" result is only reusable for a request at the same or a
+# LOWER stage — a compile-only-era cache entry (no "stage" key) must never
+# satisfy today's mandatory import-smoke requirement, and an import-level
+# cache entry must never satisfy an explicit --deep request.
+_VALIDATION_STAGE_RANK = {"import": 1, "deep": 2}
 
 
 @contextmanager
@@ -343,7 +350,7 @@ class CometManager:
         return raw or None
 
     def _compatibility_cache_valid(
-        self, image_digest: str, source_commit: str, patch_fingerprint: str
+        self, image_digest: str, source_commit: str, patch_fingerprint: str, *, deep: bool = False
     ) -> bool:
         cache_file = self.config.state_dir / "compatibility.json"
         if not cache_file.exists():
@@ -352,8 +359,11 @@ class CometManager:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
+        required_rank = _VALIDATION_STAGE_RANK["deep" if deep else "import"]
+        cached_rank = _VALIDATION_STAGE_RANK.get(cached.get("stage"), 0)
         return (
-            all(
+            cached_rank >= required_rank
+            and all(
                 cached.get(key) == value
                 for key, value in {
                     "image": self.config.image,
@@ -431,13 +441,13 @@ class CometManager:
             f"Recommended action:\n{action}"
         )
 
-    def validate_compatibility(self, *, force: bool = False) -> None:
+    def validate_compatibility(self, *, force: bool = False, deep: bool = False) -> None:
         image_ref = self.active_image_ref()
         image_digest = self.ensure_image(image_ref)
         source_commit = self.current_commit() or self.load_lock().pinned_commit
         patch_fingerprint = self._managed_patch_fingerprint()
         if not force and self._compatibility_cache_valid(
-            image_digest, source_commit, patch_fingerprint
+            image_digest, source_commit, patch_fingerprint, deep=deep
         ):
             return
 
@@ -466,9 +476,27 @@ class CometManager:
                             str(generated_file),
                             "exec",
                         )
+                    manifest = json.loads(
+                        (generated_root / "bundle-manifest.json").read_text(encoding="utf-8")
+                    )
                 except Exception as error:
                     diag = self._compatibility_diagnostic(error, source_root)
                     raise RuntimeError(diag) from error
+
+            outputs = manifest.get("outputs", {})
+            smoke = import_smoke_test(self.runner, image_ref, outputs, generated_root)
+            if smoke["status"] != "passed":
+                raise RuntimeError(
+                    "Comet compatibility check failed at the import-smoke stage.\n\n"
+                    f"{smoke['detail']}"
+                )
+            if deep:
+                deep_result = ephemeral_boot_check(self.runner, image_ref, outputs, generated_root)
+                if deep_result["status"] != "passed":
+                    raise RuntimeError(
+                        "Comet compatibility check failed at the ephemeral-boot stage.\n\n"
+                        f"{deep_result['detail']}"
+                    )
 
         cache = {
             "status": "passed",
@@ -477,6 +505,7 @@ class CometManager:
             "source_commit": source_commit,
             "patch_fingerprint": patch_fingerprint,
             "patch_count": len(generated_files),
+            "stage": "deep" if deep else "import",
         }
         ensure_directory(self.config.state_dir)
         atomic_write_text(
@@ -523,8 +552,8 @@ class CometManager:
         self.write_stack_override_file()
         return self.runner.run(self._compose_command(*args), check=check, capture=capture)
 
-    def install(self) -> None:
-        self.prepare_runtime()
+    def install(self, *, deep: bool = False) -> None:
+        self.prepare_runtime(deep=deep)
         if sys.stdin.isatty():
             import typer
 
@@ -533,19 +562,22 @@ class CometManager:
                 "StremioGuard patches.\nRun compatibility check now?",
                 default=True,
             ):
-                self.validate_compatibility()
+                self.validate_compatibility(deep=deep)
             else:
                 self.warn(
                     "Skipped compatibility validation; the next Comet start will "
                     "validate the image automatically."
                 )
         else:
-            self.validate_compatibility()
+            self.validate_compatibility(deep=deep)
 
-    def _validate_digest(self, digest: str) -> dict[str, object]:
+    def _validate_digest(self, digest: str, *, deep: bool = False) -> dict[str, object]:
         """Render + compile the override bundle from `digest`'s own image
-        source, in an isolated temp dir. Never touches the live state_dir or
-        bundle-manifest.json, and never touches running services.
+        source, in an isolated temp dir; then import-smoke-test every applied
+        override against the candidate image itself, and optionally
+        (`deep=True`) boot it ephemerally and probe /health + /manifest.json.
+        Never touches the live state_dir or bundle-manifest.json, and never
+        touches running services.
 
         Returns {"status": "passed"|"failed", "detail": str, "degraded": [...]}.
         `degraded` lists OPTIONAL patches that failed to apply even on a
@@ -583,6 +615,17 @@ class CometManager:
                     manifest = json.loads(
                         (generated_root / "bundle-manifest.json").read_text(encoding="utf-8")
                     )
+
+                outputs = manifest.get("outputs", {})
+                smoke = import_smoke_test(self.runner, image_ref, outputs, generated_root)
+                if smoke["status"] != "passed":
+                    raise RuntimeError(f"import-smoke test failed:\n{smoke['detail']}")
+                if deep:
+                    deep_result = ephemeral_boot_check(
+                        self.runner, image_ref, outputs, generated_root
+                    )
+                    if deep_result["status"] != "passed":
+                        raise RuntimeError(f"ephemeral-boot check failed:\n{deep_result['detail']}")
         except Exception as error:
             return {"status": "failed", "detail": str(error), "degraded": [], "applied": []}
         return {
@@ -592,7 +635,7 @@ class CometManager:
             "applied": manifest.get("applied", []),
         }
 
-    def _bootstrap_active_digest(self) -> None:
+    def _bootstrap_active_digest(self, *, deep: bool = False) -> None:
         """First-run digest resolution (plan 4.3): validate the newest image;
         fall back to the maintainer-tested digest from the lock file if a
         REQUIRED patch fails, so a new install can never be bricked by an
@@ -602,7 +645,7 @@ class CometManager:
             ["docker", "pull", f"{self.config.image}:latest"], check=True, capture=False
         )
         latest_digest = self._image_digest(f"{self.config.image}:latest")
-        report = self._validate_digest(latest_digest)
+        report = self._validate_digest(latest_digest, deep=deep)
 
         if report["status"] == "passed":
             degraded = report.get("degraded") or []
@@ -648,7 +691,7 @@ class CometManager:
             f"{latest_problem}\n\n"
             f"Falling back to the last maintainer-validated image ({tested_digest})."
         )
-        fallback_report = self._validate_digest(tested_digest)
+        fallback_report = self._validate_digest(tested_digest, deep=deep)
         if fallback_report["status"] != "passed":
             raise RuntimeError(
                 "Comet compatibility check failed for the maintainer-tested fallback "
@@ -664,11 +707,11 @@ class CometManager:
             "StremioGuard and run `./stremio comet update` once support ships."
         )
 
-    def prepare_runtime(self) -> None:
+    def prepare_runtime(self, *, deep: bool = False) -> None:
         self.write_runtime_env()
         state = self.load_state()
         if state.active_digest is None:
-            self._bootstrap_active_digest()
+            self._bootstrap_active_digest(deep=deep)
             state = self.load_state()
 
         image_ref = f"{self.config.image}@{state.active_digest}"
@@ -739,12 +782,16 @@ class CometManager:
                     "run `./stremio comet update`."
                 )
         except Exception:
-            logger.debug("Comet advisory update check failed.", exc_info=True)
+            # loguru wants opt(exception=True); stdlib-style exc_info= is a no-op.
+            logger.opt(exception=True).debug("Comet advisory update check failed.")
 
-    def check_remote(self) -> str | None:
+    def resolve_remote_digest(self) -> str | None:
         """Resolve the remote `:latest` digest and record the check timestamp.
-        Returns the new digest if it differs from active, else None. Never
-        pulls, never touches running services — safe to call frequently."""
+        Returns None ONLY when the registry probe fails — unlike check_remote,
+        an unchanged digest is still returned, so callers that must tell
+        "up to date" apart from "could not reach the registry" (the explicit
+        `comet update check` command) can. Never pulls, never touches running
+        services."""
         remote_digest = self._remote_digest()
         state = self.load_state()
         self.save_state(
@@ -752,14 +799,24 @@ class CometManager:
                 state, last_remote_check=datetime.now(UTC).isoformat(timespec="seconds")
             )
         )
+        return remote_digest
+
+    def check_remote(self) -> str | None:
+        """Resolve the remote `:latest` digest and record the check timestamp.
+        Returns the new digest if it differs from active, else None (including
+        when the probe fails — advisory contract; use resolve_remote_digest to
+        distinguish). Never pulls, never touches running services — safe to
+        call frequently."""
+        state = self.load_state()
+        remote_digest = self.resolve_remote_digest()
         if remote_digest is None or remote_digest == state.active_digest:
             return None
         return remote_digest
 
-    def validate_candidate(self, digest: str) -> dict[str, object]:
+    def validate_candidate(self, digest: str, *, deep: bool = False) -> dict[str, object]:
         """Validate `digest` in isolation and record it as the candidate.
         Never touches running services or the live bundle manifest."""
-        report = self._validate_digest(digest)
+        report = self._validate_digest(digest, deep=deep)
         state = self.load_state()
         candidate = CandidateDigest(
             digest=digest,

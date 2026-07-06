@@ -39,7 +39,21 @@ class UpdateCheckTests(unittest.TestCase):
                 mock.patch.object(comet_update_mod, "_comet_manager", return_value=manager),
                 self.assertRaises(typer.Exit),
             ):
-                comet_update_mod.comet_update_check()
+                comet_update_mod.comet_update_check(deep=False)
+
+    def test_registry_probe_failure_fails_loudly_not_up_to_date(self) -> None:
+        # An explicit check must never report a failed probe as "up to date".
+        with tempfile.TemporaryDirectory() as directory:
+            manager = _manager(Path(directory))
+            manager.save_state(CometState(active_digest=SHA_ACTIVE))
+            with (
+                mock.patch.object(comet_update_mod, "_comet_manager", return_value=manager),
+                mock.patch.object(manager, "_remote_digest", return_value=None),
+                mock.patch.object(manager, "validate_candidate") as validate_candidate,
+                self.assertRaises(typer.Exit),
+            ):
+                comet_update_mod.comet_update_check(deep=False)
+            validate_candidate.assert_not_called()
 
     def test_already_up_to_date_does_not_validate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -51,7 +65,7 @@ class UpdateCheckTests(unittest.TestCase):
                 mock.patch.object(manager, "validate_candidate") as validate_candidate,
                 mock.patch.object(comet_update_mod, "logger") as logger_mock,
             ):
-                comet_update_mod.comet_update_check()
+                comet_update_mod.comet_update_check(deep=False)
             validate_candidate.assert_not_called()
             logger_mock.success.assert_called_once()
 
@@ -66,7 +80,7 @@ class UpdateCheckTests(unittest.TestCase):
                 mock.patch.object(manager, "_validate_digest", return_value=report),
                 mock.patch.object(comet_update_mod, "logger") as logger_mock,
             ):
-                comet_update_mod.comet_update_check()
+                comet_update_mod.comet_update_check(deep=False)
             candidate = manager.load_state().candidate
             assert candidate is not None
             self.assertEqual(candidate.digest, SHA_NEW)
@@ -90,7 +104,7 @@ class UpdateCheckTests(unittest.TestCase):
                 mock.patch.object(manager, "_validate_digest", return_value=report),
                 mock.patch.object(comet_update_mod, "logger") as logger_mock,
             ):
-                comet_update_mod.comet_update_check()
+                comet_update_mod.comet_update_check(deep=False)
             warning_messages = [call.args[0] for call in logger_mock.warning.call_args_list]
             self.assertTrue(any("degraded" in msg for msg in warning_messages))
             logger_mock.success.assert_not_called()
@@ -106,7 +120,7 @@ class UpdateCheckTests(unittest.TestCase):
                 mock.patch.object(manager, "_validate_digest", return_value=report),
                 mock.patch.object(comet_update_mod, "logger") as logger_mock,
             ):
-                comet_update_mod.comet_update_check()
+                comet_update_mod.comet_update_check(deep=False)
             self.assertEqual(manager.load_state().active_digest, SHA_ACTIVE)
             warning_messages = [call.args[0] for call in logger_mock.warning.call_args_list]
             self.assertTrue(any("patches fail" in msg for msg in warning_messages))
@@ -134,7 +148,7 @@ class UpdateCheckTests(unittest.TestCase):
                 mock.patch.object(manager, "_validate_digest", return_value=report),
                 mock.patch.object(comet_update_mod, "logger") as logger_mock,
             ):
-                comet_update_mod.comet_update_check()
+                comet_update_mod.comet_update_check(deep=False)
             warning_messages = [call.args[0] for call in logger_mock.warning.call_args_list]
             info_messages = [call.args[0] for call in logger_mock.info.call_args_list]
             self.assertTrue(

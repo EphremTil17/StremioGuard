@@ -109,13 +109,19 @@ class Orchestrator:
         # Plan 5.2: advisory-only, runs AFTER services are up so it can never
         # delay a start/restart. Deferred import to avoid a circular import
         # (orchestrator -> comet.manager -> publishing -> config), matching
-        # guard.preflight()'s existing pattern.
-        comet_config = CometConfig.from_env(self.guard.config.root_dir)
-        if not comet_config.enabled:
-            return
-        from stremioguard.comet import CometManager
+        # guard.preflight()'s existing pattern. The whole body is guarded, not
+        # just the manager call: CometConfig.from_env raises on a bad
+        # mid-flight .env edit, and no advisory path may fail a start that
+        # already succeeded.
+        try:
+            comet_config = CometConfig.from_env(self.guard.config.root_dir)
+            if not comet_config.enabled:
+                return
+            from stremioguard.comet import CometManager
 
-        CometManager(comet_config, self.guard.runner).advisory_update_check()
+            CometManager(comet_config, self.guard.runner).advisory_update_check()
+        except Exception:
+            logger.opt(exception=True).debug("Comet update advisory skipped due to an error.")
 
     def watch_stremio(self) -> None:
         self.guard.require_commands()

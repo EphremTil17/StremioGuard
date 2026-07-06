@@ -104,6 +104,41 @@ class OrchestratorTests(unittest.TestCase):
             manager_cls.assert_called_once_with(comet_cfg, runner)
             advisory_manager.advisory_update_check.assert_called_once()
 
+    def test_comet_advisory_error_never_fails_a_successful_start(self) -> None:
+        # Plan 5.2: no advisory-path exception may escape — the services are
+        # already up, and a bad mid-flight .env edit or manager error must not
+        # turn a successful start into a failed one.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
+            )
+            cfg = make_config(tmp_path, stremio_enabled=False)
+            guard = GluetunGuard(cfg, runner)
+            orch = Orchestrator(guard)
+
+            comet_cfg = make_comet_config(tmp_path, enabled=True)
+            write_minimal_bundle_manifest(comet_cfg)
+            gateway_cfg = make_comet_gateway_config(tmp_path, enabled=False)
+
+            with (
+                mock.patch.object(guard, "require_commands", return_value=None),
+                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
+                mock.patch(
+                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
+                ),
+                mock.patch(
+                    "stremioguard.comet_gateway.CometGatewayConfig.from_env",
+                    return_value=gateway_cfg,
+                ),
+                mock.patch(
+                    "stremioguard.comet.CometManager",
+                    side_effect=RuntimeError("mid-flight .env edit"),
+                ),
+            ):
+                orch.setup_active_services(reset=True)  # must not raise
+
     def test_start_runs_setup_when_no_compose_instance_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
