@@ -12,7 +12,13 @@ from stremioguard.config import CometConfig, Config
 from stremioguard.env import env_file_value, fail
 
 
-def comet_install() -> None:
+def comet_install(
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        help="Also boot the candidate image ephemerally and check /health before accepting it.",
+    ),
+) -> None:
     """Clone/pin Comet and write local runtime configuration."""
     config = CometConfig.from_env(ROOT_DIR)
     if not is_interactive():
@@ -38,7 +44,7 @@ def comet_install() -> None:
 
     prompt_comet_setup(config, is_proxied=is_proxied)
     manager = CometManager(CometConfig.from_env(ROOT_DIR))
-    manager.install()
+    manager.install(deep=deep)
     logger.success("Comet is installed and configured locally.")
 
 

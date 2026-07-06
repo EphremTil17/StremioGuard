@@ -44,7 +44,13 @@ def _log_feature_diff(manager: CometManager, report: dict[str, object]) -> None:
         logger.info(f"This update restores: {', '.join(sorted(newly_fixed))}")
 
 
-def comet_update_check() -> None:
+def comet_update_check(
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        help="Also boot the candidate image ephemerally and check /health before recommending it.",
+    ),
+) -> None:
     """Compare the active Comet image against upstream `:latest` and validate
     any newer digest, without applying or touching running services."""
     manager = _comet_manager()
@@ -52,15 +58,23 @@ def comet_update_check() -> None:
     if state.active_digest is None:
         fail("Comet has no active image yet. Run `./stremio comet install` first.")
 
-    new_digest = manager.check_remote()
+    # resolve_remote_digest, not check_remote: this explicit command must tell
+    # "up to date" apart from "could not reach the registry" — reporting a
+    # failed probe as up-to-date would be a confident false answer.
+    new_digest = manager.resolve_remote_digest()
     if new_digest is None:
+        fail(
+            "Could not resolve the remote Comet digest (registry unreachable, "
+            "rate-limited, or docker buildx missing). Try again later."
+        )
+    if new_digest == state.active_digest:
         logger.success(
             f"Comet is already up to date ({manager.config.image}@{state.active_digest})."
         )
         return
 
     logger.info(f"Update available: {manager.config.image}:latest -> {new_digest}")
-    report = manager.validate_candidate(new_digest)
+    report = manager.validate_candidate(new_digest, deep=deep)
     if report["status"] == "passed":
         _log_feature_diff(manager, report)
         degraded = report.get("degraded") or []
@@ -95,11 +109,18 @@ def comet_update_apply() -> None:
             "StremioGuard update is needed. Run `./stremio comet update check` for details."
         )
 
-    remote_digest = manager.check_remote()
+    # A probe failure (None) does not block apply: the candidate was already
+    # validated, and the staleness check is advisory. But any successfully
+    # resolved digest that differs from the candidate — newer upstream OR an
+    # upstream rollback to the active digest — means the candidate no longer
+    # matches `:latest` and must be re-checked. check_remote can't express the
+    # rollback case (it compares against active), hence resolve_remote_digest.
+    remote_digest = manager.resolve_remote_digest()
     if remote_digest is not None and remote_digest != candidate.digest:
         fail(
-            f"A newer image ({manager.config.image}@{remote_digest}) is now available. "
-            "Run `./stremio comet update check` again before applying."
+            f"Upstream :latest ({manager.config.image}@{remote_digest}) no longer matches "
+            "the validated candidate. Run `./stremio comet update check` again before "
+            "applying."
         )
 
     manager.promote_candidate()
@@ -136,9 +157,14 @@ def comet_update_rollback(
 
 
 def _update_default(ctx: typer.Context) -> None:
-    """`./stremio comet update` with no subcommand defaults to `check`."""
+    """`./stremio comet update` with no subcommand defaults to `check`.
+
+    Calls with an explicit `deep=False` rather than relying on
+    `comet_update_check`'s parameter default — that default is a
+    `typer.Option(...)` sentinel, only resolved to a real bool by Typer's own
+    CLI dispatch, not by a direct Python call like this one."""
     if ctx.invoked_subcommand is None:
-        comet_update_check()
+        comet_update_check(deep=False)
 
 
 def register(update_app: typer.Typer) -> None:

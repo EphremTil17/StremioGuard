@@ -217,6 +217,175 @@ class ValidateDigestPipelineTests(unittest.TestCase):
             degraded_names = {d["name"] for d in report["degraded"]}  # type: ignore[union-attr]
             self.assertIn("torrentio", degraded_names)
 
+    def test_import_smoke_failure_fails_the_whole_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_comet_config(tmp_path)
+            _write_valid_sources_without_torrentio(cfg)
+            manager = CometManager(cfg, FakeRunner({}))
+            with (
+                mock.patch.object(
+                    manager_mod,
+                    "extract_image_source",
+                    side_effect=lambda runner, image_ref: _stub_extract(cfg.repo_dir),
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "import_smoke_test",
+                    return_value={"status": "failed", "stage": "import", "detail": "boom"},
+                ) as smoke,
+                mock.patch.object(manager_mod, "ephemeral_boot_check") as deep,
+            ):
+                report = manager._validate_digest(SHA_OTHER)
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("boom", str(report["detail"]))
+            smoke.assert_called_once()
+            deep.assert_not_called()
+
+    def test_deep_false_never_runs_ephemeral_boot_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_comet_config(tmp_path)
+            _write_valid_sources_without_torrentio(cfg)
+            manager = CometManager(cfg, FakeRunner({}))
+            with (
+                mock.patch.object(
+                    manager_mod,
+                    "extract_image_source",
+                    side_effect=lambda runner, image_ref: _stub_extract(cfg.repo_dir),
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "import_smoke_test",
+                    return_value={"status": "passed", "stage": "import", "detail": ""},
+                ),
+                mock.patch.object(manager_mod, "ephemeral_boot_check") as deep,
+            ):
+                report = manager._validate_digest(SHA_OTHER, deep=False)
+            self.assertEqual(report["status"], "passed")
+            deep.assert_not_called()
+
+    def test_deep_true_runs_ephemeral_boot_check_and_can_fail_the_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_comet_config(tmp_path)
+            _write_valid_sources_without_torrentio(cfg)
+            manager = CometManager(cfg, FakeRunner({}))
+            with (
+                mock.patch.object(
+                    manager_mod,
+                    "extract_image_source",
+                    side_effect=lambda runner, image_ref: _stub_extract(cfg.repo_dir),
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "import_smoke_test",
+                    return_value={"status": "passed", "stage": "import", "detail": ""},
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "ephemeral_boot_check",
+                    return_value={"status": "failed", "stage": "deep", "detail": "never healthy"},
+                ) as deep,
+            ):
+                report = manager._validate_digest(SHA_OTHER, deep=True)
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("never healthy", str(report["detail"]))
+            deep.assert_called_once()
+
+
+class ValidateCompatibilityStageTests(unittest.TestCase):
+    """validate_compatibility (used by install/start) now also runs the
+    mandatory import-smoke stage and records which stage a cached pass
+    covers, so a compile-only-era cache entry can't satisfy today's bar."""
+
+    def _manager_ready_to_render(self, tmp_path: Path) -> CometManager:
+        cfg = make_comet_config(tmp_path)
+        _write_lock(cfg.lock_file, commit="deadbeef")
+        _write_valid_sources_without_torrentio(cfg)
+        image_ref = f"g0ldyy/comet@{SHA_OTHER}"
+        inspect_cmd = ("docker", "image", "inspect", image_ref)
+        inspect_digest_cmd = (*inspect_cmd, "--format", "{{json .RepoDigests}}")
+        responses: dict[
+            tuple[str, ...],
+            list[subprocess.CompletedProcess[str]] | subprocess.CompletedProcess[str],
+        ] = {
+            inspect_cmd: completed(list(inspect_cmd), ""),
+            inspect_digest_cmd: completed(list(inspect_digest_cmd), json.dumps([image_ref])),
+        }
+        manager = CometManager(cfg, FakeRunner(responses))
+        manager.save_state(CometState(active_digest=SHA_OTHER))
+        return manager
+
+    def test_writes_import_stage_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager_ready_to_render(Path(directory))
+            with (
+                mock.patch.object(
+                    manager_mod,
+                    "extract_image_source",
+                    side_effect=lambda runner, image_ref: _stub_extract(manager.config.repo_dir),
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "import_smoke_test",
+                    return_value={"status": "passed", "stage": "import", "detail": ""},
+                ),
+                mock.patch.object(manager_mod, "ephemeral_boot_check") as deep,
+            ):
+                manager.validate_compatibility()
+            cache = json.loads(
+                (manager.config.state_dir / "compatibility.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(cache["stage"], "import")
+            deep.assert_not_called()
+
+    def test_deep_flag_writes_deep_stage_and_runs_ephemeral_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager_ready_to_render(Path(directory))
+            with (
+                mock.patch.object(
+                    manager_mod,
+                    "extract_image_source",
+                    side_effect=lambda runner, image_ref: _stub_extract(manager.config.repo_dir),
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "import_smoke_test",
+                    return_value={"status": "passed", "stage": "import", "detail": ""},
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "ephemeral_boot_check",
+                    return_value={"status": "passed", "stage": "deep", "detail": ""},
+                ) as deep,
+            ):
+                manager.validate_compatibility(deep=True)
+            cache = json.loads(
+                (manager.config.state_dir / "compatibility.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(cache["stage"], "deep")
+            deep.assert_called_once()
+
+    def test_smoke_failure_raises_with_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager_ready_to_render(Path(directory))
+            with (
+                mock.patch.object(
+                    manager_mod,
+                    "extract_image_source",
+                    side_effect=lambda runner, image_ref: _stub_extract(manager.config.repo_dir),
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "import_smoke_test",
+                    return_value={"status": "failed", "stage": "import", "detail": "boom"},
+                ),
+                self.assertRaisesRegex(RuntimeError, "import-smoke stage"),
+            ):
+                manager.validate_compatibility()
+            self.assertFalse((manager.config.state_dir / "compatibility.json").exists())
+
 
 class PrepareRuntimeDigestTests(unittest.TestCase):
     def test_prepare_runtime_bootstraps_on_first_run(self) -> None:
@@ -302,6 +471,29 @@ class RemoteDigestTests(unittest.TestCase):
                 side_effect=subprocess.TimeoutExpired(cmd=list(self._CMD), timeout=20),
             ):
                 self.assertIsNone(manager._remote_digest())
+
+
+class ResolveRemoteDigestTests(unittest.TestCase):
+    """resolve_remote_digest is check_remote minus the active-digest collapse:
+    None means ONLY 'probe failed', so the explicit CLI check can tell
+    up-to-date apart from registry-unreachable."""
+
+    def test_returns_digest_even_when_unchanged_from_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            manager.save_state(CometState(active_digest=SHA_LATEST))
+            with mock.patch.object(manager, "_remote_digest", return_value=SHA_LATEST):
+                self.assertEqual(manager.resolve_remote_digest(), SHA_LATEST)
+            self.assertIsNotNone(manager.load_state().last_remote_check)
+
+    def test_returns_none_only_on_probe_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            manager.save_state(CometState(active_digest=SHA_LATEST))
+            with mock.patch.object(manager, "_remote_digest", return_value=None):
+                self.assertIsNone(manager.resolve_remote_digest())
+            # Still records the attempt for the advisory throttle.
+            self.assertIsNotNone(manager.load_state().last_remote_check)
 
 
 class CheckRemoteTests(unittest.TestCase):

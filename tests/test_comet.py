@@ -987,6 +987,7 @@ class CompatibilityTests(unittest.TestCase):
                 "image_digest": "sha256:image",
                 "source_commit": "commit",
                 "patch_fingerprint": "patches",
+                "stage": "import",
             }
             cfg.state_dir.mkdir(parents=True, exist_ok=True)
             (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
@@ -999,6 +1000,33 @@ class CompatibilityTests(unittest.TestCase):
             )
             self.assertFalse(
                 manager._compatibility_cache_valid("sha256:image", "commit", "changed")
+            )
+
+    def test_compatibility_cache_stage_must_cover_the_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = make_comet_config(Path(directory))
+            manager = CometManager(cfg, FakeRunner({}))
+            cache = {
+                "status": "passed",
+                "image": cfg.image,
+                "image_digest": "sha256:image",
+                "source_commit": "commit",
+                "patch_fingerprint": "patches",
+                "stage": "import",
+            }
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
+            # An import-level cache entry satisfies a plain (non-deep) request...
+            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "commit", "patches"))
+            # ...but not an explicit --deep request, and a pre-Phase-6 cache
+            # entry with no "stage" key at all must never satisfy either.
+            self.assertFalse(
+                manager._compatibility_cache_valid("sha256:image", "commit", "patches", deep=True)
+            )
+            cache.pop("stage")
+            (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
+            self.assertFalse(
+                manager._compatibility_cache_valid("sha256:image", "commit", "patches")
             )
 
 
