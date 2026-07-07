@@ -7,7 +7,12 @@ commands; here every docker interaction is scripted through a mocked runner
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,7 +23,7 @@ from stremioguard.comet.validation import (
     import_smoke_test,
 )
 
-from .conftest import completed
+from .conftest import completed, make_comet_config
 
 
 class ContainerPathToModuleTests(unittest.TestCase):
@@ -219,6 +224,134 @@ class EphemeralBootCheckTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "failed")
         self.assertIn("manifest.json was not reachable", str(result["detail"]))
+
+
+class ValidatorScriptTests(unittest.TestCase):
+    """`python -m stremioguard.comet.validate` — the CI/canary entry point.
+
+    Everything is exercised through `run_validation` with a scripted runner
+    and a temp-dir config: these tests must never read this machine's real
+    `.env` or gateway token state.
+    """
+
+    IMAGE = "g0ldyy/comet@sha256:digest"
+
+    def _run(
+        self,
+        smoke_result: dict[str, object],
+        manifest: dict[str, object],
+        *,
+        bundle_raises: Exception | None = None,
+    ) -> tuple[dict[str, object], mock.Mock]:
+        import stremioguard.comet.validate as validate_mod
+
+        runner = mock.Mock()
+
+        def runner_run(args, **kwargs):
+            if "{{json .RepoDigests}}" in args:
+                return completed(args, f'["{self.IMAGE}"]', "")
+            return completed(args, "", "")
+
+        runner.run.side_effect = runner_run
+
+        def fake_write_bundle(repo_dir, state_dir, **kwargs):
+            if bundle_raises is not None:
+                raise bundle_raises
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / "bundle-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            source_root = tmp_path / "source"
+            (source_root / "comet").mkdir(parents=True)
+
+            @contextlib.contextmanager
+            def fake_extract(runner_arg, image_ref):
+                yield source_root
+
+            write_bundle = mock.Mock(side_effect=fake_write_bundle)
+            with (
+                mock.patch.object(
+                    validate_mod.CometConfig,
+                    "from_env",
+                    return_value=make_comet_config(tmp_path),
+                ),
+                mock.patch.object(validate_mod, "extract_image_source", fake_extract),
+                mock.patch.object(validate_mod, "write_override_bundle", write_bundle),
+                mock.patch.object(validate_mod, "import_smoke_test", return_value=smoke_result),
+            ):
+                report = validate_mod.run_validation(runner, self.IMAGE)
+        return report, write_bundle
+
+    def test_passed_report_lists_applied_patches(self) -> None:
+        report, _ = self._run(
+            {"status": "passed", "stage": "import", "detail": ""},
+            {"outputs": {"stream.py": "/app/x/stream.py"}, "applied": ["stream"], "skipped": []},
+        )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["applied"], ["stream"])
+
+    def test_renders_the_superset_bundle_not_local_config(self) -> None:
+        # tested_digest must vouch for every deployment shape: the gate
+        # force-enables the gateway (its specs become required) and episode
+        # packs, regardless of what this machine's .env says.
+        _, write_bundle = self._run(
+            {"status": "passed", "stage": "import", "detail": ""},
+            {"outputs": {}, "applied": [], "skipped": []},
+        )
+        kwargs = write_bundle.call_args.kwargs
+        self.assertTrue(kwargs["gateway_enabled"])
+        self.assertTrue(kwargs["patch_episode_pack_results"])
+        self.assertEqual(kwargs["result_format_style"], "plain")
+        self.assertIsNotNone(kwargs["gateway_addon_base_url"])
+
+    def test_any_skipped_spec_fails_even_optional(self) -> None:
+        # A skip under the superset config is upstream anchor drift; the
+        # canary must not bump tested_digest past a degraded OPTIONAL patch.
+        report, _ = self._run(
+            {"status": "passed", "stage": "import", "detail": ""},
+            {
+                "outputs": {},
+                "applied": ["stream"],
+                "skipped": [{"name": "torrentio", "reason": "anchor not found"}],
+            },
+        )
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["stage"], "render")
+        self.assertIn("torrentio", str(report["detail"]))
+
+    def test_smoke_failure_fails_the_report(self) -> None:
+        report, _ = self._run(
+            {"status": "failed", "stage": "import", "detail": "No module named 'x'"},
+            {"outputs": {"stream.py": "/app/x/stream.py"}, "applied": ["stream"], "skipped": []},
+        )
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["stage"], "import")
+        self.assertIn("No module named", str(report["detail"]))
+
+    def test_required_render_failure_fails_the_report(self) -> None:
+        report, _ = self._run(
+            {"status": "passed", "stage": "import", "detail": ""},
+            {},
+            bundle_raises=RuntimeError("Required patch 'stream' failed to apply: drift"),
+        )
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("Required patch 'stream'", str(report["detail"]))
+
+    def test_main_exits_nonzero_and_prints_json_report(self) -> None:
+        import stremioguard.comet.validate as validate_mod
+
+        failed_report = {"status": "failed", "stage": "import", "detail": "boom"}
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["validate", "--image", self.IMAGE, "--json"]),
+            mock.patch.object(validate_mod, "run_validation", return_value=failed_report),
+            contextlib.redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as sysexit,
+        ):
+            validate_mod.main()
+        self.assertEqual(sysexit.exception.code, 1)
+        self.assertEqual(json.loads(stdout.getvalue()), failed_report)
 
 
 if __name__ == "__main__":

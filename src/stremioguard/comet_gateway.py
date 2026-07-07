@@ -263,10 +263,13 @@ http {{
     limit_req_zone $binary_remote_addr zone=gateway_admin:1m rate=10r/s;
     limit_req_zone $binary_remote_addr zone=gateway_fail:1m rate=5r/s;
 
-    # Mask the token path segment before it reaches the access log; the raw
-    # request line carries the gateway token (and any config blob after it).
+    # Mask the whole path after /comet/ before it reaches the access log: the
+    # raw request line carries the gateway token AND the base64 Comet config
+    # blob after it, which can embed debrid API keys. Masking only the token
+    # segment would still log the blob, so everything up to the protocol
+    # field is replaced.
     map $request $request_masked {{
-        ~^(?<mrh>\\S+\\s/comet/)[A-Za-z0-9_-]+(?<mrt>\\S*) "${{mrh}}***${{mrt}}";
+        ~^(?<mrh>\\S+\\s/comet/)\\S+(?<mrt>.*)$ "${{mrh}}***${{mrt}}";
         default $request;
     }}
 

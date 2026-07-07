@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,27 @@ class TestCometGatewayManager:
         assert "map $request $request_masked {" in rendered
         # The concrete token value must never appear anywhere in the rendered conf.
         assert token not in rendered
+
+    def test_mask_regex_hides_token_and_config_blob(self, tmp_path: Path) -> None:
+        # Plan 0.1: verify the mask against a real playback request line. It
+        # carries the token AND the base64 config blob after it (which can
+        # embed debrid API keys) — neither may survive into the access log.
+        manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
+        _, token = manager.add_token("Shared Addon")
+        rendered = manager.render_nginx_conf()
+
+        mask_line = next(line for line in rendered.splitlines() if "***" in line)
+        nginx_pattern = mask_line.strip().split(" ")[0].removeprefix("~")
+        pattern = re.compile(nginx_pattern.replace("?<", "?P<"))
+
+        blob = "eyJkZWJyaWRBcGlLZXkiOiJzZWNyZXQta2V5In0"
+        line = f"GET /comet/{token}/{blob}/playback/tt1234/deadbeef HTTP/1.1"
+        match = pattern.match(line)
+        assert match is not None
+        masked = match.group("mrh") + "***" + match.group("mrt")
+        assert masked == "GET /comet/*** HTTP/1.1"
+        assert token not in masked
+        assert blob not in masked
 
     def test_write_nginx_configs_writes_secret_files_at_0600(self, tmp_path: Path) -> None:
         manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
