@@ -138,6 +138,24 @@ Expected results:
 - `./stremio comet doctor` confirms Comet shares gluetun and egresses through
   the VPN
 
+## Rate Limiting and Log Hygiene
+
+The generated nginx config rate-limits abuse paths without ever throttling
+authenticated playback:
+
+- Requests carrying an invalid gateway token are rewritten to an internal
+  location that rejects them in the access phase, rate-limited per client IP
+  (5 r/s, burst 10). Valid tokens never enter that location, so bursty range
+  requests during seeks are unaffected.
+- Human-paced pages (`/configure`, `/static/`, `/health`, `/admin`, and the
+  root page) are limited per client IP at 10 r/s (burst 20), which throttles
+  configure-password brute force.
+- Everything else falls through to a `403` limited at 5 r/s (burst 3).
+
+Access logs record a masked request line: the entire path after `/comet/` —
+the token and the base64 config blob after it, which can embed debrid API
+keys — is replaced with `***`, so neither secret ever lands in `access.log`.
+
 ## Tradeoffs
 
 This is a pragmatic small-scale access model. Tokens in URLs are easy to share

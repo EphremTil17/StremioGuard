@@ -162,14 +162,26 @@ automatically.
 Comet commands:
 
 ```bash
-./stremio comet install
+./stremio comet install [--deep]
 ./stremio comet start
 ./stremio comet status
 ./stremio comet doctor
 ./stremio comet probe-playback --url 'http://<comet-host>:18000/.../playback/...'
 ./stremio comet logs
+./stremio comet update [check [--deep]|apply|rollback]
 ./stremio comet stop
 ```
+
+### Digest Pinning and Update Workflow
+
+To ensure absolute configuration coherence and prevent upstream Comet updates from silently breaking your deployment, StremioGuard enforces a **digest-pinned model**:
+
+1. **Digest Pinning:** The stack always runs Comet from a specific image digest (e.g., `g0ldyy/comet@sha256:...`) instead of floating tags.
+2. **Advisory Start-Time Checks:** Once every 24 hours, running `./stremio start` or `./stremio restart` triggers a throttled check against the upstream `:latest` registry tag. If an update is available, it prints a single notification line without blocking startup.
+3. **Comet Update Suite:**
+   - `./stremio comet update check`: Resolves the remote registry digest, extracts the code, compiles it in isolation, runs a mandatory container-isolated `import-smoke` check, and logs a feature diff (applied/skipped patches). Use `--deep` to run an ephemeral boot test.
+   - `./stremio comet update apply`: Promotes the validated candidate digest to active state and restarts the Comet stack.
+   - `./stremio comet update rollback`: Reverts to the previous active digest.
 
 Recommended phase-1 shape:
 
@@ -268,7 +280,7 @@ With no arguments, `./stremio` behaves like `./stremio start`.
 
 ### Container restart policy
 
-- `stremio` uses `restart: "no"` so Docker does not revive it before the verifier has run.
+- `stremio`, `comet`, `comet-postgres`, and `comet-gateway` use `restart: "no"` so Docker does not revive them before the verifier and validation checks have run.
 - `gluetun` uses `restart: unless-stopped` so it can recover across host reboots and transient handshake failures.
 
 ### Useful commands
@@ -313,6 +325,10 @@ Each `./stremio start` creates a host-side run log under `logs/`, named like `lo
 Use `./stremio logs` to tail the latest run log. The background watchdog writes its PID to `.stremio/watchdog.pid`. `./stremio stop` stops the watchdog before stopping Stremio so it will not immediately restart the container.
 
 The watchdog polls gluetun health and the egress IP every 10 seconds by default. Tune with `WATCH_INTERVAL_SECONDS=5 ./stremio start` for faster checks, or a larger value for less polling.
+
+Additional watchdog parameters:
+- `PUBLIC_IP_FAILURE_THRESHOLD`: The number of consecutive failed public IP checks (returning `UNKNOWN` status) before the watchdog shuts down the stack to fail closed (default: `3`).
+- `IP_CROSSCHECK_INTERVAL_SECONDS`: The interval in seconds at which the watchdog cross-checks the Gluetun control server IP against external public IP providers (default: `300`).
 
 Log summaries are decoupled from the poll cadence and default to every 5 minutes. Tune them with `WATCHDOG_LOG_INTERVAL_SECONDS=300 ./stremio start`. After changing either interval, restart with `./stremio stop` and `./stremio start`.
 

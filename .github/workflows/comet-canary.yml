@@ -1,0 +1,151 @@
+name: Comet Canary
+
+# Daily upstream-drift canary (plan Phase 7.2): resolve the remote digest of
+# <image>:latest, validate it against the patch generator when it differs
+# from the lock's tested_digest, then either open a bump PR or file a drift
+# issue. Scheduled runs fire on the repository's DEFAULT branch only.
+#
+# Note: PRs created with the built-in GITHUB_TOKEN do not trigger other
+# workflows (including ci.yml). The bump PR is validated by this run itself;
+# to also get a CI run on the PR, replace `token` below with a PAT or a
+# GitHub App token.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  canary:
+    name: Validate Upstream Comet Latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve remote and tested digests
+        id: digests
+        run: |
+          IMAGE=$(jq -r '.image' vendor/comet.lock.json)
+          TESTED_DIGEST=$(jq -r '.tested_digest' vendor/comet.lock.json)
+          REMOTE_DIGEST=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          {
+            echo "image=$IMAGE"
+            echo "remote_digest=$REMOTE_DIGEST"
+            echo "tested_digest=$TESTED_DIGEST"
+          } >> "$GITHUB_OUTPUT"
+          echo "Remote :latest digest: $REMOTE_DIGEST"
+          echo "Lock tested_digest:    $TESTED_DIGEST"
+
+      - name: Report up to date
+        if: steps.digests.outputs.remote_digest == steps.digests.outputs.tested_digest
+        run: echo "Upstream :latest matches tested_digest; nothing to do."
+
+      - name: Run patch validation
+        id: run_validation
+        if: steps.digests.outputs.remote_digest != steps.digests.outputs.tested_digest
+        run: |
+          CANDIDATE="${{ steps.digests.outputs.image }}@${{ steps.digests.outputs.remote_digest }}"
+          docker pull "$CANDIDATE"
+          # Scratch outputs live in RUNNER_TEMP so create-pull-request (which
+          # commits every working-tree change under add-paths) can never
+          # sweep them into the bump PR.
+          if uv run python -m stremioguard.comet.validate --image "$CANDIDATE" --json > "$RUNNER_TEMP/validation_report.json"; then
+            echo "failed=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=1" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$RUNNER_TEMP/validation_report.json" || true
+
+      - name: Bump tested_digest and write PR body
+        id: success
+        if: steps.digests.outputs.remote_digest != steps.digests.outputs.tested_digest && steps.run_validation.outputs.failed == '0'
+        run: |
+          REMOTE_DIGEST="${{ steps.digests.outputs.remote_digest }}"
+          IMAGE="${{ steps.digests.outputs.image }}"
+          jq --arg digest "$REMOTE_DIGEST" '.tested_digest = $digest' vendor/comet.lock.json > "$RUNNER_TEMP/comet.lock.json"
+          mv "$RUNNER_TEMP/comet.lock.json" vendor/comet.lock.json
+          SHORT_DIGEST=${REMOTE_DIGEST:7:12}
+          echo "short_digest=$SHORT_DIGEST" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Comet patch validation passed"
+            echo
+            echo "All StremioGuard patches validated (render, compile, and import-smoke, with every optional feature and the gateway enabled) against the new Comet release: \`$IMAGE@$REMOTE_DIGEST\`."
+            echo
+            echo "#### Applied patches"
+            jq -r '.applied[]? | "- \(.)"' "$RUNNER_TEMP/validation_report.json"
+            echo
+            echo "<details><summary>Full validation report</summary>"
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/validation_report.json"
+            echo '```'
+            echo
+            echo "</details>"
+          } > "$RUNNER_TEMP/pr_body.md"
+
+      - name: Create pull request
+        if: steps.digests.outputs.remote_digest != steps.digests.outputs.tested_digest && steps.run_validation.outputs.failed == '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          add-paths: vendor/comet.lock.json
+          commit-message: "build(deps): bump Comet tested_digest to ${{ steps.success.outputs.short_digest }}"
+          title: "build(deps): bump Comet tested_digest to ${{ steps.success.outputs.short_digest }}"
+          body-path: ${{ runner.temp }}/pr_body.md
+          branch: "canary/comet-${{ steps.success.outputs.short_digest }}"
+          delete-branch: true
+
+      - name: File drift issue
+        if: steps.digests.outputs.remote_digest != steps.digests.outputs.tested_digest && steps.run_validation.outputs.failed == '1'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REMOTE_DIGEST="${{ steps.digests.outputs.remote_digest }}"
+          IMAGE="${{ steps.digests.outputs.image }}"
+          SHORT_DIGEST=${REMOTE_DIGEST:7:12}
+          ISSUE_TITLE="Comet upstream drift: patches fail against $SHORT_DIGEST"
+
+          DIAGNOSTIC_DETAIL=$(jq -r '.detail // empty' "$RUNNER_TEMP/validation_report.json" 2>/dev/null || true)
+          [ -n "$DIAGNOSTIC_DETAIL" ] || DIAGNOSTIC_DETAIL="The validator crashed before producing a report; see this workflow run's log."
+
+          {
+            echo "### Comet upstream drift"
+            echo
+            echo "The daily canary failed to validate the StremioGuard patches against the newest Comet release: \`$IMAGE@$REMOTE_DIGEST\`."
+            echo
+            echo "#### Diagnostic"
+            echo '```'
+            echo "$DIAGNOSTIC_DETAIL"
+            echo '```'
+          } > "$RUNNER_TEMP/issue_body.md"
+
+          # The marker label is the de-duplication key; --force makes this
+          # idempotent whether or not the label already exists.
+          gh label create comet-canary --description "Automated Comet upstream drift reports" --force || true
+          EXISTING_ISSUE=$(gh issue list --label comet-canary --state open --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING_ISSUE" ]; then
+            gh issue comment "$EXISTING_ISSUE" --body-file "$RUNNER_TEMP/issue_body.md"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/issue_body.md" --label comet-canary
+          fi
+
+          echo "Validation failed against candidate image: $IMAGE@$REMOTE_DIGEST"
+          exit 1

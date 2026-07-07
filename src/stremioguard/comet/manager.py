@@ -62,7 +62,10 @@ def extract_image_source(runner: Runner, image_ref: str) -> Iterator[Path]:
             yield source_root
         finally:
             if container_id:
-                runner.run(["docker", "rm", "-f", container_id], check=False, capture=False)
+                # Captured: `docker rm -f` echoes the container ID, which is
+                # noise interactively and corrupts machine-readable stdout
+                # (the Phase 7 validator prints its JSON report there).
+                runner.run(["docker", "rm", "-f", container_id], check=False)
 
 
 class CometManager:

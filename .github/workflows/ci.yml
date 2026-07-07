@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ gluetun, main ]
+  pull_request:
+    branches: [ gluetun, main ]
+
+jobs:
+  check:
+    name: Lint, Type Check, Test & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Run Ruff lint check
+        run: uv run ruff check .
+
+      - name: Run Pyright type check
+        run: uv run pyright
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Validate Comet patches against tested digest
+        run: |
+          IMAGE=$(jq -r '.image' vendor/comet.lock.json)
+          TESTED_DIGEST=$(jq -r '.tested_digest' vendor/comet.lock.json)
+          docker pull "$IMAGE@$TESTED_DIGEST"
+          uv run python -m stremioguard.comet.validate --image "$IMAGE@$TESTED_DIGEST"

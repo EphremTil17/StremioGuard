@@ -214,6 +214,9 @@ def ephemeral_boot_check(
             }
         return {"status": "passed", "stage": "deep", "detail": ""}
     finally:
+        # Captured: these teardown commands echo the container ID / network
+        # name, which is noise interactively and corrupts machine-readable
+        # stdout (the Phase 7 validator prints its JSON report there).
         if container_id:
-            runner.run(["docker", "rm", "-f", container_id], check=False, capture=False)
-        runner.run(["docker", "network", "rm", network_name], check=False, capture=False)
+            runner.run(["docker", "rm", "-f", container_id], check=False)
+        runner.run(["docker", "network", "rm", network_name], check=False)

@@ -33,26 +33,55 @@ far fewer results than the user expected.
 
 ## Methodology
 
-The patch strategy is intentionally simple:
+The patch strategy is dynamically compiled and verified:
 
-- keep the upstream Comet checkout in `vendor/comet`
-- generate override files under `.stremio/comet/`
-- mount those files read-only into the Comet container through the generated
-  Compose override
+- We extract the original source code directly from the **active image's**
+  own layer structure (e.g. `g0ldyy/comet@sha256:...`) at runtime.
+- We generate override files dynamically under `.stremio/comet/` and mount
+  them read-only into the container.
+- The local `vendor/comet` checkout is demoted to a maintainer aid used only
+  for local diffing and anchor alignment via `./stremio comet vendor-sync`.
 
-This means we are **not** editing files inside the running container by hand and
-we are **not** maintaining a full hard fork of Comet in the repo.
+### Patch Specs & Requirements
 
-By default, StremioGuard keeps `COMET_TORRENTIO_URL` pointed at the generic
-`https://torrentio.strem.fun` root instead of expecting a user to paste a
-private configured Torrentio URL into the root `.env`. The compatibility
-patches are meant to improve Comet's handling of ordinary Torrentio scraper
-results without turning a secret-bearing addon URL into setup state.
+Each patch is managed as a declarative spec with an explicit requirement class:
 
-The generator entrypoints are:
+| Patch Name | Feature / Purpose | Requirement Class | Degraded Mode (If Failed) |
+|------------|-------------------|-------------------|---------------------------|
+| `stream` | TV-readable stream naming and gateway playback URLs | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; fallback to default stream handler otherwise. |
+| `config` | Protected gateway `/configure` credentials integration | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; public `/configure` remains exposed. |
+| `template` | Configure page installer link customization | `REQUIRED_WHEN_GATEWAY` | Addon installation URL defaults to direct localhost address. |
+| `torrentio` | Preserves richer Torrentio scraper title and index metadata | `OPTIONAL` | Falls back to stock Torrentio parser (missing HDR, resolution tags on some items). |
+| `filtering` | Permissively filters branded/multilingual titles | `OPTIONAL` | Falls back to stock strict title matching. |
+| `formatter` | Curated TV-safe emoji/text layout | `OPTIONAL` | Stream labels default to upstream format layout. |
+| `orchestration` | Preserves episode-pack season priority and badges | `OPTIONAL` | Season pack items are dropped or ranked below single files. |
+| `metadata_service` | Cinemeta caching and season episode count verification | `OPTIONAL` | In-memory count resolution only (higher API latency). |
 
-- `scripts/generate_comet_overrides.py`
-- `src/stremioguard/overrides/`
+### Canary & PR Flow for Maintainers
+
+To keep these patches robust against upstream updates, the project operates
+an automated validation pipeline:
+
+1. **Daily Canary Workflow:** A daily GitHub Actions job
+   (`.github/workflows/comet-canary.yml`) compares the upstream registry
+   digest of `:latest` against the lock's `tested_digest`.
+2. **Automated Validation:** If a new digest is detected, the job runs
+   `python -m stremioguard.comet.validate` to extract, patch, compile, and
+   smoke-import the entire patch suite. The validator force-enables every
+   feature (gateway on, episode packs on) so `tested_digest` vouches for all
+   deployment shapes, and any skipped patch — even an optional one — fails
+   the run as upstream drift.
+3. **Feedback Actions:**
+   - **Pass:** The canary opens an automated PR bumping `tested_digest` in
+     `vendor/comet.lock.json`, embedding the JSON validation report.
+   - **Fail:** The canary opens (or comments on) a tracking issue carrying
+     the `comet-canary` marker label, with the failure diagnostic from the
+     JSON report, so maintainers can update the patch anchors.
+
+The regression gate (`.github/workflows/ci.yml`) runs the same validator
+against the lock's current `tested_digest` on every push and PR, so a change
+to `src/stremioguard/overrides/` that breaks against the digest we claim to
+support cannot land.
 
 The generated files currently include:
 

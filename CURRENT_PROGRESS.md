@@ -9,15 +9,28 @@ into the same Docker product instead of being treated as a separate stack.
 
 ## Mental model
 
-- `src/stremioguard/cli.py` is the user-facing wrapper.
-- `src/stremioguard/orchestrator.py` runs the guard daemon commands.
+- `src/stremioguard/cli/` is the user-facing wrapper (Typer app plus command
+  modules under `cli/commands/`).
+- `src/stremioguard/orchestrator.py` runs the guard daemon commands and
+  triggers the throttled advisory update checks.
 - `src/stremioguard/guard.py` contains Docker, gluetun, and IP-safety logic.
 - `src/stremioguard/init.py` and `src/stremioguard/nordvpn.py` own guided setup.
 - `src/stremioguard/env.py` and `config.py` centralize configuration parsing.
-- `src/stremioguard/comet/manager.py` owns vendored Comet repo management, runtime env
-  generation, doctor checks, and playback probing.
-- `src/stremioguard/publishing.py` owns the shared gluetun-published service
-  override generation used by both Stremio and Comet.
+- `src/stremioguard/comet/manager.py` owns Comet runtime env generation,
+  doctor checks, playback probing, and the digest promotion state machine
+  (candidate validation, promote/rollback, advisory start-time check) behind
+  the `./stremio comet update` commands.
+- `src/stremioguard/comet/state.py` manages local state in `state.json`
+  (active/previous digests, candidate details).
+- `src/stremioguard/comet/validation.py` implements container-isolated import
+  smoke testing and ephemeral deep boot checks.
+- `src/stremioguard/comet/validate.py` is the CI/canary entry point
+  (`python -m stremioguard.comet.validate`), not an operator command.
+- `vendor/comet.lock.json` pins `tested_digest` (last validated by
+  maintainers via the CI canary).
+- `src/stremioguard/publishing.py` owns StackPublisher, which gathers stack
+  configs and atomically writes `docker-compose.bindings.yml`, rendering
+  digest-pinned image references `<image>@<active_digest>`.
 
 The project assumes Stremio itself is not an auth boundary. Security is
 achieved by controlling where the service binds, what network can reach it, and
@@ -88,15 +101,15 @@ point back to the server in proxy-stream mode so the real media path is:
 
 `client -> Tailscale/server -> Comet relay -> debrid provider`
 
-That subsystem is still exposed through `./stremio comet ...` for advanced
-operations, but the root `./stremio` commands now auto-manage it when
-`COMET_ENABLED=1`. The vendored checkout remains under `vendor/comet`, runtime
-state remains under `.stremio/comet/`, and `probe-playback` still fails if it
-observes a direct provider redirect when proxy mode is expected.
+That subsystem is managed automatically by root commands when
+`COMET_ENABLED=1`. The stack runs a strict digest-pinned model using
+`state.json` to prevent updates from breaking configurations. The local
+`vendor/comet` checkout is demoted to a maintainer aid, and all patches are
+dynamically generated from the running image's own extracted source files
+rather than the checkout.
 
 Comet patching is now standardized. Override files are generated from
-`src/stremioguard/overrides/` through
-`scripts/generate_comet_overrides.py`, written under `.stremio/comet/`, and
+`src/stremioguard/overrides/` and written under `.stremio/comet/` to be
 mounted read-only into the running Comet container. The main managed override
 areas today are:
 
@@ -108,8 +121,11 @@ areas today are:
 
 The current matching philosophy is "resolved-file-first, evidence-based
 permissiveness" rather than one-off hardcoded title exceptions. Compatibility is
-validated automatically against the configured Comet image during setup and
-startup; successful checks are cached in `.stremio/comet/compatibility.json`.
+validated dynamically against the candidate Comet image using
+container-isolated import-smoke and optional ephemeral boot checks;
+successful validations are cached in `.stremio/comet/compatibility.json` and
+gate updates before promotion. A daily canary workflow validates the
+upstream latest digest automatically to catch regressions.
 
 Important boundary: phase 1 proves debrid video proxy behavior only. It does
 not prove that every subtitle, manifest, or auxiliary playback request stays on
