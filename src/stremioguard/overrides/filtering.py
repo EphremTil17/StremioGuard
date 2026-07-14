@@ -16,7 +16,7 @@ def render_filtering_override(repo_dir: Path) -> str:
     helper_marker = (
         "def quick_alias_match(text_normalized: str, ez_aliases_normalized: list[str]):\n"
     )
-    if "_fallback_suffix_title_match(" not in content:
+    if "_titles_compat_match(" not in content:
         helper = """
 TITLE_TOKEN_STOPWORDS = {
     "a",
@@ -97,8 +97,16 @@ def _torrent_evidence_match(torrent: dict, title: str, parsed_title: str, aliase
     return False
 
 
-def _titles_compat_match(torrent: dict, title: str, parsed_title: str, aliases: dict) -> bool:
+def _titles_compat_match(
+    torrent: dict, torrent_title: str, title: str, parsed_title: str, aliases: dict
+) -> bool:
     if title_match(title, parsed_title, aliases=aliases):
+        return True
+    # Newer Comet versions ship their own multi-title fallback
+    # (alternate_title_match, added 2026-06); keep it in the chain when this
+    # version has it, so the compat patch only ever widens the net.
+    alternate = globals().get("alternate_title_match")
+    if callable(alternate) and alternate(torrent_title, title, aliases):
         return True
     return _torrent_evidence_match(torrent, title, parsed_title, aliases)
 
@@ -110,14 +118,28 @@ def _titles_compat_match(torrent: dict, title: str, parsed_title: str, aliases: 
             )
         content = content.replace(helper_marker, helper + helper_marker, 1)
 
-    original_line = "if not title_match(title, parsed.parsed_title, aliases=aliases):"
-    replacement_line = "if not _titles_compat_match(torrent, title, parsed.parsed_title, aliases):"
+    replacement_line = (
+        "if not _titles_compat_match(torrent, torrent_title, title, parsed.parsed_title, aliases):"
+    )
+    # Known upstream call-site shapes, newest first. The 2026-06 image added
+    # upstream's own alternate_title_match() fallback and reformatted the call
+    # site; older images use the original single line. Both collapse to the
+    # one compat call above — the injected helper keeps upstream's fallback in
+    # the chain when this version defines it. Anchors are exact-match on
+    # purpose: an unrecognized shape must fail closed, not patch blindly.
+    anchors = (
+        "if not title_match(\n"
+        "                title, parsed.parsed_title, aliases=aliases\n"
+        "            ) and not alternate_title_match(torrent_title, title, aliases):",
+        "if not title_match(title, parsed.parsed_title, aliases=aliases):",
+    )
     if replacement_line not in content:
-        if original_line not in content:
+        anchor = next((candidate for candidate in anchors if candidate in content), None)
+        if anchor is None:
             raise RuntimeError(
                 "Unable to apply managed Comet filtering patch; upstream "
                 "title-match block has changed."
             )
-        content = content.replace(original_line, replacement_line, 1)
+        content = content.replace(anchor, replacement_line, 1)
 
     return content
