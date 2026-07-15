@@ -282,6 +282,7 @@ With no arguments, `./stremio` behaves like `./stremio start`.
 
 - `stremio`, `comet`, `comet-postgres`, and `comet-gateway` use `restart: "no"` so Docker does not revive them before the verifier and validation checks have run.
 - `gluetun` uses `restart: unless-stopped` so it can recover across host reboots and transient handshake failures.
+- `gluetun` tracks the `qmcgaw/gluetun:v3` release channel (not `latest` master builds). Every `./stremio start`/`restart` best-effort pulls the newest v3 release before bringing gluetun up; a failed or slow pull only logs a warning and gluetun boots from the existing local image. A bad release fails closed: the watchdog holds all services down until gluetun is healthy and the IP check passes, and rolling back is re-pinning one line in `docker-compose.yml`.
 
 ### Useful commands
 
