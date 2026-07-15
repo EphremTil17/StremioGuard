@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -367,6 +368,65 @@ class GluetunGuardTests(unittest.TestCase):
                 guard.preflight()
             compose_fresh_mock.assert_called_once_with("up", "-d", "gluetun", capture=False)
             compose_mock.assert_not_called()
+
+    def _preflight_with_pull(self, runner: FakeRunner) -> GluetunGuard:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        tmp_path = Path(directory.name)
+        (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+        guard = GluetunGuard(make_config(tmp_path), runner)
+        with (
+            mock.patch.object(guard, "require_commands"),
+            mock.patch.object(guard, "check_bind_addresses"),
+            mock.patch.object(guard, "wait_for_gluetun_healthy"),
+            mock.patch.object(guard, "public_ip_safe", return_value=True),
+        ):
+            guard.preflight()
+        return guard
+
+    def test_preflight_pulls_gluetun_image_before_up(self) -> None:
+        # Every start/restart tracks the pinned release channel: the pull
+        # must land before gluetun is brought up, never after.
+        runner = FakeRunner({})
+        self._preflight_with_pull(runner)
+        pull_index = next(
+            i for i, args in enumerate(runner.calls) if args[-2:] == ["pull", "gluetun"]
+        )
+        up_index = next(
+            i for i, args in enumerate(runner.calls) if args[-3:] == ["up", "-d", "gluetun"]
+        )
+        self.assertLess(pull_index, up_index)
+        self.assertEqual(runner.calls[pull_index][:2], ["docker", "compose"])
+
+    def test_gluetun_pull_failure_never_fails_start(self) -> None:
+        # A registry hiccup or offline host must not block a start; gluetun
+        # boots from the existing local image instead.
+        runner = FakeRunner({})
+        real_run = runner.run
+
+        def failing_pull(args: list[str], **kwargs: object):
+            if args[-2:] == ["pull", "gluetun"]:
+                return completed(args, "", "connection refused", returncode=1)
+            return real_run(args, **kwargs)  # type: ignore[arg-type]
+
+        with mock.patch.object(runner, "run", side_effect=failing_pull):
+            self._preflight_with_pull(runner)  # must not raise
+        self.assertTrue(any(args[-3:] == ["up", "-d", "gluetun"] for args in runner.calls))
+
+    def test_gluetun_pull_timeout_never_fails_start(self) -> None:
+        # Runner pitfall: timeout= makes subprocess.run RAISE TimeoutExpired;
+        # a hung registry must not hang or fail the start.
+        runner = FakeRunner({})
+        real_run = runner.run
+
+        def hanging_pull(args: list[str], **kwargs: object):
+            if args[-2:] == ["pull", "gluetun"]:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=180)
+            return real_run(args, **kwargs)  # type: ignore[arg-type]
+
+        with mock.patch.object(runner, "run", side_effect=hanging_pull):
+            self._preflight_with_pull(runner)  # must not raise
+        self.assertTrue(any(args[-3:] == ["up", "-d", "gluetun"] for args in runner.calls))
 
     def test_public_ip_via_control_server_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

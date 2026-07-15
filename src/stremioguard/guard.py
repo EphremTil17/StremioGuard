@@ -28,6 +28,7 @@ from stremioguard.preflight import require_docker, verify_bind_addresses
 from stremioguard.publishing import StackPublisher
 
 HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
+GLUETUN_PULL_TIMEOUT_SECONDS = 180
 
 
 class PublicIPAssessment(Enum):
@@ -379,6 +380,37 @@ class GluetunGuard:
             return
         verify_bind_addresses(self.runner, self.bind_addresses(), log=self.log, warn=self.warn)
 
+    def refresh_gluetun_image(self) -> None:
+        """Best-effort `compose pull gluetun` so every start/restart tracks
+        the pinned release channel (`qmcgaw/gluetun:v3` in the compose file).
+
+        The health wait and IP check right after `up` validate whatever was
+        pulled, and a broken image fails closed. A registry hiccup, hung
+        pull, or offline host must never block a start, so every failure
+        only warns and gluetun boots from the existing local image.
+        """
+        self.log("Checking the gluetun release channel for a newer image.")
+        try:
+            if not self.config.compose_override_file.exists():
+                self.write_compose_override()
+            result = self.runner.run(
+                self._compose_command("pull", "gluetun"),
+                check=False,
+                timeout=GLUETUN_PULL_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip().splitlines()
+                suffix = f": {detail[-1]}" if detail else "."
+                self.warn(f"gluetun image pull failed; starting with the existing image{suffix}")
+        except subprocess.TimeoutExpired:
+            self.warn(
+                f"gluetun image pull timed out after {GLUETUN_PULL_TIMEOUT_SECONDS}s; "
+                "starting with the existing image."
+            )
+        except Exception:
+            logger.opt(exception=True).debug("gluetun image pull failed unexpectedly.")
+            self.warn("gluetun image pull failed; starting with the existing image.")
+
     def preflight(self) -> None:
         self.require_commands()
         if not self._env_path.exists():
@@ -397,6 +429,7 @@ class GluetunGuard:
             comet_manager.prepare_runtime()
 
         self.log("Ensuring the gluetun service is running.")
+        self.refresh_gluetun_image()
         # Lifecycle path: gluetun must come up against a freshly rendered
         # override so bind/mount changes apply BEFORE the VPN is verified,
         # not via a surprise dependency-recreate during the services `up`.
