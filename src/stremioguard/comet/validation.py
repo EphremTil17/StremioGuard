@@ -15,10 +15,11 @@ render+compile stage in `comet/manager.py` (plan Phase 6).
 
 from __future__ import annotations
 
+import json
 import secrets
 import subprocess
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from stremioguard.config import Runner
 
@@ -49,6 +50,33 @@ def _override_mount_args(outputs: dict[str, str], bundle_dir: Path) -> list[str]
     return args
 
 
+def image_python_command(runner: Runner, image_ref: str) -> list[str]:
+    """How to invoke THIS image's own Python, read from its entrypoint.
+
+    Not hardcoded, for the same reason the deep boot check runs the image's
+    own entrypoint: upstream changes it. Images through 2026-06 declare
+    `uv run python -m comet.main` and need `uv run python`, because the bare
+    `python` there is the system one without Comet's dependencies; the
+    2026-07 image dropped uv, put its venv first on PATH, and declares
+    `python -m comet.main`. Taking the entrypoint prefix up to and including
+    the interpreter adapts to both. Falls back to plain `python`.
+    """
+    result = runner.run(
+        ["docker", "image", "inspect", image_ref, "--format", "{{json .Config.Entrypoint}}"],
+        check=False,
+    )
+    if result.returncode == 0:
+        try:
+            entrypoint = json.loads((result.stdout or "").strip() or "null")
+        except json.JSONDecodeError:
+            entrypoint = None
+        if isinstance(entrypoint, list):
+            for index, part in enumerate(entrypoint):
+                if isinstance(part, str) and PurePosixPath(part).name.startswith("python"):
+                    return [str(item) for item in entrypoint[: index + 1]]
+    return ["python"]
+
+
 def import_smoke_test(
     runner: Runner, image_ref: str, outputs: dict[str, str], bundle_dir: Path
 ) -> dict[str, object]:
@@ -64,6 +92,7 @@ def import_smoke_test(
     if not modules:
         return {"status": "passed", "stage": "import", "detail": ""}
 
+    python_command = image_python_command(runner, image_ref)
     args = [
         "docker",
         "run",
@@ -73,11 +102,10 @@ def import_smoke_test(
         "-w",
         "/app",
         "--entrypoint",
-        "uv",
+        python_command[0],
         *_override_mount_args(outputs, bundle_dir),
         image_ref,
-        "run",
-        "python",
+        *python_command[1:],
         "-c",
         "; ".join(f"import {module}" for module in modules),
     ]

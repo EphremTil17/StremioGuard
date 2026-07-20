@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -20,6 +21,27 @@ from stremioguard.comet.manager import CometManager, extract_image_source
 from stremioguard.comet.validation import import_smoke_test
 from stremioguard.config import CometConfig, Runner, SubprocessRunner
 from stremioguard.overrides import write_override_bundle
+
+
+def _undefined_names(generated_root: Path) -> str:
+    """Report undefined names (ruff F821) in the rendered bundle.
+
+    A patch can compile cleanly and import cleanly while still calling a
+    helper the current Comet version renamed or stopped importing — the
+    NameError only surfaces when a request finally executes that line, which
+    neither the compile nor the import-smoke stage reaches. Best-effort: an
+    unavailable ruff yields no finding rather than a false failure.
+    """
+    try:
+        result = subprocess.run(
+            ["ruff", "check", "--isolated", "--select", "F821", "--quiet", str(generated_root)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "" if result.returncode == 0 else (result.stdout or result.stderr).strip()
 
 
 def run_validation(runner: Runner, image_ref: str) -> dict[str, object]:
@@ -69,6 +91,17 @@ def run_validation(runner: Runner, image_ref: str) -> dict[str, object]:
                 manifest = json.loads(
                     (generated_root / "bundle-manifest.json").read_text(encoding="utf-8")
                 )
+
+            undefined = _undefined_names(generated_root)
+            if undefined:
+                return {
+                    "status": "failed",
+                    "stage": "lint",
+                    "detail": (
+                        "rendered overrides reference names this Comet version does not "
+                        f"define:\n{undefined}"
+                    ),
+                }
 
             applied = manifest.get("applied", [])
             skipped = manifest.get("skipped", [])
