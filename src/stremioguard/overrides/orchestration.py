@@ -2,6 +2,27 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from stremioguard.overrides._patching import replace_first_matching
+
+_SCOPE_SIGNATURES = (
+    # 2026-07 added the scope_is_known keyword; older images lack it.
+    """    def _matches_requested_scope(
+        self,
+        parsed: ParsedData,
+        *,
+        reject_unknown_override: bool | None = None,
+        scope_is_known: bool = False,
+    ) -> bool:
+""",
+    """    def _matches_requested_scope(
+        self,
+        parsed: ParsedData,
+        *,
+        reject_unknown_override: bool | None = None,
+    ) -> bool:
+""",
+)
+
 
 def render_orchestration_override(repo_dir: Path) -> str:
     # The orchestration patch exists because stock Comet is stricter than
@@ -27,13 +48,11 @@ def render_orchestration_override(repo_dir: Path) -> str:
             1,
         )
 
-    helper_marker = """    def _matches_requested_scope(
-        self,
-        parsed: ParsedData,
-        *,
-        reject_unknown_override: bool | None = None,
-    ) -> bool:
-"""
+    helper_marker = next((sig for sig in _SCOPE_SIGNATURES if sig in content), None)
+    if helper_marker is None:
+        raise RuntimeError(
+            "Unable to apply managed Comet orchestration patch; upstream scope matcher has changed."
+        )
     helper_block = """    def _record_pack_backed_candidate(
         self,
         info_hash: str,
@@ -91,13 +110,76 @@ def render_orchestration_override(repo_dir: Path) -> str:
 
 """
     if "_record_pack_backed_candidate(" not in content:
-        if helper_marker not in content:
-            raise RuntimeError(
-                "Unable to apply managed Comet orchestration patch; upstream "
-                "scope matcher has changed."
-            )
         content = content.replace(helper_marker, helper_block + helper_marker, 1)
 
+    # 2026-07 routed scope matching through self.media_scope.matches_parsed and
+    # dropped the parsed_matches_target import; the patched body must call
+    # whichever primitive THIS version actually has in scope, or it would raise
+    # NameError at request time — a failure the import-smoke stage cannot see.
+    scope_original_new = """    def _matches_requested_scope(
+        self,
+        parsed: ParsedData,
+        *,
+        reject_unknown_override: bool | None = None,
+        scope_is_known: bool = False,
+    ) -> bool:
+        reject_unknown = (
+            self.reject_unknown_episode_files
+            if reject_unknown_override is None
+            else reject_unknown_override
+        )
+        return self.media_scope.matches_parsed(
+            parsed,
+            self.search_season,
+            self.search_episode,
+            target_air_date=self.target_air_date,
+            reject_unknown_episode_files=reject_unknown,
+            scope_is_known=scope_is_known,
+        )"""
+    scope_replacement_new = """    def _matches_requested_scope(
+        self,
+        parsed: ParsedData,
+        *,
+        file_index: int | None = None,
+        reject_unknown_override: bool | None = None,
+        scope_is_known: bool = False,
+    ) -> bool:
+        reject_unknown = (
+            self.reject_unknown_episode_files
+            if reject_unknown_override is None
+            else reject_unknown_override
+        )
+        if self.media_scope.matches_parsed(
+            parsed,
+            self.search_season,
+            self.search_episode,
+            target_air_date=self.target_air_date,
+            reject_unknown_episode_files=reject_unknown,
+            scope_is_known=scope_is_known,
+        ):
+            return True
+
+        if not reject_unknown or self.search_episode is None or parsed.episodes:
+            return False
+
+        if (
+            self.search_season is not None
+            and parsed.seasons
+            and self.search_season in parsed.seasons
+        ):
+            return True
+
+        if file_index is None:
+            return False
+
+        return self.media_scope.matches_parsed(
+            parsed,
+            self.search_season,
+            self.search_episode,
+            target_air_date=self.target_air_date,
+            reject_unknown_episode_files=False,
+            scope_is_known=scope_is_known,
+        )"""
     original_method = """    def _matches_requested_scope(
         self,
         parsed: ParsedData,
@@ -157,69 +239,140 @@ def render_orchestration_override(repo_dir: Path) -> str:
             target_air_date=self.target_air_date,
             reject_unknown_episode_files=False,
         )"""
-    replacement_signature = """    def _matches_requested_scope(
-        self,
-        parsed: ParsedData,
-        *,
-        file_index: int | None = None,
-        reject_unknown_override: bool | None = None,
-    ) -> bool:
-"""
-    if replacement_signature not in content:
-        if original_method not in content:
-            raise RuntimeError(
-                "Unable to apply managed Comet orchestration patch; upstream "
-                "scope matcher has changed."
-            )
-        content = content.replace(original_method, replacement_method, 1)
+    content = replace_first_matching(
+        content,
+        (
+            (scope_original_new, scope_replacement_new),
+            (original_method, replacement_method),
+        ),
+        error=(
+            "Unable to apply managed Comet orchestration patch; upstream scope matcher has changed."
+        ),
+    )
 
-    replacements = {
-        "        for torrent in self.ready_to_cache:\n": (
-            "        for torrent in self.ready_to_cache:\n"
-            "            self._record_pack_backed_candidate(\n"
-            '                torrent["infoHash"],\n'
-            "                episode=self.search_episode,\n"
-            '                file_index=torrent["fileIndex"],\n'
-            "            )\n"
+    # Each edit below is verified: a silent no-op would ship a file that still
+    # reports as applied while having lost the behavior it exists for. Where
+    # upstream reformatted a call site, the older shape follows as a fallback.
+    record_live = (
+        "        for torrent in self.ready_to_cache:\n"
+        "            self._record_pack_backed_candidate(\n"
+        '                torrent["infoHash"],\n'
+        "                episode=self.search_episode,\n"
+        '                file_index=torrent["fileIndex"],\n'
+        "            )\n"
+    )
+    record_cached = (
+        "            self._record_pack_backed_candidate(\n"
+        '                row["info_hash"],\n'
+        '                episode=row["episode"],\n'
+        '                file_index=row["file_index"],\n'
+        "            )\n"
+    )
+    edits: tuple[tuple[str, tuple[tuple[str, str], ...], int], ...] = (
+        (
+            "pack-backed recording for live results",
+            (("        for torrent in self.ready_to_cache:\n", record_live),),
+            # Both ready_to_cache loops record candidates.
+            2,
         ),
-        'if not self._matches_requested_scope(torrent["parsed"]):': (
-            "if not self._matches_requested_scope("
-            'torrent["parsed"], file_index=torrent["fileIndex"]):'
+        (
+            "live scope call",
+            (
+                (
+                    'if not self._matches_requested_scope(torrent["parsed"]):',
+                    "if not self._matches_requested_scope("
+                    'torrent["parsed"], file_index=torrent["fileIndex"]):',
+                ),
+            ),
+            1,
         ),
-        '                "parsed": torrent["parsed"],\n': (
-            '                "parsed": torrent["parsed"],\n'
-            '                "packBacked": await self._is_pack_backed_candidate(\n'
-            '                    torrent["parsed"],\n'
-            "                    info_hash=info_hash,\n"
-            '                    file_index=torrent["fileIndex"],\n'
-            "                ),\n"
+        (
+            "live packBacked flag",
+            (
+                (
+                    '                "parsed": torrent["parsed"],\n',
+                    '                "parsed": torrent["parsed"],\n'
+                    '                "packBacked": await self._is_pack_backed_candidate(\n'
+                    '                    torrent["parsed"],\n'
+                    "                    info_hash=info_hash,\n"
+                    '                    file_index=torrent["fileIndex"],\n'
+                    "                ),\n",
+                ),
+            ),
+            1,
         ),
-        '            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))\n': (
-            "            self._record_pack_backed_candidate(\n"
-            '                row["info_hash"],\n'
-            '                episode=row["episode"],\n'
-            '                file_index=row["file_index"],\n'
-            "            )\n"
-            '            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))\n'
+        (
+            "pack-backed recording for cached rows",
+            (
+                # 2026-07 replaced the inline orjson parse with load_cached_parsed.
+                (
+                    '            parsed_data = load_cached_parsed(row["parsed_json"])\n',
+                    record_cached
+                    + '            parsed_data = load_cached_parsed(row["parsed_json"])\n',
+                ),
+                (
+                    '            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))\n',
+                    record_cached
+                    + '            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))\n',
+                ),
+            ),
+            1,
         ),
-        "parsed_data, reject_unknown_override=reject_unknown_override": (
-            "parsed_data, "
-            'file_index=row["file_index"], '
-            "reject_unknown_override=reject_unknown_override"
+        (
+            "cached scope call",
+            (
+                # 2026-07 split this call across lines and added scope_is_known.
+                (
+                    "                parsed_data,\n"
+                    "                reject_unknown_override=reject_unknown_override,\n",
+                    "                parsed_data,\n"
+                    '                file_index=row["file_index"],\n'
+                    "                reject_unknown_override=reject_unknown_override,\n",
+                ),
+                (
+                    "parsed_data, reject_unknown_override=reject_unknown_override",
+                    "parsed_data, "
+                    'file_index=row["file_index"], '
+                    "reject_unknown_override=reject_unknown_override",
+                ),
+            ),
+            1,
         ),
-        '                "parsed": parsed_data,\n': (
-            '                "parsed": parsed_data,\n'
-            '                "packBacked": await self._is_pack_backed_candidate(\n'
-            "                    parsed_data,\n"
-            "                    info_hash=info_hash,\n"
-            '                    file_index=row["file_index"],\n'
-            "                ),\n"
+        (
+            "cached packBacked flag",
+            (
+                (
+                    '                "parsed": parsed_data,\n',
+                    '                "parsed": parsed_data,\n'
+                    '                "packBacked": await self._is_pack_backed_candidate(\n'
+                    "                    parsed_data,\n"
+                    "                    info_hash=info_hash,\n"
+                    '                    file_index=row["file_index"],\n'
+                    "                ),\n",
+                ),
+            ),
+            1,
         ),
-        "parsed, reject_unknown_override=True": (
-            'parsed, file_index=torrent["fileIndex"], reject_unknown_override=True'
+        (
+            "cache file-info scope call",
+            (
+                (
+                    "parsed, reject_unknown_override=True",
+                    'parsed, file_index=torrent["fileIndex"], reject_unknown_override=True',
+                ),
+            ),
+            1,
         ),
-    }
-    for before, after in replacements.items():
-        content = content.replace(before, after)
+    )
+    for description, candidates, expected in edits:
+        content = replace_first_matching(
+            content,
+            candidates,
+            error=(
+                "Unable to apply managed Comet orchestration patch; "
+                f"upstream {description} has changed."
+            ),
+            expected=expected,
+        )
 
     return content
