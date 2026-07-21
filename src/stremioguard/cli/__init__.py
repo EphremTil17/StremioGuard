@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 
 import typer
@@ -12,7 +13,14 @@ from stremioguard.cli.commands.general import (
     start,
 )
 from stremioguard.cli.context import ENV_FILE
+from stremioguard.config import MANAGED_STACK_ENV
 from stremioguard.env import env_needs_init, fail
+
+# Satisfies the interpolation guard in docker-compose.yml, marking compose
+# invocations as coming from this CLI. Set at import so it is inherited by
+# every compose subprocess and by the background watchdog, whose environment
+# is copied from this one.
+os.environ.setdefault(MANAGED_STACK_ENV, "1")
 
 __all__ = [
     "APP",

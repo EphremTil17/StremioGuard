@@ -239,6 +239,7 @@ def _write_upstream_patch_sources(cfg) -> None:
         encoding="utf-8",
     )
     orchestration_file.write_text(
+        "import orjson\n"
         "from RTN import ParsedData\n"
         "from comet.utils.parsing import parsed_matches_target\n"
         "\n"
@@ -284,11 +285,25 @@ def _write_upstream_patch_sources(cfg) -> None:
         '            if not self._matches_requested_scope(torrent["parsed"]):\n'
         "                continue\n"
         "\n"
-        "    async def get_cached_torrents(self):\n"
-        "        if not self._matches_requested_scope(\n"
-        "            parsed_data, reject_unknown_override=reject_unknown_override\n"
-        "        ):\n"
-        "            return\n"
+        '            info_hash = torrent["infoHash"]\n'
+        "            self.torrents[info_hash] = {\n"
+        '                "fileIndex": torrent["fileIndex"],\n'
+        '                "parsed": torrent["parsed"],\n'
+        "            }\n"
+        "\n"
+        "    async def get_cached_torrents(self, rows):\n"
+        "        for row in rows:\n"
+        '            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))\n'
+        "            if not self._matches_requested_scope(\n"
+        "                parsed_data, reject_unknown_override=reject_unknown_override\n"
+        "            ):\n"
+        "                continue\n"
+        "\n"
+        '            info_hash = row["info_hash"]\n'
+        "            self.torrents[info_hash] = {\n"
+        '                "fileIndex": row["file_index"],\n'
+        '                "parsed": parsed_data,\n'
+        "            }\n"
         "\n"
         "    def _append_cache_file_infos(self, file_infos: list[dict], torrent: dict):\n"
         '        parsed = torrent["parsed"]\n'
