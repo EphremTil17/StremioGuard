@@ -268,12 +268,13 @@ def render_orchestration_override(repo_dir: Path) -> str:
         '                file_index=row["file_index"],\n'
         "            )\n"
     )
-    edits: tuple[tuple[str, tuple[tuple[str, str], ...], int], ...] = (
+    edits: tuple[tuple[str, tuple[tuple[str, str], ...], int | None], ...] = (
         (
             "pack-backed recording for live results",
             (("        for torrent in self.ready_to_cache:\n", record_live),),
-            # Both ready_to_cache loops record candidates.
-            2,
+            # Every ready_to_cache loop records candidates, however many
+            # upstream happens to have.
+            None,
         ),
         (
             "live scope call",

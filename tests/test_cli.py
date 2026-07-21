@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from stremioguard import nordvpn as nordvpn_mod
 from stremioguard.cli import context as context_mod
 from stremioguard.cli import watchdog as watchdog_mod
 from stremioguard.cli.commands import general as general_cmd_mod
+from stremioguard.config import MANAGED_STACK_ENV
 from stremioguard.env import env_file_value
 
 
@@ -563,6 +565,43 @@ class CliCommandTests(unittest.TestCase):
             ext.assert_called_once()
             opt.assert_not_called()
             comet.assert_called_once()
+
+
+class ManagedStackGuardTests(unittest.TestCase):
+    """A bare `docker compose up` misses the generated override, so Postgres
+    gets no credentials and no bind mount and tries to initialize an empty
+    anonymous volume. Compose must refuse that with an explanation instead."""
+
+    def _compose_file(self) -> str:
+        root = Path(__file__).resolve().parent.parent
+        return (root / "docker-compose.yml").read_text(encoding="utf-8")
+
+    def test_compose_requires_the_managed_marker(self) -> None:
+        compose = self._compose_file()
+        self.assertIn(f"${{{MANAGED_STACK_ENV}:?", compose)
+        # The error has to name the supported entry point.
+        marker_line = next(
+            line for line in compose.splitlines() if f"${{{MANAGED_STACK_ENV}:?" in line
+        )
+        self.assertIn("./stremio", marker_line)
+
+    def test_marker_is_not_in_env_example(self) -> None:
+        # Compose auto-loads ./.env, so shipping the marker there would
+        # satisfy the guard for raw `docker compose up` and defeat it.
+        root = Path(__file__).resolve().parent.parent
+        self.assertNotIn(MANAGED_STACK_ENV, (root / ".env.example").read_text(encoding="utf-8"))
+
+    def test_cli_import_sets_the_marker(self) -> None:
+        import stremioguard.cli  # noqa: F401  (import is the behavior under test)
+
+        self.assertEqual(os.environ.get(MANAGED_STACK_ENV), "1")
+
+    def test_watchdog_environment_carries_the_marker(self) -> None:
+        # The background watchdog runs compose too, and its environment is
+        # copied from this process rather than inherited implicitly.
+        with tempfile.TemporaryDirectory() as directory:
+            context = context_mod.RunContext(run_id="test", log_file=Path(directory) / "log")
+            self.assertEqual(context.env(background=True).get(MANAGED_STACK_ENV), "1")
 
 
 if __name__ == "__main__":

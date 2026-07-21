@@ -573,3 +573,22 @@ class RenderOrchestrationNewShapeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             self._render(source)
         self.assertIn("pack-backed recording for cached rows", str(raised.exception))
+
+
+class ReplaceFirstMatchingEveryOccurrenceTests(unittest.TestCase):
+    def test_expected_none_replaces_every_occurrence(self) -> None:
+        # Edits whose intent is "every call site" must not treat a differing
+        # count as drift — upstream merging or adding a loop is legitimate.
+        from stremioguard.overrides._patching import replace_first_matching
+
+        for source, wanted in (("x\n", "y\n"), ("x\nx\n", "y\ny\n"), ("x\nx\nx\n", "y\ny\ny\n")):
+            self.assertEqual(
+                replace_first_matching(source, (("x\n", "y\n"),), error="nope", expected=None),
+                wanted,
+            )
+
+    def test_expected_none_still_fails_closed_on_no_match(self) -> None:
+        from stremioguard.overrides._patching import replace_first_matching
+
+        with self.assertRaises(RuntimeError):
+            replace_first_matching("z\n", (("x\n", "y\n"),), error="anchor gone", expected=None)
