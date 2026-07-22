@@ -544,3 +544,36 @@ class GluetunGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ComposeOverrideBootstrapTests(unittest.TestCase):
+    """A stack whose generated override is missing must still be
+    inspectable and stoppable, and must be able to bootstrap itself."""
+
+    def _guard(self, tmp_path: Path, runner: FakeRunner) -> GluetunGuard:
+        config = make_config(tmp_path)
+        config.compose_override_file.unlink()  # never published yet
+        return GluetunGuard(config, runner)
+
+    def test_compose_omits_a_missing_override_file(self) -> None:
+        # Passing `-f` for a nonexistent file is a hard docker error.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = FakeRunner({})
+            guard = self._guard(Path(directory), runner)
+            guard.compose("ps", check=False)
+            self.assertEqual(runner.calls[-1].count("-f"), 1)
+            self.assertNotIn("docker-compose.bindings.yml", " ".join(runner.calls[-1]))
+
+    def test_instance_check_does_not_publish(self) -> None:
+        # Regression: publishing here required a rendered Comet bundle, which
+        # preflight has not produced yet, so `./stremio start` on a stack
+        # without one failed while telling the operator to run `./stremio
+        # start`.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = self._guard(tmp_path, runner)
+            with mock.patch.object(guard, "write_compose_override") as publish:
+                guard.compose_instance_exists()
+            publish.assert_not_called()
+            self.assertFalse(guard.config.compose_override_file.exists())

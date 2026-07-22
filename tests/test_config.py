@@ -36,8 +36,13 @@ class TestConfig(unittest.TestCase):
                 return False
             return default
 
-        with mock.patch("stremioguard.config.env_flag_enabled", side_effect=mock_env_flag_enabled):
-            config = Config.from_env()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("stremioguard.config.env_flag_enabled", side_effect=mock_env_flag_enabled),
+        ):
+            # Explicit root: from_env() defaults to the repo, whose .env is
+            # root-owned on a hardened install and live on any install.
+            config = Config.from_env(Path(directory))
         self.assertTrue(config.stremio_enabled)
 
     def test_from_env_comet_enabled_only(self) -> None:
@@ -48,8 +53,13 @@ class TestConfig(unittest.TestCase):
                 return True
             return default
 
-        with mock.patch("stremioguard.config.env_flag_enabled", side_effect=mock_env_flag_enabled):
-            config = Config.from_env()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("stremioguard.config.env_flag_enabled", side_effect=mock_env_flag_enabled),
+        ):
+            # Explicit root: from_env() defaults to the repo, whose .env is
+            # root-owned on a hardened install and live on any install.
+            config = Config.from_env(Path(directory))
         self.assertFalse(config.stremio_enabled)
 
 
