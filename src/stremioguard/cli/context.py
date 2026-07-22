@@ -14,7 +14,22 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent.parent
 LOG_DIR = ROOT_DIR / "logs"
 STATE_DIR = ROOT_DIR / ".stremio"
 PID_FILE = STATE_DIR / "watchdog.pid"
-UV_CACHE = ROOT_DIR / ".uv-cache"
+
+
+def toolchain_cache_dir() -> Path:
+    """Where `uv` should keep its cache for this invocation.
+
+    The `./stremio` wrapper exports UV_CACHE_DIR, pointing a non-owner (sudo,
+    a service account) at their own state directory so they never write into
+    the repo owner's tree. Child processes re-derive the path in Python, so
+    they have to honour the same variable — reading only ROOT_DIR here is
+    what previously left a root-owned .uv-cache in the checkout.
+    """
+    override = os.environ.get("UV_CACHE_DIR")
+    return Path(override) if override else ROOT_DIR / ".uv-cache"
+
+
+UV_CACHE = toolchain_cache_dir()
 ENV_FILE = ROOT_DIR / ".env"
 ENV_EXAMPLE = ROOT_DIR / ".env.example"
 

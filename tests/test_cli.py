@@ -604,5 +604,30 @@ class ManagedStackGuardTests(unittest.TestCase):
             self.assertEqual(context.env(background=True).get(MANAGED_STACK_ENV), "1")
 
 
+class ToolchainPathTests(unittest.TestCase):
+    """The wrapper hands the invoking user's cache down via UV_CACHE_DIR;
+    child processes must honour it instead of re-deriving the repo path."""
+
+    def test_cache_dir_honours_the_wrapper_override(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(os.environ, {"UV_CACHE_DIR": directory}),
+        ):
+            self.assertEqual(context_mod.toolchain_cache_dir(), Path(directory))
+
+    def test_cache_dir_falls_back_to_the_checkout(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "UV_CACHE_DIR"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(context_mod.toolchain_cache_dir(), context_mod.ROOT_DIR / ".uv-cache")
+
+    def test_watchdog_spawns_uv_with_that_cache(self) -> None:
+        # Regression: this call site passed a hardcoded repo-relative cache,
+        # so a sudo run left a root-owned .uv-cache in the checkout and broke
+        # `uv run` for the repo owner.
+        command = watchdog_mod._uv_command("python", "-c", "pass")
+        self.assertEqual(command[:2], ["uv", "--cache-dir"])
+        self.assertEqual(command[2], str(watchdog_mod.UV_CACHE))
+
+
 if __name__ == "__main__":
     unittest.main()

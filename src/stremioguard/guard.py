@@ -148,8 +148,14 @@ class GluetunGuard:
     def compose(
         self, *args: str, check: bool = True, capture: bool = True
     ) -> subprocess.CompletedProcess[str]:
-        if not self.config.compose_override_file.exists():
-            self.write_compose_override()
+        """Query/teardown compose call: uses the override if one exists, but
+        never publishes one.
+
+        Publishing requires a rendered Comet bundle, so doing it here made
+        teardown and status depend on a state that `preflight` has not
+        produced yet — a stack whose bundle is missing could not even be
+        inspected or brought down. Lifecycle calls use `compose_fresh`.
+        """
         return self.runner.run(self._compose_command(*args), check=check, capture=capture)
 
     def compose_fresh(
@@ -159,13 +165,14 @@ class GluetunGuard:
         return self.runner.run(self._compose_command(*args), check=check, capture=capture)
 
     def _compose_command(self, *args: str) -> list[str]:
+        override = self.config.compose_override_file
+        override_args = ["-f", str(override)] if override.exists() else []
         return [
             "docker",
             "compose",
             "-f",
             str(self.config.compose_file),
-            "-f",
-            str(self.config.compose_override_file),
+            *override_args,
             *args,
         ]
 
@@ -444,8 +451,9 @@ class GluetunGuard:
         self.log(f"Using Stremio data directory: {data_dir}")
 
     def compose_instance_exists(self) -> bool:
-        if not self.config.compose_override_file.exists():
-            self.write_compose_override()
+        # Deliberately does not publish an override: this runs before
+        # `preflight` has rendered the Comet bundle, and publishing without
+        # one raises. Asking "does an instance exist" must stay a question.
         for service in self.enabled_runtime_services():
             result = self.runner.run(self._compose_command("ps", "-a", "-q", service), check=False)
             if bool((result.stdout or "").strip()):
