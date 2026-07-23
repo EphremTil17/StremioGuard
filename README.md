@@ -64,7 +64,7 @@ During guided setup, Stremio asks which deployment **tier** you're running:
 - **Tier 1 — LAN + Tailscale only.** No public domain. Init writes `STREMIO_BIND_ADDRS=<host-LAN-IP>,<host-tailscale-IP>` when you choose both addresses and clears `EXTERNAL_BASE_URL`. LAN clients reach Stremio at `http://<host-LAN-IP>:<STREMIO_HOST_PORT>`. Tailnet clients can still reach the raw Tailscale IP directly, but the recommended browser/addon path is Tailscale Serve HTTPS on the node's `*.ts.net` hostname. See [docs/tailscale-runbook.md](docs/tailscale-runbook.md) for the end-to-end Serve flow.
 - **Tier 2 / 3 — reverse-proxied behind a domain.** Init writes the selected bind addresses plus `EXTERNAL_BASE_URL=https://<your-domain>`. You provide the proxy (NPM, Caddy, Traefik, raw nginx); it upstreams to one selected host address on `STREMIO_HOST_PORT` and applies whatever access control fits your threat model. Tier 2 is tailnet-only via a Cloudflare → CGNAT DNS pivot; Tier 3 is publicly routable. The Stremio-side config is identical for both.
 
-`init` is idempotent — re-run it to switch tiers. Always start the stack through `./stremio`, never with `docker compose` directly: the guard generates a local Compose override from `STREMIO_BIND_ADDRS` that publishes Stremio's host port, supplies the Comet Postgres credentials, and bind-mounts its data directory. Compose now refuses to run without that override (it fails on an unset `STREMIOGUARD_MANAGED` variable with a message pointing back here) rather than silently starting Postgres against an empty anonymous volume. See [docs/secure-access.md](docs/secure-access.md) for the full per-tier runbook, threat model, and verification steps.
+`init` is idempotent — re-run it to switch tiers. Start the stack through `./stremio`, which generates a local Compose override from `STREMIO_BIND_ADDRS` publishing Stremio's host port along with Comet's image pin and patched files. Ordinary `docker compose` commands work normally against the base file — `docker compose logs -f`, `ps`, and so on — and Postgres finds its real data directory either way, because that path lives in `docker-compose.yml` rather than in the generated override. Starting with plain `docker compose up` is not harmful, it just runs Comet unpinned and unpatched until the next `./stremio start`. See [docs/secure-access.md](docs/secure-access.md) for the full per-tier runbook, threat model, and verification steps.
 
 For NordVPN, `init` offers two protocol paths:
 
@@ -220,6 +220,8 @@ If you want the details, see:
 
 - [docs/comet-gateway.md](docs/comet-gateway.md)
 - [docs/comet-patches.md](docs/comet-patches.md)
+- [docs/rootless-docker.md](docs/rootless-docker.md) — optional: the few things
+  that behave differently if you run the stack under a rootless daemon
 
 For public reverse proxies such as Nginx Proxy Manager or raw nginx, the
 recommended upstream shape is:

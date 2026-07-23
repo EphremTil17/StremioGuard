@@ -24,7 +24,11 @@ from stremioguard.config import (
     parse_public_ip,
 )
 from stremioguard.env import env_file_value, env_int_value
-from stremioguard.preflight import require_docker, verify_bind_addresses
+from stremioguard.preflight import (
+    require_docker,
+    require_matching_daemon,
+    verify_bind_addresses,
+)
 from stremioguard.publishing import StackPublisher
 
 HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
@@ -142,6 +146,11 @@ class GluetunGuard:
             self.runner,
             install_missing=self.config.install_missing,
             log=self.log,
+            warn=self.warn,
+        )
+        require_matching_daemon(
+            self.runner,
+            self.config.compose_override_file.parent / "daemon-id",
             warn=self.warn,
         )
 

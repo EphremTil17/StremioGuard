@@ -577,3 +577,79 @@ class ComposeOverrideBootstrapTests(unittest.TestCase):
                 guard.compose_instance_exists()
             publish.assert_not_called()
             self.assertFalse(guard.config.compose_override_file.exists())
+
+
+class DaemonIdentityTests(unittest.TestCase):
+    """A host can run the rootful daemon and a rootless one side by side.
+    Both see the same bind mounts, so the stack must stay pinned to the
+    daemon that created it."""
+
+    DOCKER_INFO = ["docker", "info", "--format", "{{.ID}}"]
+
+    def _record(self, tmp_path: Path) -> Path:
+        return tmp_path / ".stremio" / "daemon-id"
+
+    def test_first_run_pins_the_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            record = self._record(tmp_path)
+            runner = FakeRunner(
+                {tuple(self.DOCKER_INFO): completed(self.DOCKER_INFO, "daemon-a\n")}
+            )
+            preflight_mod.require_matching_daemon(runner, record, warn=lambda _: None)
+            self.assertEqual(record.read_text(encoding="utf-8").strip(), "daemon-a")
+
+    def test_same_daemon_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            record = self._record(tmp_path)
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text("daemon-a\n", encoding="utf-8")
+            runner = FakeRunner(
+                {tuple(self.DOCKER_INFO): completed(self.DOCKER_INFO, "daemon-a\n")}
+            )
+            preflight_mod.require_matching_daemon(runner, record, warn=lambda _: None)
+
+    def test_switched_daemon_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            record = self._record(tmp_path)
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text("daemon-a\n", encoding="utf-8")
+            runner = FakeRunner(
+                {tuple(self.DOCKER_INFO): completed(self.DOCKER_INFO, "daemon-b\n")}
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                preflight_mod.require_matching_daemon(runner, record, warn=lambda _: None)
+            message = str(ctx.exception)
+            self.assertIn("daemon-a", message)
+            self.assertIn("daemon-b", message)
+            self.assertIn("docker context ls", message)
+            # The record must survive so the operator can still reach the
+            # original daemon after reading the error.
+            self.assertEqual(record.read_text(encoding="utf-8").strip(), "daemon-a")
+
+    def test_unreadable_daemon_id_warns_instead_of_blocking(self) -> None:
+        # An engine that does not report an ID is not a reason to refuse to
+        # run a stack that is otherwise healthy.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            record = self._record(tmp_path)
+            runner = FakeRunner(
+                {tuple(self.DOCKER_INFO): completed(self.DOCKER_INFO, "", "boom", 1)}
+            )
+            warnings: list[str] = []
+            preflight_mod.require_matching_daemon(runner, record, warn=warnings.append)
+            self.assertFalse(record.exists())
+            self.assertEqual(len(warnings), 1)
+
+    def test_guard_pins_daemon_during_require_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {tuple(self.DOCKER_INFO): completed(self.DOCKER_INFO, "daemon-a\n")}
+            )
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            with mock.patch.object(guard_mod, "require_docker", return_value=None):
+                guard.require_commands()
+            self.assertEqual(self._record(tmp_path).read_text(encoding="utf-8").strip(), "daemon-a")

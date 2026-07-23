@@ -20,13 +20,6 @@ from stremioguard.env import (
 )
 
 GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
-# Set by the CLI before it shells out to compose, and required by an
-# interpolation guard in docker-compose.yml. A bare `docker compose up` runs
-# without the generated override — no Postgres credentials and no bind mount
-# for the real data directory — so the guard turns that into an immediate,
-# explanatory error instead of a container that quietly initializes an empty
-# database. Deliberately not placed in `.env`, which compose would auto-load.
-MANAGED_STACK_ENV = "STREMIOGUARD_MANAGED"
 DEFAULT_COMET_HOST_PORT = 18000
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
 

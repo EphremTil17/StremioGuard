@@ -140,13 +140,13 @@ def render_stack_compose_override(
                 "      timeout: 5s",
                 "      retries: 5",
                 "      start_period: 10s",
-                "  comet-postgres:",
-                "    env_file:",
-                f"      - {comet_config.state_dir / 'postgres.env'}",
-                "    volumes:",
-                f"      - {comet_config.postgres_data_dir}:/var/lib/postgresql/",
             ]
         )
+        # comet-postgres is deliberately absent: its env_file and data
+        # directory are fixed paths, so they live in docker-compose.yml where
+        # every way of starting the stack picks them up. Generating them here
+        # meant a plain `docker compose up` started Postgres against an
+        # anonymous volume.
 
     return "\n".join(content) + "\n"
 
