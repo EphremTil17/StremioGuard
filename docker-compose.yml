@@ -59,18 +59,24 @@ services:
   comet-postgres:
     image: postgres:18-alpine
     restart: "no"
-    environment:
-      # Refuse to run outside `./stremio`. The generated override
-      # (.stremio/docker-compose.bindings.yml) supplies this service's
-      # credentials and bind-mounts the real data directory; started without
-      # it, Postgres finds an empty anonymous volume and tries to initialize
-      # a brand-new database. Compose fails on this unset variable first, so
-      # the operator gets an explanation instead of a confusing
-      # "database is uninitialized" error.
-      STREMIOGUARD_MANAGED: "${STREMIOGUARD_MANAGED:?start this stack with ./stremio (for example ./stremio start) rather than docker compose - the generated override supplies Postgres credentials and the data directory mount}"
-    # Credentials are supplied through a generated env_file (.stremio/comet/
-    # postgres.env) added by the compose override, so the password is not a
-    # hardcoded default in this file.
+    # The data directory lives here, in the base file, so that no way of
+    # starting this service can miss it. It used to be supplied only by the
+    # generated override, which meant a plain `docker compose up` gave Postgres
+    # an empty anonymous volume and it tried to initialize a new database on
+    # top of a working one. Guarding against that with a `${VAR:?}` tripwire
+    # was worse than the disease: Compose interpolates before *every* command,
+    # so `logs` and `ps` broke too. A fixed relative path costs nothing and
+    # removes the failure mode entirely.
+    volumes:
+      - ./.stremio/comet/postgres-data:/var/lib/postgresql/
+    # Credentials come from a generated file so no password is hardcoded here.
+    # `required: false` keeps every Compose command working before `./stremio
+    # init` has generated it; Postgres then refuses to initialize a *new*
+    # cluster without a password, which is the correct failure and its own
+    # clear message.
+    env_file:
+      - path: ./.stremio/comet/postgres.env
+        required: false
     command:
       - "postgres"
       - "-c"

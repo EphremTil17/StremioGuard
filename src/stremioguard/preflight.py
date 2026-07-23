@@ -6,6 +6,7 @@ import json
 import shutil
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from stremioguard.config import Runner, docker_permission_help
 
@@ -45,6 +46,55 @@ def require_docker(
             "Docker is installed, but the daemon is not reachable from this shell. "
             "Run `docker ps` to confirm and fix Docker access before retrying."
         )
+
+
+def require_matching_daemon(
+    runner: Runner,
+    record: Path,
+    *,
+    warn: Callable[[str], None],
+) -> None:
+    """Refuse to drive the stack from a different Docker daemon than made it.
+
+    One host can run the rootful daemon and a rootless per-user daemon at the
+    same time, and `docker context use` (or sudo, which reads root's contexts)
+    switches between them silently. Both daemons see the same bind mounts, so
+    starting the stack under the second one aims a second Postgres at the live
+    data directory. The postmaster.pid lock cannot save us there: the running
+    postmaster is in another PID namespace, so its PID either looks dead or
+    collides with an unrelated process. Pin the daemon on first start and
+    refuse to move without an explicit opt-out.
+    """
+    result = runner.run(["docker", "info", "--format", "{{.ID}}"], check=False)
+    current = (result.stdout or "").strip()
+    if result.returncode != 0 or not current:
+        # Older engines and odd endpoints may not report an ID. A missing
+        # identity is not a reason to block a stack that is otherwise fine.
+        warn("Could not read the Docker daemon ID; skipping the daemon-identity check.")
+        return
+
+    if not record.exists():
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(f"{current}\n", encoding="utf-8")
+        return
+
+    previous = record.read_text(encoding="utf-8").strip()
+    if not previous or previous == current:
+        return
+
+    raise RuntimeError(
+        "This stack was created under a different Docker daemon.\n"
+        f"  created under: {previous}\n"
+        f"  this shell:    {current}\n"
+        "Both daemons mount the same data directories, so starting the stack here "
+        "would point a second Postgres at the live data directory and risk "
+        "corrupting it.\n"
+        "Run `docker context ls` to see which endpoint each context uses, then switch "
+        "back with `docker context use <name>` (remember that sudo reads root's "
+        "contexts, not yours).\n"
+        f"If you moved daemons on purpose, confirm the old stack is fully removed and "
+        f"delete {record} to re-pin."
+    )
 
 
 def _install_apt_packages(

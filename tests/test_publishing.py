@@ -42,6 +42,23 @@ class TestPublishingOverride(unittest.TestCase):
         self.assertIn("comet:", content)
         self.assertIn("comet-gateway:", content)
 
+    def test_override_leaves_postgres_paths_to_the_base_file(self) -> None:
+        # The data directory and credentials file are fixed paths, so they live
+        # in docker-compose.yml where every way of starting the stack picks
+        # them up. Emitting them here too would restore the split that let a
+        # plain `docker compose up` hand Postgres an anonymous volume.
+        content = render_stack_compose_override(
+            bind_addresses=["10.0.0.1"],
+            stremio_host_port=11470,
+            stremio_container_port=11470,
+            stremio_enabled=False,
+            comet_config=make_comet_config(Path("/tmp"), enabled=True),
+            comet_gateway_config=None,
+        )
+        self.assertIn("comet:", content)
+        self.assertNotIn("postgres-data", content)
+        self.assertNotIn("postgres.env", content)
+
     def test_stremio_only_profile_publishing(self) -> None:
         content = render_stack_compose_override(
             bind_addresses=["10.0.0.1"],

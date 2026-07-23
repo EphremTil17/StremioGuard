@@ -16,7 +16,6 @@ from stremioguard import nordvpn as nordvpn_mod
 from stremioguard.cli import context as context_mod
 from stremioguard.cli import watchdog as watchdog_mod
 from stremioguard.cli.commands import general as general_cmd_mod
-from stremioguard.config import MANAGED_STACK_ENV
 from stremioguard.env import env_file_value
 
 
@@ -567,41 +566,38 @@ class CliCommandTests(unittest.TestCase):
             comet.assert_called_once()
 
 
-class ManagedStackGuardTests(unittest.TestCase):
-    """A bare `docker compose up` misses the generated override, so Postgres
-    gets no credentials and no bind mount and tries to initialize an empty
-    anonymous volume. Compose must refuse that with an explanation instead."""
+class PostgresDataDirectoryTests(unittest.TestCase):
+    """Postgres must find its real data directory no matter how the stack is
+    started, including a plain `docker compose up` with no override.
+
+    This used to be enforced by a `${VAR:?}` tripwire that made Compose refuse
+    to run at all without the generated override. That guarded the right thing
+    the wrong way: Compose interpolates before every command, so `logs` and
+    `ps` were rejected too. Putting the fixed path in the base file removes the
+    failure mode instead of detecting it."""
 
     def _compose_file(self) -> str:
         root = Path(__file__).resolve().parent.parent
         return (root / "docker-compose.yml").read_text(encoding="utf-8")
 
-    def test_compose_requires_the_managed_marker(self) -> None:
+    def test_base_compose_mounts_the_data_directory(self) -> None:
         compose = self._compose_file()
-        self.assertIn(f"${{{MANAGED_STACK_ENV}:?", compose)
-        # The error has to name the supported entry point.
-        marker_line = next(
-            line for line in compose.splitlines() if f"${{{MANAGED_STACK_ENV}:?" in line
-        )
-        self.assertIn("./stremio", marker_line)
+        self.assertIn(".stremio/comet/postgres-data:/var/lib/postgresql/", compose)
 
-    def test_marker_is_not_in_env_example(self) -> None:
-        # Compose auto-loads ./.env, so shipping the marker there would
-        # satisfy the guard for raw `docker compose up` and defeat it.
-        root = Path(__file__).resolve().parent.parent
-        self.assertNotIn(MANAGED_STACK_ENV, (root / ".env.example").read_text(encoding="utf-8"))
+    def test_base_compose_supplies_the_credentials_file(self) -> None:
+        compose = self._compose_file()
+        self.assertIn(".stremio/comet/postgres.env", compose)
+        # Optional, so every Compose command still works on a fresh clone
+        # before `./stremio init` has generated it.
+        self.assertIn("required: false", compose)
 
-    def test_cli_import_sets_the_marker(self) -> None:
-        import stremioguard.cli  # noqa: F401  (import is the behavior under test)
-
-        self.assertEqual(os.environ.get(MANAGED_STACK_ENV), "1")
-
-    def test_watchdog_environment_carries_the_marker(self) -> None:
-        # The background watchdog runs compose too, and its environment is
-        # copied from this process rather than inherited implicitly.
-        with tempfile.TemporaryDirectory() as directory:
-            context = context_mod.RunContext(run_id="test", log_file=Path(directory) / "log")
-            self.assertEqual(context.env(background=True).get(MANAGED_STACK_ENV), "1")
+    def test_no_interpolation_tripwire_remains(self) -> None:
+        # A required-variable interpolation on a live line breaks read-only
+        # commands too. Comments are exempt: one of them explains the removal.
+        live = [
+            line for line in self._compose_file().splitlines() if not line.lstrip().startswith("#")
+        ]
+        self.assertNotIn(":?", "\n".join(live))
 
 
 class ToolchainPathTests(unittest.TestCase):
