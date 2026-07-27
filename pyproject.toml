@@ -18,7 +18,7 @@ packages = ["src/stremioguard"]
 dev = [
     "pyright>=1.1.411",
     "pytest>=9.1.1",
-    "ruff>=0.15.22",
+    "ruff>=0.16.0",
 ]
 
 [tool.pytest.ini_options]
