@@ -3,10 +3,49 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from stremioguard.comet_gateway import CometGatewayConfig
 from stremioguard.config import CometConfig, Config
+
+# Deployment paths that modules bind at import time (`from ...context import
+# ROOT_DIR`), so patching the defining module alone would not reach them.
+_SANDBOXED_PATHS = {
+    "ROOT_DIR": lambda root: root,
+    "ENV_FILE": lambda root: root / ".env",
+    "STATE_DIR": lambda root: root / ".stremio",
+    "LOG_DIR": lambda root: root / "logs",
+    "UV_CACHE": lambda root: root / ".uv-cache",
+    "PID_FILE": lambda root: root / ".stremio" / "watchdog.pid",
+    "LOCK_FILE": lambda root: root / ".stremio" / "watchdog.lock",
+}
+
+
+@pytest.fixture(autouse=True)
+def sandbox_deployment_paths(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Point every module-level deployment path at a throwaway root.
+
+    The test suite must never touch the real deployment: on a hardened
+    install `.env` and `.stremio/` are root-owned, so reaching them raises
+    PermissionError, and on a permissive one a test could mutate live
+    credentials or state. Rebinding the constants in every already-imported
+    stremioguard module keeps that structural rather than something each new
+    test has to remember.
+    """
+    root = tmp_path_factory.mktemp("deployment")
+    (root / ".stremio").mkdir()
+    for module in list(sys.modules.values()):
+        if not getattr(module, "__name__", "").startswith("stremioguard"):
+            continue
+        for attribute, build in _SANDBOXED_PATHS.items():
+            if isinstance(getattr(module, attribute, None), Path):
+                monkeypatch.setattr(module, attribute, build(root))
+    return root
 
 
 class FakeRunner:
@@ -60,6 +99,10 @@ def completed(
 def make_config(tmp_path: Path, **overrides: object) -> Config:
     state_dir = tmp_path / ".stremio"
     state_dir.mkdir(parents=True, exist_ok=True)
+    # A configured deployment has already published its override, and compose
+    # commands only pass `-f` for a file that exists (a missing one is a hard
+    # docker error). Create it so command assertions match a real stack.
+    (state_dir / "docker-compose.bindings.yml").touch()
     values: dict[str, object] = {
         "root_dir": tmp_path,
         "compose_file": tmp_path / "docker-compose.yml",

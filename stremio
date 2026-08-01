@@ -51,4 +51,24 @@ ensure_uv() {
 }
 
 ensure_uv
-exec uv --cache-dir "$ROOT_DIR/.uv-cache" run python -m stremioguard.cli "$@"
+
+# Whoever runs this gets their own virtualenv and cache unless they own the
+# checkout. Syncing dependencies as a different user (sudo, a service
+# account) would otherwise leave files in ./.venv and ./.uv-cache that the
+# repo owner cannot write, silently breaking their `uv run` later. The test
+# is ownership rather than "am I root", so a non-root service account is
+# covered too.
+repo_uid="$(stat -c %u "$ROOT_DIR" 2>/dev/null || echo -1)"
+if [[ "$(id -u)" != "${repo_uid}" ]]; then
+    state_dir="${STREMIOGUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/stremioguard}"
+    UV_CACHE_DIR="${UV_CACHE_DIR:-${state_dir}/uv-cache}"
+    UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-${state_dir}/venv}"
+    mkdir -p "${UV_CACHE_DIR}" "$(dirname -- "${UV_PROJECT_ENVIRONMENT}")"
+    chmod 700 "${state_dir}"
+else
+    UV_CACHE_DIR="${UV_CACHE_DIR:-$ROOT_DIR/.uv-cache}"
+    UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$ROOT_DIR/.venv}"
+fi
+export UV_CACHE_DIR UV_PROJECT_ENVIRONMENT
+
+exec uv run python -m stremioguard.cli "$@"

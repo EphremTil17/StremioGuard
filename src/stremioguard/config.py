@@ -140,8 +140,10 @@ class Config:
     public_ip_failure_threshold: int
 
     @classmethod
-    def from_env(cls) -> Config:
-        root_dir = Path(__file__).resolve().parent.parent.parent
+    def from_env(cls, root_dir: Path | None = None) -> Config:
+        # Optional root mirrors CometConfig.from_env, so callers (and tests)
+        # can point at a directory other than the installed checkout.
+        root_dir = root_dir or Path(__file__).resolve().parent.parent.parent
         env_file = root_dir / ".env"
         stremio_enabled = env_flag_enabled("STREMIO_ENABLED", True, env_path=env_file)
         comet_enabled = env_flag_enabled("COMET_ENABLED", False, env_path=env_file)
