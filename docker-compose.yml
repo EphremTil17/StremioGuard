@@ -59,6 +59,15 @@ services:
   comet-postgres:
     image: postgres:18-alpine
     restart: "no"
+    environment:
+      # Refuse to run outside `./stremio`. The generated override
+      # (.stremio/docker-compose.bindings.yml) supplies this service's
+      # credentials and bind-mounts the real data directory; started without
+      # it, Postgres finds an empty anonymous volume and tries to initialize
+      # a brand-new database. Compose fails on this unset variable first, so
+      # the operator gets an explanation instead of a confusing
+      # "database is uninitialized" error.
+      STREMIOGUARD_MANAGED: "${STREMIOGUARD_MANAGED:?start this stack with ./stremio (for example ./stremio start) rather than docker compose - the generated override supplies Postgres credentials and the data directory mount}"
     # Credentials are supplied through a generated env_file (.stremio/comet/
     # postgres.env) added by the compose override, so the password is not a
     # hardcoded default in this file.
