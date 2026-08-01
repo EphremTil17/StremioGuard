@@ -20,6 +20,7 @@ from unittest import mock
 from stremioguard.comet.validation import (
     container_path_to_module,
     ephemeral_boot_check,
+    image_python_command,
     import_smoke_test,
 )
 
@@ -37,10 +38,46 @@ class ContainerPathToModuleTests(unittest.TestCase):
         self.assertIsNone(container_path_to_module("/app/comet/templates/index.html"))
 
 
+def _runner_with_entrypoint(entrypoint: str) -> mock.Mock:
+    """Runner that answers the image-inspect probe, then succeeds."""
+    runner = mock.Mock()
+
+    def run(args: list[str], **kwargs: object):
+        if args[:3] == ["docker", "image", "inspect"]:
+            return completed(args, entrypoint, "")
+        return completed(args, "", "")
+
+    runner.run.side_effect = run
+    return runner
+
+
+class ImagePythonCommandTests(unittest.TestCase):
+    """The interpreter invocation is read from the image, not hardcoded:
+    upstream dropped uv in 2026-07 and put its venv first on PATH."""
+
+    def test_uses_uv_prefix_when_the_entrypoint_declares_it(self) -> None:
+        runner = _runner_with_entrypoint('["uv","run","python","-m","comet.main"]')
+        self.assertEqual(
+            image_python_command(runner, "g0ldyy/comet@sha256:abc"), ["uv", "run", "python"]
+        )
+
+    def test_uses_bare_python_when_the_entrypoint_declares_it(self) -> None:
+        runner = _runner_with_entrypoint('["python","-m","comet.main"]')
+        self.assertEqual(image_python_command(runner, "g0ldyy/comet@sha256:abc"), ["python"])
+
+    def test_falls_back_to_python_on_an_unrecognized_entrypoint(self) -> None:
+        for entrypoint in ('["/bin/sh","-c","serve"]', "null", "", "not json"):
+            runner = _runner_with_entrypoint(entrypoint)
+            self.assertEqual(
+                image_python_command(runner, "g0ldyy/comet@sha256:abc"),
+                ["python"],
+                msg=entrypoint,
+            )
+
+
 class ImportSmokeTestTests(unittest.TestCase):
     def test_passes_and_mounts_every_python_output(self) -> None:
-        runner = mock.Mock()
-        runner.run.return_value = completed(["docker"], "", "")
+        runner = _runner_with_entrypoint('["uv","run","python","-m","comet.main"]')
         outputs = {
             "stream.py": "/app/comet/api/endpoints/stream.py",
             "index.html": "/app/comet/templates/index.html",
@@ -51,8 +88,7 @@ class ImportSmokeTestTests(unittest.TestCase):
 
         args = runner.run.call_args.args[0]
         self.assertEqual(args[:5], ["docker", "run", "--rm", "--network", "none"])
-        self.assertIn("--entrypoint", args)
-        self.assertIn("uv", args)
+        self.assertEqual(args[args.index("--entrypoint") + 1], "uv")
         # Only the .py output is bind-mounted; the template is not a module.
         self.assertIn("-v", args)
         mount_index = args.index("-v")
@@ -61,9 +97,27 @@ class ImportSmokeTestTests(unittest.TestCase):
             f"{Path('/bundle') / 'stream.py'}:/app/comet/api/endpoints/stream.py:ro",
         )
         self.assertNotIn("index.html", " ".join(args))
+        # The interpreter's remaining argv follows the image reference.
+        image_index = args.index("g0ldyy/comet@sha256:abc")
+        self.assertEqual(args[image_index + 1 : image_index + 3], ["run", "python"])
         # The import statement only references the Python module, not the template.
         script = args[-1]
         self.assertEqual(script, "import comet.api.endpoints.stream")
+
+    def test_uses_bare_python_on_images_without_uv(self) -> None:
+        runner = _runner_with_entrypoint('["python","-m","comet.main"]')
+        result = import_smoke_test(
+            runner,
+            "g0ldyy/comet@sha256:abc",
+            {"stream.py": "/app/comet/api/endpoints/stream.py"},
+            Path("/bundle"),
+        )
+        self.assertEqual(result["status"], "passed")
+        args = runner.run.call_args.args[0]
+        self.assertEqual(args[args.index("--entrypoint") + 1], "python")
+        self.assertNotIn("uv", args)
+        image_index = args.index("g0ldyy/comet@sha256:abc")
+        self.assertEqual(args[image_index + 1], "-c")
 
     def test_no_python_outputs_passes_without_running_docker(self) -> None:
         runner = mock.Mock()
@@ -80,7 +134,13 @@ class ImportSmokeTestTests(unittest.TestCase):
         # Same Runner pitfall as _remote_digest/ephemeral polls: timeout= makes
         # subprocess.run RAISE TimeoutExpired, not return a nonzero result.
         runner = mock.Mock()
-        runner.run.side_effect = subprocess.TimeoutExpired(cmd=["docker", "run"], timeout=60)
+
+        def run(args: list[str], **kwargs: object):
+            if args[:3] == ["docker", "image", "inspect"]:
+                return completed(args, '["python","-m","comet.main"]', "")
+            raise subprocess.TimeoutExpired(cmd=args, timeout=60)
+
+        runner.run.side_effect = run
         result = import_smoke_test(
             runner,
             "g0ldyy/comet@sha256:abc",

@@ -2,6 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from stremioguard.overrides._patching import replace_first_matching
+
+# Insertion points for the injected helpers, newest upstream shape first.
+# 2026-07 moved title matching into a TitleMatcher class and renamed
+# quick_alias_match to exact_alias_match; earlier images have neither.
+_HELPER_MARKERS = (
+    "class TitleMatcher:\n",
+    "def quick_alias_match(text_normalized: str, ez_aliases_normalized: list[str]):\n",
+)
+
 
 def render_filtering_override(repo_dir: Path) -> str:
     # The filtering patch makes title matching more evidence-driven. If the
@@ -13,9 +23,11 @@ def render_filtering_override(repo_dir: Path) -> str:
         raise RuntimeError(f"Comet filtering file not found at {filtering_file}.")
     content = filtering_file.read_text(encoding="utf-8")
 
-    helper_marker = (
-        "def quick_alias_match(text_normalized: str, ez_aliases_normalized: list[str]):\n"
-    )
+    helper_marker = next((marker for marker in _HELPER_MARKERS if marker in content), None)
+    if helper_marker is None:
+        raise RuntimeError(
+            "Unable to apply managed Comet filtering patch; upstream helper marker has changed."
+        )
     if "_titles_compat_match(" not in content:
         helper = """
 TITLE_TOKEN_STOPWORDS = {
@@ -98,48 +110,61 @@ def _torrent_evidence_match(torrent: dict, title: str, parsed_title: str, aliase
 
 
 def _titles_compat_match(
-    torrent: dict, torrent_title: str, title: str, parsed_title: str, aliases: dict
+    torrent: dict,
+    torrent_title: str,
+    title: str,
+    parsed_title: str,
+    aliases: dict,
+    matcher=None,
 ) -> bool:
-    if title_match(title, parsed_title, aliases=aliases):
-        return True
-    # Newer Comet versions ship their own multi-title fallback
-    # (alternate_title_match, added 2026-06); keep it in the chain when this
-    # version has it, so the compat patch only ever widens the net.
-    alternate = globals().get("alternate_title_match")
-    if callable(alternate) and alternate(torrent_title, title, aliases):
-        return True
+    # Upstream's own matchers always run first, so this patch can only ever
+    # widen the net. 2026-07 consolidated them behind TitleMatcher; on that
+    # shape the call site passes the live matcher and its whole chain
+    # (exact-alias, title_match, alternate_title_match) is delegated to.
+    if matcher is not None:
+        if matcher.matches_title(torrent_title, parsed_title):
+            return True
+    else:
+        if title_match(title, parsed_title, aliases=aliases):
+            return True
+        # 2026-06 added a multi-title fallback as a module-level function;
+        # keep it in the chain when this version defines it.
+        alternate = globals().get("alternate_title_match")
+        if callable(alternate) and alternate(torrent_title, title, aliases):
+            return True
     return _torrent_evidence_match(torrent, title, parsed_title, aliases)
 
 
 """
-        if helper_marker not in content:
-            raise RuntimeError(
-                "Unable to apply managed Comet filtering patch; upstream helper marker has changed."
-            )
         content = content.replace(helper_marker, helper + helper_marker, 1)
 
-    replacement_line = (
-        "if not _titles_compat_match(torrent, torrent_title, title, parsed.parsed_title, aliases):"
+    # Known upstream call-site shapes, newest first: 2026-07 delegates to a
+    # TitleMatcher instance, 2026-06 chained a module-level
+    # alternate_title_match, older images call title_match on one line. Each
+    # collapses to a single compat call. Anchors are exact-match on purpose:
+    # an unrecognized shape must fail closed, not patch blindly.
+    compat = "_titles_compat_match(torrent, torrent_title, title, parsed.parsed_title, aliases"
+    content = replace_first_matching(
+        content,
+        (
+            (
+                "if not matcher.matches_title(torrent_title, parsed.parsed_title):",
+                f"if not {compat}, matcher):",
+            ),
+            (
+                "if not title_match(\n"
+                "                title, parsed.parsed_title, aliases=aliases\n"
+                "            ) and not alternate_title_match(torrent_title, title, aliases):",
+                f"if not {compat}):",
+            ),
+            (
+                "if not title_match(title, parsed.parsed_title, aliases=aliases):",
+                f"if not {compat}):",
+            ),
+        ),
+        error=(
+            "Unable to apply managed Comet filtering patch; upstream title-match block has changed."
+        ),
     )
-    # Known upstream call-site shapes, newest first. The 2026-06 image added
-    # upstream's own alternate_title_match() fallback and reformatted the call
-    # site; older images use the original single line. Both collapse to the
-    # one compat call above — the injected helper keeps upstream's fallback in
-    # the chain when this version defines it. Anchors are exact-match on
-    # purpose: an unrecognized shape must fail closed, not patch blindly.
-    anchors = (
-        "if not title_match(\n"
-        "                title, parsed.parsed_title, aliases=aliases\n"
-        "            ) and not alternate_title_match(torrent_title, title, aliases):",
-        "if not title_match(title, parsed.parsed_title, aliases=aliases):",
-    )
-    if replacement_line not in content:
-        anchor = next((candidate for candidate in anchors if candidate in content), None)
-        if anchor is None:
-            raise RuntimeError(
-                "Unable to apply managed Comet filtering patch; upstream "
-                "title-match block has changed."
-            )
-        content = content.replace(anchor, replacement_line, 1)
 
     return content
