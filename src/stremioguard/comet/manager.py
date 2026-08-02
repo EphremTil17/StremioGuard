@@ -935,10 +935,18 @@ class CometManager:
         if not container_id or not self.container_health_status(container_id):
             return False
         result = self.runner.run(
-            ["docker", "exec", container_id, "wget", "-qO-", "http://127.0.0.1:8000/health"],
+            [
+                "docker",
+                "exec",
+                container_id,
+                "/app/.venv/bin/python",
+                "-c",
+                "import urllib.request; resp = urllib.request.urlopen('http://127.0.0.1:8000/health'); print(resp.read().decode())",
+            ],
             check=False,
             timeout=5,
         )
+
         if result.returncode != 0:
             return False
         return '{"status":"ok"}' in (result.stdout or "").replace(" ", "")
@@ -957,14 +965,25 @@ class CometManager:
 
     def public_ip(self, container_name: str) -> str | None:
         for url in ("https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"):
+            py_script = f"import urllib.request; print(urllib.request.urlopen('{url}', timeout=5).read().decode().strip())"
+            for py_bin in ("/app/.venv/bin/python", "python3", "python"):
+                result = self.runner.run(
+                    ["docker", "exec", container_name, py_bin, "-c", py_script],
+                    check=False,
+                    timeout=10,
+                )
+                if result.returncode == 0 and (result.stdout or "").strip():
+                    return result.stdout.strip()
+
             result = self.runner.run(
                 ["docker", "exec", container_name, "wget", "-qO-", url],
                 check=False,
                 timeout=10,
             )
-            if result.returncode == 0:
-                return (result.stdout or "").strip() or None
+            if result.returncode == 0 and (result.stdout or "").strip():
+                return result.stdout.strip()
         return None
+
 
     def gluetun_container_id(self) -> str | None:
         return self.service_container_id("gluetun")
