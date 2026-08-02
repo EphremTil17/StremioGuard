@@ -16,6 +16,7 @@ from stremioguard import nordvpn as nordvpn_mod
 from stremioguard.cli import context as context_mod
 from stremioguard.cli import watchdog as watchdog_mod
 from stremioguard.cli.commands import general as general_cmd_mod
+from stremioguard.config import MANAGED_STACK_ENV
 from stremioguard.env import env_file_value
 
 
@@ -598,6 +599,46 @@ class PostgresDataDirectoryTests(unittest.TestCase):
             line for line in self._compose_file().splitlines() if not line.lstrip().startswith("#")
         ]
         self.assertNotIn(":?", "\n".join(live))
+
+
+class ComposeUpGateTests(unittest.TestCase):
+    """`docker compose up` on its own yields a stack with no published ports,
+    an unconfigured Comet, no leak check and no watchdog. A gate service says
+    so, and only `up` runs containers, so read-only commands stay usable."""
+
+    def _compose_file(self) -> str:
+        root = Path(__file__).resolve().parent.parent
+        return (root / "docker-compose.yml").read_text(encoding="utf-8")
+
+    def test_gate_service_name_carries_the_instruction(self) -> None:
+        # For `up -d`, Compose shows only `service "<name>" didn't complete
+        # successfully`, so the name is the sole text that reaches the operator.
+        compose = self._compose_file()
+        self.assertIn("use-stremio-start-instead:", compose)
+
+    def test_everything_is_gated_through_gluetun(self) -> None:
+        # Every other service hangs off gluetun, so gating gluetun is enough.
+        compose = self._compose_file()
+        gluetun = compose.split("\n  gluetun:", 1)[1].split("\n  stremio:", 1)[0]
+        self.assertIn("use-stremio-start-instead", gluetun)
+        self.assertIn("service_completed_successfully", gluetun)
+
+    def test_gate_reads_the_marker_at_runtime_not_interpolation(self) -> None:
+        # `${VAR:-0}` resolves for every command but only *matters* when the
+        # container runs; `${VAR:?}` would abort `logs` and `ps` as well.
+        compose = self._compose_file()
+        self.assertIn(f"${{{MANAGED_STACK_ENV}:-0}}", compose)
+
+    def test_cli_import_sets_the_marker(self) -> None:
+        import stremioguard.cli  # noqa: F401  (import is the behavior under test)
+
+        self.assertEqual(os.environ.get(MANAGED_STACK_ENV), "1")
+
+    def test_watchdog_environment_carries_the_marker(self) -> None:
+        # The watchdog runs compose too, from a copied environment.
+        with tempfile.TemporaryDirectory() as directory:
+            context = context_mod.RunContext(run_id="test", log_file=Path(directory) / "log")
+            self.assertEqual(context.env(background=True).get(MANAGED_STACK_ENV), "1")
 
 
 class ToolchainPathTests(unittest.TestCase):

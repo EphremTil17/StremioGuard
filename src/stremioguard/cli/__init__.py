@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 
 import typer
@@ -12,7 +13,13 @@ from stremioguard.cli.commands.general import (
     start,
 )
 from stremioguard.cli.context import ENV_FILE
+from stremioguard.config import MANAGED_STACK_ENV
 from stremioguard.env import env_needs_init, fail
+
+# Lets the compose gate know the stack is being started through this CLI. Set
+# at import so every compose subprocess inherits it, including the background
+# watchdog, whose environment is copied from this process.
+os.environ.setdefault(MANAGED_STACK_ENV, "1")
 
 __all__ = [
     "APP",

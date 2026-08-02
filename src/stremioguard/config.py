@@ -19,6 +19,11 @@ from stremioguard.env import (
     env_int_value,
 )
 
+# Marks compose invocations as coming from this CLI. The `use-stremio-start-
+# instead` gate in docker-compose.yml reads it when its container runs, so an
+# unset value stops `docker compose up` while leaving `logs`, `ps` and `config`
+# working. Setting it by hand is the documented override.
+MANAGED_STACK_ENV = "STREMIOGUARD_MANAGED"
 GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
 DEFAULT_COMET_HOST_PORT = 18000
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
