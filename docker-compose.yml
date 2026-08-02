@@ -1,5 +1,36 @@
 services:
+  # A gate, not a service. `docker compose up` on its own produces a stack with
+  # no published ports, an unconfigured Comet, no public-IP leak check and no
+  # watchdog -- quietly broken rather than dangerous, which is worse to debug.
+  # Everything hangs off gluetun, so gating gluetun gates the whole stack.
+  #
+  # The name carries the instruction on purpose. Compose prints the container's
+  # own output only for an attached `up`; for `up -d` the single line the
+  # operator sees is `service "..." didn't complete successfully`, so the
+  # service name is the only text guaranteed to reach them either way.
+  #
+  # Nothing here is interpolated with `${VAR:?}`: that resolves before *every*
+  # command and would break `logs`, `ps` and `config` too. The check happens
+  # when the container runs, so only `up` is affected.
+  use-stremio-start-instead:
+    image: busybox:stable
+    restart: "no"
+    environment:
+      STREMIOGUARD_MANAGED: "${STREMIOGUARD_MANAGED:-0}"
+    command:
+      - sh
+      - -c
+      - |
+        [ "$${STREMIOGUARD_MANAGED}" = "1" ] && exit 0
+        echo "'docker compose up' skips the public-IP leak check and the watchdog,"
+        echo "and does not render the override that publishes ports or configures Comet."
+        echo "Run './stremio start' instead, or set STREMIOGUARD_MANAGED=1 to override."
+        exit 1
+
   gluetun:
+    depends_on:
+      use-stremio-start-instead:
+        condition: service_completed_successfully
     # Release channel, not master builds; the guard best-effort pulls this
     # tag on every start/restart so the newest v3 release is always used.
     image: qmcgaw/gluetun:v3
