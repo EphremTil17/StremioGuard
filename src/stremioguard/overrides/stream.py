@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from stremioguard.overrides._patching import replace_first_matching
+
 
 def render_stream_override(repo_dir: Path) -> str:
     stream_file = repo_dir / "comet" / "api" / "endpoints" / "stream.py"
     if not stream_file.exists():
         raise RuntimeError(f"Comet stream endpoint file not found at {stream_file}.")
     content = stream_file.read_text(encoding="utf-8")
+    if "    torrents = search_result.torrents\n" not in content:
+        raise RuntimeError(
+            "Unable to apply required RTN rank display patch; Comet no longer uses "
+            "the supported MediaSearchResult stream architecture."
+        )
+
     helper_marker = "def _build_stream_name(\n"
     if "_display_resolution_label(" not in content:
         helper = r"""
@@ -166,26 +174,23 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
         ),
     }
     for before, after in call_replacements.items():
-        content = content.replace(before, after)
+        if after in content:
+            continue
+        if before not in content:
+            continue
+        content = replace_first_matching(
+            content,
+            ((before, after),),
+            error=(
+                "Unable to apply managed Comet stream-name patch; upstream "
+                "stream call shape has changed."
+            ),
+        )
 
-    # Stamp each torrent dict with its RTN rank so the per-stream formatter can
-    # surface it. ranked_torrents maps info_hash -> RTN Torrent (carrying .rank);
-    # torrents maps info_hash -> the dict consumed during stream building.
-    rank_stamp_block = "    torrents = torrent_manager.torrents\n"
-    rank_stamp_replacement = (
-        "    torrents = torrent_manager.torrents\n"
-        "    for _sg_info_hash, _sg_ranked in torrent_manager.ranked_torrents.items():\n"
-        "        _sg_torrent = torrents.get(_sg_info_hash)\n"
-        "        if _sg_torrent is not None:\n"
-        '            _sg_torrent["_sg_rank"] = getattr(_sg_ranked, "rank", None)\n'
-    )
-    if "_sg_rank" not in content and rank_stamp_block in content:
-        content = content.replace(rank_stamp_block, rank_stamp_replacement, 1)
-
-    # Render technical metadata first, then the RTN rank, and finally the raw
-    # release title. The title is intentionally last because Android TV may
-    # truncate the bottom of a stream card; technical metadata and rank must
-    # remain visible above it.
+    # Comet now hands this endpoint a MediaSearchResult. Its scalar rank map
+    # crosses the search boundary separately from the native ordered hashes.
+    # This is deliberately required: accepting a partially patched stream file
+    # silently removed the user-visible RTN score in the past.
     size_rank_block = """        formatted_components = format_components(
             rtn_data,
             torrent_title,
@@ -204,7 +209,7 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
             torrent["tracker"],
             config["resultFormat"],
         )
-        _sg_rank = torrent.get("_sg_rank")
+        _sg_rank = search_result.rtn_ranks.get(info_hash)
         _sg_display_components = dict(formatted_components)
         _sg_title = _sg_display_components.pop("title", None)
         _sg_size = _sg_display_components.get("size")
@@ -216,7 +221,10 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
         if _sg_title is not None:
             formatted_title = f"{formatted_title}\\n{_sg_title}"
 """
-    rank_already_applied = size_rank_replacement in content
-    if "_sg_rank" in content and not rank_already_applied and size_rank_block in content:
-        content = content.replace(size_rank_block, size_rank_replacement, 1)
-    return content
+    return replace_first_matching(
+        content,
+        ((size_rank_block, size_rank_replacement),),
+        error=(
+            "Unable to apply required RTN rank display patch; Comet stream formatting has changed."
+        ),
+    )
