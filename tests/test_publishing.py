@@ -250,6 +250,7 @@ class TestPublisherFailClosed(unittest.TestCase):
             outputs = {
                 "stream.py": "/app/comet/api/endpoints/stream.py",
                 "config.py": "/app/comet/api/endpoints/config.py",
+                "media_search.py": "/app/comet/services/media_search.py",
                 "index.html": "/app/comet/templates/index.html",
             }
             (state_dir / "bundle-manifest.json").write_text(
@@ -280,7 +281,10 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
             state_dir = root / ".stremio" / "comet"
             state_dir.mkdir(parents=True)
             (state_dir / "bundle-manifest.json").write_text(
-                json.dumps({"outputs": {}}), encoding="utf-8"
+                json.dumps(
+                    {"outputs": {"media_search.py": "/app/comet/services/media_search.py"}},
+                ),
+                encoding="utf-8",
             )
             from stremioguard.comet.state import CometState
 
@@ -302,7 +306,10 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
             state_dir = root / ".stremio" / "comet"
             state_dir.mkdir(parents=True)
             (state_dir / "bundle-manifest.json").write_text(
-                json.dumps({"outputs": {}}), encoding="utf-8"
+                json.dumps(
+                    {"outputs": {"media_search.py": "/app/comet/services/media_search.py"}},
+                ),
+                encoding="utf-8",
             )
             StackPublisher(root).publish()
             content = (root / ".stremio" / "docker-compose.bindings.yml").read_text(
@@ -320,7 +327,10 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
             state_dir = root / ".stremio" / "comet"
             state_dir.mkdir(parents=True)
             (state_dir / "bundle-manifest.json").write_text(
-                json.dumps({"outputs": {}}), encoding="utf-8"
+                json.dumps(
+                    {"outputs": {"media_search.py": "/app/comet/services/media_search.py"}},
+                ),
+                encoding="utf-8",
             )
             from stremioguard.comet.state import CometState
 

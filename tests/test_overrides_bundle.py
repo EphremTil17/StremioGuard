@@ -122,17 +122,18 @@ class TestOverridesBundle(unittest.TestCase):
             comet_cfg = make_comet_config(root, enabled=True)
             comet_cfg.state_dir.mkdir(parents=True, exist_ok=True)
 
-            # Write dummy manifest listing only 'stream' and 'formatter' as applied
+            # Write dummy manifest listing all required rank-context mounts.
             manifest = {
                 "image_digest": "sha256:123",
                 "patch_fingerprint": "fp123",
                 "format_style": "emoji",
                 "patch_episode_pack": False,
-                "applied": ["formatter", "stream"],
+                "applied": ["formatter", "stream", "media_search"],
                 "skipped": [],
                 "outputs": {
                     "formatting.py": "/app/comet/utils/formatting.py",
                     "stream.py": "/app/comet/api/endpoints/stream.py",
+                    "media_search.py": "/app/comet/services/media_search.py",
                 },
             }
             (comet_cfg.state_dir / "bundle-manifest.json").write_text(
@@ -155,6 +156,7 @@ class TestOverridesBundle(unittest.TestCase):
             # Formatting and stream should be in volume mounts
             self.assertIn("/app/comet/utils/formatting.py:ro", override_content)
             self.assertIn("/app/comet/api/endpoints/stream.py:ro", override_content)
+            self.assertIn("/app/comet/services/media_search.py:ro", override_content)
 
             # Others like config or torrentio should NOT be in volume mounts
             self.assertNotIn("/app/comet/api/endpoints/config.py:ro", override_content)

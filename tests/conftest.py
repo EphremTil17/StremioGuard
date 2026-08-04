@@ -211,6 +211,7 @@ def write_minimal_bundle_manifest(comet_config: CometConfig) -> None:
             {
                 "outputs": {
                     "stream.py": "/app/comet/api/endpoints/stream.py",
+                    "media_search.py": "/app/comet/services/media_search.py",
                     "config.py": "/app/comet/api/endpoints/config.py",
                     "index.html": "/app/comet/templates/index.html",
                 }
