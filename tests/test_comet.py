@@ -47,6 +47,7 @@ def _write_lock(
 def _write_upstream_patch_sources(cfg) -> None:
     formatting_file = cfg.repo_dir / "comet" / "utils" / "formatting.py"
     stream_file = cfg.repo_dir / "comet" / "api" / "endpoints" / "stream.py"
+    media_search_file = cfg.repo_dir / "comet" / "services" / "media_search.py"
     config_file = cfg.repo_dir / "comet" / "api" / "endpoints" / "config.py"
     template_file = cfg.repo_dir / "comet" / "templates" / "index.html"
     torrentio_file = cfg.repo_dir / "comet" / "scrapers" / "torrentio.py"
@@ -54,11 +55,31 @@ def _write_upstream_patch_sources(cfg) -> None:
     orchestration_file = cfg.repo_dir / "comet" / "services" / "orchestration.py"
     formatting_file.parent.mkdir(parents=True, exist_ok=True)
     stream_file.parent.mkdir(parents=True, exist_ok=True)
+    media_search_file.parent.mkdir(parents=True, exist_ok=True)
     config_file.parent.mkdir(parents=True, exist_ok=True)
     template_file.parent.mkdir(parents=True, exist_ok=True)
     torrentio_file.parent.mkdir(parents=True, exist_ok=True)
     filtering_file.parent.mkdir(parents=True, exist_ok=True)
     orchestration_file.parent.mkdir(parents=True, exist_ok=True)
+    media_search_file.write_text(
+        "from dataclasses import dataclass, field\n\n"
+        "class MediaSearchStatus:\n"
+        "    OK = 'ok'\n\n"
+        "@dataclass\n"
+        "class MediaSearchResult:\n"
+        "    status: str\n"
+        "    torrents: dict = field(default_factory=dict)\n"
+        "    ranked_info_hashes: list[str] = field(default_factory=list)\n"
+        "    service_cache_status: dict = field(default_factory=dict)\n\n"
+        "def search_media(torrent_manager):\n"
+        "    return MediaSearchResult(\n"
+        "        MediaSearchStatus.OK,\n"
+        "        torrents=torrent_manager.torrents,\n"
+        "        ranked_info_hashes=list(torrent_manager.ranked_torrents),\n"
+        "        service_cache_status={},\n"
+        "    )\n",
+        encoding="utf-8",
+    )
     formatting_file.write_text(
         "COMPONENTS = {\n"
         '    "title": "{}",\n'
@@ -126,7 +147,8 @@ def _write_upstream_patch_sources(cfg) -> None:
         "        if settings.PUBLIC_BASE_URL\n"
         '        else f"{request.url.scheme}://{request.url.netloc}"\n'
         "    )\n"
-        "    torrents = torrent_manager.torrents\n"
+        "    torrents = search_result.torrents\n"
+        "    for info_hash in []:\n"
         "        formatted_components = format_components(\n"
         "            rtn_data,\n"
         "            torrent_title,\n"
