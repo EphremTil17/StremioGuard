@@ -11,6 +11,7 @@ that:
 - formatting stays readable on TV clients
 - Torrentio-backed episode results survive more like native Torrentio
 - Torrentio-style ranking signals are preserved more faithfully
+- the native RTN numeric rank remains visible beside the stream size
 
 ## Why Patch Comet
 
@@ -48,9 +49,10 @@ Each patch is managed as a declarative spec with an explicit requirement class:
 
 | Patch Name | Feature / Purpose | Requirement Class | Degraded Mode (If Failed) |
 |------------|-------------------|-------------------|---------------------------|
-| `stream` | TV-readable stream naming and gateway playback URLs | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; fallback to default stream handler otherwise. |
-| `config` | Protected gateway `/configure` credentials integration | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; public `/configure` remains exposed. |
-| `template` | Configure page installer link customization | `REQUIRED_WHEN_GATEWAY` | Addon installation URL defaults to direct localhost address. |
+| `stream` | TV-readable stream naming, gateway playback URLs, and RTN rank display | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway is enabled. It is also a required half of the current RTN display contract, so a bundle that cannot render it is rejected. |
+| `media_search` | Carries RTN scores to stream rendering | `REQUIRED` | Hard failure; score display cannot silently disappear. |
+| `config` | Protected gateway `/configure` credentials integration | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; the gateway deployment is not published. |
+| `template` | Configure page installer link customization | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; the gateway deployment is not published. |
 | `torrentio` | Preserves richer Torrentio scraper title and index metadata | `OPTIONAL` | Falls back to stock Torrentio parser (missing HDR, resolution tags on some items). |
 | `filtering` | Permissively filters branded/multilingual titles | `OPTIONAL` | Falls back to stock strict title matching. |
 | `formatter` | Curated TV-safe emoji/text layout | `OPTIONAL` | Stream labels default to upstream format layout. |
@@ -87,6 +89,7 @@ The generated files currently include:
 
 - `formatting.py`
 - `stream.py`
+- `media_search.py`
 - `torrentio.py`
 - `filtering.py`
 - `orchestration.py`
@@ -108,7 +111,39 @@ Approach:
 - switch Comet formatting to a plainer style
 - use a small curated symbol set and simpler left-side naming
 
-### 2. Stream-name patch
+### 2. RTN rank-context and display patch
+
+Purpose:
+
+- preserve the numeric RTN score that Comet already calculated
+- show `R:<score>` beside the stream size without changing native result order,
+  cache policy, or playback behaviour
+
+Approach:
+
+- patch the current `services/media_search.py` handoff to add a scalar
+  `rtn_ranks` map to `MediaSearchResult`
+- derive that map from `torrent_manager.ranked_torrents` after Comet has
+  completed native RTN ranking
+- patch `api/endpoints/stream.py` to read
+  `search_result.rtn_ranks.get(info_hash)` while it formats each result
+- render `10.6 GB • R:5850` when a size exists; render a separate
+  `– R:5850` line when it does not
+
+This is a presentation-only handoff. StremioGuard never sorts, recomputes,
+promotes, or otherwise interprets an RTN rank. The current architecture is:
+
+```text
+TorrentManager.ranked_torrents
+  -> MediaSearchResult.rtn_ranks
+  -> stream endpoint display
+```
+
+The old endpoint-owned `torrent_manager` shape is deliberately unsupported.
+If Comet changes this handoff, rendering fails closed and the patch must be
+deliberately updated for the new architecture; no legacy shim is retained.
+
+### 3. Stream-name patch
 
 Purpose:
 
@@ -127,7 +162,7 @@ Approach:
   - `HDTV`
   - weak codec/container hints in lower-confidence cases
 
-### 3. Torrentio scraper patch
+### 4. Torrentio scraper patch
 
 Purpose:
 
@@ -152,7 +187,7 @@ This lets Comet ingest more of the same results that native Torrentio surfaces.
 It also reduces cases where a result survives filtering but gets buried because
 resolution, HDR, quality, or codec signals were lost before parsing.
 
-### 4. Episode-pack preservation patch
+### 5. Episode-pack preservation patch
 
 Purpose:
 
@@ -174,7 +209,7 @@ This patch is optional in setup and is controlled by:
 
 - `COMET_PATCH_EPISODE_PACK_RESULTS=1`
 
-### 5. Title-compatibility filtering patch
+### 6. Title-compatibility filtering patch
 
 Purpose:
 
@@ -229,6 +264,9 @@ Tradeoffs:
 - more permissive matching can admit occasional false positives
 - upstream Comet changes can require refreshes to the patch generator
 - exact native Torrentio parity is still not guaranteed
+
+- RTN score display supports the current `MediaSearchResult` architecture
+  only; an upstream boundary change stops the compatible bundle rather than silently displaying incomplete information
 
 So the philosophy here is:
 

@@ -151,6 +151,11 @@ automatically.
   richer Torrentio title metadata and degrading better when resolution is
   missing. See [docs/comet-patches.md](docs/comet-patches.md) for the full
   rationale and tradeoffs.
+- RTN rank display follows Comet's current `MediaSearchResult` boundary:
+  StremioGuard carries the already-calculated scalar score from media search
+  to stream formatting and displays it as `R:<score>` beside size. It never
+  reorders or recalculates RTN results, and it deliberately has no shim for
+  the retired endpoint-owned ranking architecture.
 - Server-owned fallback debrid credentials are optional. If you prefer to do all
   final addon configuration inside Comet's `/configure` page and then distribute
   only the finished addon or Stremio account, you can skip them during setup.
@@ -176,7 +181,7 @@ Comet commands:
 
 To ensure absolute configuration coherence and prevent upstream Comet updates from silently breaking your deployment, StremioGuard enforces a **digest-pinned model**:
 
-1. **Digest Pinning:** The stack always runs Comet from a specific image digest (e.g., `g0ldyy/comet@sha256:...`) instead of floating tags.
+1. **Digest Pinning:** After initial resolution, the stack runs Comet from a specific image digest (e.g., `g0ldyy/comet@sha256:...`) instead of a floating tag. The first resolution evaluates the current upstream `:latest` image against the managed patch suite and persists the accepted digest; the maintainer-tested lock digest is the fallback when required compatibility fails. This is a reproducibility and compatibility control, not a provenance/signature verification policy.
 2. **Advisory Start-Time Checks:** Once every 24 hours, running `./stremio start` or `./stremio restart` triggers a throttled check against the upstream `:latest` registry tag. If an update is available, it prints a single notification line without blocking startup.
 3. **Comet Update Suite:**
    - `./stremio comet update check`: Resolves the remote registry digest, extracts the code, compiles it in isolation, runs a mandatory container-isolated `import-smoke` check, and logs a feature diff (applied/skipped patches). Use `--deep` to run an ephemeral boot test.
@@ -242,6 +247,9 @@ location / {
 
 Replace `18001` with your configured `COMET_GATEWAY_HOST_PORT` if you changed
 it. Do not point `comet.example.com` directly at raw `COMET_HOST_PORT`.
+
+Restrict the gateway port to the proxy/LAN/tailnet path that should reach it,
+and make the proxy overwrite client-supplied `Host` and forwarded-origin headers.
 
 Create and manage gateway tokens with:
 
