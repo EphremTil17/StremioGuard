@@ -2,7 +2,7 @@
 
 The Comet gateway is the public access boundary for shared addon use. Stremio
 itself is no longer the authorization layer; users can keep their own Stremio
-accounts while all Comet stream discovery and playback stays behind a short
+accounts while all Comet stream discovery and playback stays behind a bearer
 gateway token.
 
 ## URL Model
@@ -60,6 +60,7 @@ COMET_HOST_PORT=18000
 COMET_GATEWAY_ENABLED=1
 COMET_GATEWAY_HOST_PORT=18001
 COMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.com
+COMET_GATEWAY_TOKEN_LENGTH=8
 # Alternatively, leave COMET_GATEWAY_PUBLIC_BASE_URL blank/empty to enable dynamic relative
 # path resolution. The gateway and configure page will automatically resolve endpoints
 # using the client browser's request window location host origin at runtime.
@@ -77,6 +78,13 @@ copy/install buttons. You can switch the default later:
 ```bash
 ./stremio comet token use <id>
 ```
+
+Treat the token like a password: anyone who has it can use the corresponding
+addon path. Keep the default length or increase it; do not lower
+`COMET_GATEWAY_TOKEN_LENGTH` for an internet-facing deployment. Tokens do not
+expire automatically, so rotate or revoke them when a device/user no longer
+needs access.
+
 
 ## Reverse Proxy
 
@@ -98,6 +106,15 @@ location / {
 
 Replace `<SERVERIP:18001>` with the host address and
 `COMET_GATEWAY_HOST_PORT` your reverse proxy can reach.
+
+The gateway trusts the origin information the proxy supplies to construct
+secure cookies and playback URLs. Do both of the following:
+
+- restrict `COMET_GATEWAY_HOST_PORT` at the host firewall/security group so
+  only the reverse proxy, LAN, or tailnet can reach it as intended;
+- overwrite `Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto` at the proxy.
+  Do not pass client-supplied forwarded headers through unchanged.
+
 
 If your proxy terminates HTTPS before forwarding to the gateway, make sure
 `X-Forwarded-Proto` reaches the gateway as `https`. Nginx Proxy Manager usually
@@ -155,6 +172,10 @@ authenticated playback:
 Access logs record a masked request line: the entire path after `/comet/` —
 the token and the base64 config blob after it, which can embed debrid API
 keys — is replaced with `***`, so neither secret ever lands in `access.log`.
+
+This applies to the generated gateway log only. Configure your external reverse
+proxy to redact or avoid logging `/comet/` request paths too; it sees the token
+and configuration blob before the request reaches the gateway.
 
 ## Tradeoffs
 
