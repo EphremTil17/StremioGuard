@@ -81,7 +81,9 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
         "Optionally proxy playback streams through this server (and your VPN)\n"
         "instead of direct client-to-debrid connections."
     )
-    proxy_enabled = typer.confirm("Enable Comet debrid stream proxying?", default=True)
+    proxy_enabled = typer.confirm(
+        "Enable Comet debrid stream proxying?", default=config.proxy_debrid_stream
+    )
     write_env_setting(config.env_file, "COMET_PROXY_DEBRID_STREAM", "1" if proxy_enabled else "0")
     max_connections = typer.prompt(
         "Per-IP proxy max connections (-1 for unlimited)",
