@@ -10,6 +10,7 @@ ExecStop=%h/projects/docker/StremioGuard/stremio stop
 PIDFile=%h/projects/docker/StremioGuard/.stremio/watchdog.pid
 Restart=always
 RestartSec=10
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=default.target

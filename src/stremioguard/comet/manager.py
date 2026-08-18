@@ -941,7 +941,11 @@ class CometManager:
                 container_id,
                 "/app/.venv/bin/python",
                 "-c",
-                "import urllib.request; resp = urllib.request.urlopen('http://127.0.0.1:8000/health'); print(resp.read().decode())",
+                (
+                    "import urllib.request; "
+                    "resp = urllib.request.urlopen('http://127.0.0.1:8000/health'); "
+                    "print(resp.read().decode())"
+                ),
             ],
             check=False,
             timeout=5,
@@ -965,7 +969,10 @@ class CometManager:
 
     def public_ip(self, container_name: str) -> str | None:
         for url in ("https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"):
-            py_script = f"import urllib.request; print(urllib.request.urlopen('{url}', timeout=5).read().decode().strip())"
+            py_script = (
+                "import urllib.request; "
+                f"print(urllib.request.urlopen('{url}', timeout=5).read().decode().strip())"
+            )
             for py_bin in ("/app/.venv/bin/python", "python3", "python"):
                 result = self.runner.run(
                     ["docker", "exec", container_name, py_bin, "-c", py_script],
@@ -983,7 +990,6 @@ class CometManager:
             if result.returncode == 0 and (result.stdout or "").strip():
                 return result.stdout.strip()
         return None
-
 
     def gluetun_container_id(self) -> str | None:
         return self.service_container_id("gluetun")

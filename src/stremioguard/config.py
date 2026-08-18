@@ -27,6 +27,10 @@ MANAGED_STACK_ENV = "STREMIOGUARD_MANAGED"
 GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
 DEFAULT_COMET_HOST_PORT = 18000
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
+CIRCUIT_BREAKER_EXIT_CODE = 78
+DEFAULT_VPN_RECOVERY_BUDGET_SECONDS = 300
+DEFAULT_VPN_RESTART_CADENCE_SECONDS = 45
+DEFAULT_VPN_FAILOVER_ESCALATION_RATIO = 0.5
 
 
 def parse_public_ip(text: str) -> str | None:
@@ -47,6 +51,7 @@ class Runner(Protocol):
         check: bool = False,
         capture: bool = True,
         timeout: float | None = None,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -58,6 +63,7 @@ class SubprocessRunner:
         check: bool = False,
         capture: bool = True,
         timeout: float | None = None,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             args,
@@ -65,6 +71,7 @@ class SubprocessRunner:
             text=True,
             capture_output=capture,
             timeout=timeout,
+            env=env,
         )
 
 
@@ -136,6 +143,14 @@ class Config:
     stremio_enabled: bool
     ip_crosscheck_interval_seconds: int
     public_ip_failure_threshold: int
+    vpn_recovery_budget_seconds: int
+    vpn_restart_cadence_seconds: int
+    vpn_lockout_file: Path
+    server_countries: str | None
+    server_regions: str | None
+    server_cities: str | None
+    server_hostnames: str | None
+    server_categories: str | None
 
     @classmethod
     def from_env(cls, root_dir: Path | None = None) -> Config:
@@ -190,6 +205,20 @@ class Config:
                 env_file, "IP_CROSSCHECK_INTERVAL_SECONDS", 300
             ),
             public_ip_failure_threshold=_tunable_int(env_file, "PUBLIC_IP_FAILURE_THRESHOLD", 3),
+            vpn_recovery_budget_seconds=_tunable_int(
+                env_file, "VPN_RECOVERY_BUDGET_SECONDS", DEFAULT_VPN_RECOVERY_BUDGET_SECONDS
+            ),
+            vpn_restart_cadence_seconds=_tunable_int(
+                env_file, "VPN_RESTART_CADENCE_SECONDS", DEFAULT_VPN_RESTART_CADENCE_SECONDS
+            ),
+            vpn_lockout_file=Path(
+                os.environ.get("VPN_LOCKOUT_FILE", root_dir / ".stremio" / "vpn-lockout")
+            ),
+            server_countries=env_file_value(env_file, "SERVER_COUNTRIES"),
+            server_regions=env_file_value(env_file, "SERVER_REGIONS"),
+            server_cities=env_file_value(env_file, "SERVER_CITIES"),
+            server_hostnames=env_file_value(env_file, "SERVER_HOSTNAMES"),
+            server_categories=env_file_value(env_file, "SERVER_CATEGORIES"),
         )
 
 

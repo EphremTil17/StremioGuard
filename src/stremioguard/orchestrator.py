@@ -11,7 +11,14 @@ from collections.abc import Callable
 import typer
 from loguru import logger
 
-from stremioguard.config import CometConfig, Config, docker_daemon_help, docker_permission_help
+from stremioguard.config import (
+    CIRCUIT_BREAKER_EXIT_CODE,
+    DEFAULT_VPN_FAILOVER_ESCALATION_RATIO,
+    CometConfig,
+    Config,
+    docker_daemon_help,
+    docker_permission_help,
+)
 from stremioguard.guard import GluetunGuard, PublicIPAssessment
 
 app = typer.Typer(
@@ -48,6 +55,11 @@ class Orchestrator:
         self.consecutive_ip_unknowns = 0
         self.loop_error_count = 0
         self.loop_errors_since_summary = 0
+        self.outage_started_at: float | None = None
+        self.outage_start_wall: float | None = None
+        self.last_auth_check_wall: float | None = None
+        self.last_restart_at: float = 0.0
+        self.escalation_triggered: bool = False
         if self.guard.config.log_session:
             self._log_session_start()
 
@@ -81,7 +93,8 @@ class Orchestrator:
                 capture=False,
             )
             time.sleep(2)
-        g.preflight()
+        if g.preflight(allow_recovery=True, defer_vpn_recovery=True) is False:
+            return
         g.log(f"Building services: {', '.join(services)}.")
         g.compose_fresh("build", *services, capture=False)
         g.log(f"Starting services: {', '.join(services)}.")
@@ -98,7 +111,8 @@ class Orchestrator:
         g = self.guard
         if g.config.stremio_enabled:
             g.ensure_data_dir()
-        g.preflight()
+        if g.preflight(allow_recovery=False, defer_vpn_recovery=True) is False:
+            return
         services = g.enabled_runtime_services()
         g.log(f"Starting services: {', '.join(services)}.")
         g.compose_fresh("up", "-d", *services, capture=False)
@@ -134,6 +148,8 @@ class Orchestrator:
             try:
                 self.watch_once()
                 self.consecutive_loop_errors = 0
+            except (typer.Exit, SystemExit, KeyboardInterrupt):
+                raise
             except Exception:
                 logger.exception("Watchdog loop iteration encountered an error.")
                 self.consecutive_loop_errors += 1
@@ -152,20 +168,33 @@ class Orchestrator:
                         )
             time.sleep(self.guard.config.watch_interval_seconds)
 
-    def watch_once(self) -> None:
+    def _trip_circuit_breaker(self, reason: str) -> None:
+        elapsed = (
+            time.monotonic() - self.outage_started_at if self.outage_started_at is not None else 0.0
+        )
+        self.guard.warn(
+            f"Circuit breaker tripped ({reason}). "
+            "Persisting lockout marker and initiating fail-closed stack shutdown."
+        )
+        # Attempt to write atomic lockout marker BEFORE stopping containers.
+        # Guarded so that filesystem/disk errors cannot bypass container shutdown or exit 78.
+        try:
+            self.guard.write_vpn_lockout(reason=reason, outage_duration_seconds=elapsed)
+        except Exception:
+            logger.exception("Failed to write VPN lockout marker during circuit breaker trip.")
+        finally:
+            try:
+                self.guard.stop_active_services()
+            finally:
+                try:
+                    self.guard.stop_gluetun()
+                finally:
+                    raise typer.Exit(code=CIRCUIT_BREAKER_EXIT_CODE)
+
+    def _handle_unhealthy_ip_assessment(
+        self, assessment: PublicIPAssessment, services: list[str]
+    ) -> None:
         g = self.guard
-        self.checks_since_summary += 1
-        services = g.enabled_runtime_services()
-
-        if not g.gluetun_healthy():
-            g.warn("Gluetun is not healthy. Stopping active services.")
-            self.vpn_drop_count += 1
-            self.vpn_drops_since_summary += 1
-            g.stop_active_services(services=services)
-            self._maybe_log_summary()
-            return
-
-        assessment = g.public_ip_assessment()
         if assessment == PublicIPAssessment.UNSAFE_DEFINITIVE:
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
             g.warn("Definitive leak / unsafe IP detected. Stopping active services immediately.")
@@ -174,7 +203,6 @@ class Orchestrator:
             self.consecutive_ip_unknowns = 0
             g.stop_active_services(services=services)
             self._maybe_log_summary()
-            return
         elif assessment == PublicIPAssessment.UNKNOWN:
             self.consecutive_ip_unknowns += 1
             limit = self.guard.config.public_ip_failure_threshold
@@ -192,16 +220,122 @@ class Orchestrator:
                 self.public_ip_failures_since_summary += 1
                 g.stop_active_services(services=services)
             self._maybe_log_summary()
-            return
-        else:
-            self.consecutive_ip_unknowns = 0
 
+    def watch_once(self) -> None:
+        g = self.guard
+        self.checks_since_summary += 1
+        services = g.enabled_runtime_services()
+
+        if not g.gluetun_healthy():
+            budget = g.config.vpn_recovery_budget_seconds
+            now_mono = time.monotonic()
+            now_wall = time.time()
+
+            if self.outage_started_at is None:
+                self.outage_started_at = now_mono
+                self.outage_start_wall = now_wall
+                self.last_auth_check_wall = now_wall
+                self.last_restart_at = now_mono
+                self.vpn_drop_count += 1
+                self.vpn_drops_since_summary += 1
+                g.warn(
+                    "Gluetun is not healthy. Outage detected; entering recovery window "
+                    f"(budget: {budget}s)."
+                )
+                g.stop_active_services(services=services)
+                # Bounded tail scan on tick 1 to catch the auth rejection that triggered the outage:
+                if g.gluetun_auth_failed(lines=100, since_epoch=None):
+                    self._trip_circuit_breaker(reason="auth_rejected")
+
+                # Restart Gluetun (best-effort candidate reselection)
+                g.restart_gluetun()
+                self._maybe_log_summary()
+                return
+
+            # Incremental bounded log check since previous probe
+            check_since = self.last_auth_check_wall or self.outage_start_wall
+            self.last_auth_check_wall = now_wall
+            if g.gluetun_auth_failed(since_epoch=check_since):
+                self._trip_circuit_breaker(reason="auth_rejected")
+
+            elapsed = now_mono - self.outage_started_at
+            if elapsed >= budget:
+                self._trip_circuit_breaker(reason="recovery_budget_exhausted")
+
+            # Check for hybrid failover escalation (at 50% of budget)
+            has_narrow_filter = bool(
+                g.config.server_cities
+                or g.config.server_hostnames
+                or g.config.server_regions
+                or g.config.server_categories
+            )
+            if (
+                has_narrow_filter
+                and not self.escalation_triggered
+                and elapsed >= (budget * DEFAULT_VPN_FAILOVER_ESCALATION_RATIO)
+            ):
+                country = g.config.server_countries or "United States"
+                g.warn(
+                    f"Preferred location did not recover within {int(elapsed)}s. "
+                    f"Escalating to broad country pool ({country})."
+                )
+                g.restart_gluetun_relaxed()
+                self.escalation_triggered = True
+                self.last_restart_at = now_mono
+                self._maybe_log_summary()
+                return
+
+            # Check restart cadence
+            if now_mono - self.last_restart_at >= g.config.vpn_restart_cadence_seconds:
+                self.last_restart_at = now_mono
+                if self.escalation_triggered:
+                    g.restart_gluetun_relaxed()
+                else:
+                    g.restart_gluetun()
+
+            self._maybe_log_summary()
+            return
+
+        # Gluetun is healthy
+        if self.outage_started_at is not None:
+            assessment = g.public_ip_assessment()
+            if assessment != PublicIPAssessment.SAFE:
+                self._handle_unhealthy_ip_assessment(assessment, services)
+                return
+
+            g.clear_vpn_lockout()
+            if self.escalation_triggered:
+                g.log("Gluetun recovered under broad country fallback. Resuming active services.")
+            else:
+                g.log("Gluetun has recovered and is healthy. Resuming active services.")
+
+            self.outage_started_at = None
+            self.outage_start_wall = None
+            self.last_auth_check_wall = None
+            self.last_restart_at = 0.0
+            self.escalation_triggered = False
+
+            if not g.container_running(services=services):
+                self.auto_starts_since_summary += 1
+                g.compose_fresh("up", "-d", "--build", *services, check=False, capture=False)
+
+            self.last_public_ip = g.last_observed_ip or self.last_public_ip
+            self._maybe_log_summary()
+            return
+
+        # Normal steady-state monitoring
+        assessment = g.public_ip_assessment()
+        if assessment != PublicIPAssessment.SAFE:
+            self._handle_unhealthy_ip_assessment(assessment, services)
+            return
+
+        self.consecutive_ip_unknowns = 0
         self.last_public_ip = g.last_observed_ip or self.last_public_ip
 
         if not g.container_running(services=services):
             g.log("Gluetun healthy; starting active services.")
             self.auto_starts_since_summary += 1
-            g.compose_fresh("up", "-d", *services, check=False, capture=False)
+            g.compose_fresh("up", "-d", "--build", *services, check=False, capture=False)
 
         self._maybe_log_summary()
 
@@ -301,6 +435,8 @@ def _run_command(action: Callable[[Orchestrator], None]) -> None:
     orch = Orchestrator(guard)
     try:
         action(orch)
+    except (typer.Exit, SystemExit):
+        raise
     except KeyboardInterrupt:
         logger.info("Interrupted.")
         raise typer.Exit(130) from None
@@ -375,6 +511,16 @@ def status() -> None:
 def record_home_ip() -> None:
     """Save current public IP as leak-detection baseline."""
     _run_command(lambda o: o.record_home_ip())
+
+
+@app.command()
+def unlock() -> None:
+    """Clear active VPN circuit breaker lockout."""
+
+    def _unlock(o: Orchestrator) -> None:
+        o.guard.clear_vpn_lockout()
+
+    _run_command(_unlock)
 
 
 def main() -> None:

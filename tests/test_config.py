@@ -62,6 +62,30 @@ class TestConfig(unittest.TestCase):
             config = Config.from_env(Path(directory))
         self.assertFalse(config.stremio_enabled)
 
+    def test_from_env_parses_recovery_and_failover_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env_file = root / ".env"
+            env_file.write_text(
+                "SERVER_COUNTRIES=United States\n"
+                "SERVER_REGIONS=North America\n"
+                "SERVER_CITIES=Seattle\n"
+                "SERVER_HOSTNAMES=us123.nordvpn.com\n"
+                "SERVER_CATEGORIES=P2P\n"
+                "VPN_RECOVERY_BUDGET_SECONDS=400\n"
+                "VPN_RESTART_CADENCE_SECONDS=60\n",
+                encoding="utf-8",
+            )
+            config = Config.from_env(root)
+            self.assertEqual(config.server_countries, "United States")
+            self.assertEqual(config.server_regions, "North America")
+            self.assertEqual(config.server_cities, "Seattle")
+            self.assertEqual(config.server_hostnames, "us123.nordvpn.com")
+            self.assertEqual(config.server_categories, "P2P")
+            self.assertEqual(config.vpn_recovery_budget_seconds, 400)
+            self.assertEqual(config.vpn_restart_cadence_seconds, 60)
+            self.assertEqual(config.vpn_lockout_file, root / ".stremio" / "vpn-lockout")
+
 
 if __name__ == "__main__":
     unittest.main()
