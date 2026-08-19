@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import NoReturn
@@ -36,13 +39,19 @@ def env_file_value(env_path: Path, key: str) -> str | None:
 
 
 def write_env_setting(env_path: Path, key: str, value: str) -> None:
+    write_env_settings(env_path, {key: value})
+
+
+def write_env_settings(env_path: Path, settings: Mapping[str, str]) -> None:
+    """Atomically replace a related set of dotenv fields in one transaction."""
     content = env_path.read_text(encoding="utf-8")
-    pattern = re.compile(ENV_LINE_TEMPLATE.format(key=re.escape(key)), re.MULTILINE)
-    new_line = f"{key}={value}"
-    if pattern.search(content):
-        content = pattern.sub(new_line, content, count=1)
-    else:
-        content = content.rstrip("\n") + f"\n{new_line}\n"
+    for key, value in settings.items():
+        pattern = re.compile(ENV_LINE_TEMPLATE.format(key=re.escape(key)), re.MULTILINE)
+        new_line = f"{key}={value}"
+        if pattern.search(content):
+            content = pattern.sub(new_line, content, count=1)
+        else:
+            content = content.rstrip("\n") + f"\n{new_line}\n"
     atomic_write_text(env_path, content, mode=0o600)
 
 
@@ -75,8 +84,31 @@ def write_wireguard_key(env_path: Path, key: str) -> None:
 
 
 def write_openvpn_credentials(env_path: Path, username: str, password: str) -> None:
-    write_env_setting(env_path, "OPENVPN_USER", username)
-    write_env_setting(env_path, "OPENVPN_PASSWORD", password)
+    write_env_settings(env_path, {"OPENVPN_USER": username, "OPENVPN_PASSWORD": password})
+
+
+def validate_wireguard_private_key(value: str) -> str:
+    """Return a canonical WireGuard private key or reject malformed input."""
+    candidate = value.strip()
+    try:
+        decoded = base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError(
+            "WireGuard private key must be padded base64 for exactly 32 bytes."
+        ) from error
+    if len(decoded) != 32:
+        raise ValueError("WireGuard private key must decode to exactly 32 bytes.")
+    return candidate
+
+
+def valid_wireguard_private_key(value: str | None) -> bool:
+    if not isinstance(value, str) or value in {"", WIREGUARD_KEY_PLACEHOLDER}:
+        return False
+    try:
+        validate_wireguard_private_key(value)
+    except ValueError:
+        return False
+    return True
 
 
 def env_flag_enabled(key: str, default: bool, *, env_path: Path) -> bool:
@@ -134,8 +166,7 @@ def env_needs_init(env_path: Path) -> bool:
             user = env_file_value(env_path, "OPENVPN_USER")
             password = env_file_value(env_path, "OPENVPN_PASSWORD")
             return not user or not password
-        key = env_file_value(env_path, "WIREGUARD_PRIVATE_KEY")
-        return key in {None, "", WIREGUARD_KEY_PLACEHOLDER}
+        return not valid_wireguard_private_key(env_file_value(env_path, "WIREGUARD_PRIVATE_KEY"))
 
     if vpn_type == "openvpn":
         user = env_file_value(env_path, "OPENVPN_USER")
@@ -146,8 +177,7 @@ def env_needs_init(env_path: Path) -> bool:
             OPENVPN_PASSWORD_PLACEHOLDER,
         }
 
-    key = env_file_value(env_path, "WIREGUARD_PRIVATE_KEY")
-    return key in {None, "", WIREGUARD_KEY_PLACEHOLDER}
+    return not valid_wireguard_private_key(env_file_value(env_path, "WIREGUARD_PRIVATE_KEY"))
 
 
 def read_env_provider(env_path: Path) -> str:

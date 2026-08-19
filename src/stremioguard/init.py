@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 from contextlib import suppress
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import typer
 from loguru import logger
@@ -13,9 +14,106 @@ from stremioguard.env import (
     DEFAULT_STREMIO_HOST_PORT,
     env_file_value,
     env_flag_enabled,
+    env_needs_init,
     env_port_value,
     write_env_setting,
 )
+
+
+def existing_setup_summary(env_path: Path) -> list[str]:
+    """Return a redacted, .env-derived summary for interactive re-initialization.
+
+    `.env` is the only configuration authority. Generated `.stremio` files are
+    runtime state, so they deliberately do not participate in this decision.
+    """
+    stremio_enabled = env_flag_enabled("STREMIO_ENABLED", True, env_path=env_path)
+    comet_enabled = env_flag_enabled("COMET_ENABLED", True, env_path=env_path)
+    if stremio_enabled and comet_enabled:
+        profile = "Unified (Stremio + Comet)"
+    elif comet_enabled:
+        profile = "Comet-only"
+    elif stremio_enabled:
+        profile = "Stremio-only"
+    else:
+        profile = "No active service profile"
+
+    provider = env_file_value(env_path, "VPN_SERVICE_PROVIDER") or "nordvpn"
+    vpn_type = env_file_value(env_path, "VPN_TYPE") or "wireguard"
+    credential_status = "configured" if not env_needs_init(env_path) else "needs setup"
+    bind_addresses = env_file_value(env_path, "STREMIO_BIND_ADDRS") or "not published"
+    public_url = (
+        env_file_value(env_path, "EXTERNAL_BASE_URL")
+        or env_file_value(env_path, "COMET_GATEWAY_PUBLIC_BASE_URL")
+        or env_file_value(env_path, "COMET_PUBLIC_BASE_URL")
+    )
+    location_filters = ", ".join(
+        f"{key.removeprefix('SERVER_').lower()}={value}"
+        for key in (
+            "SERVER_COUNTRIES",
+            "SERVER_REGIONS",
+            "SERVER_CITIES",
+            "SERVER_HOSTNAMES",
+            "SERVER_CATEGORIES",
+        )
+        if (value := env_file_value(env_path, key))
+    )
+
+    summary = [
+        "Current setup from .env (secrets are never displayed):",
+        f"  Profile: {profile}",
+        f"  VPN: {provider} / {vpn_type} ({credential_status})",
+        f"  Published addresses: {bind_addresses}",
+    ]
+    if public_url:
+        summary.append(f"  Public URL: {_redacted_public_url(public_url)}")
+    if comet_enabled:
+        gateway = (
+            "enabled"
+            if env_flag_enabled("COMET_GATEWAY_ENABLED", True, env_path=env_path)
+            else "disabled"
+        )
+        summary.append(f"  Comet gateway: {gateway}")
+    if location_filters:
+        summary.append(f"  VPN server filters: {location_filters}")
+    return summary
+
+
+def _redacted_public_url(value: str) -> str:
+    """Show only a URL origin; paths, queries, and user-info may be sensitive."""
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return "configured (redacted)"
+    if parsed.scheme not in {"http", "https"} or not host:
+        return "configured (redacted)"
+    authority = f"{host}:{port}" if port else host
+    prefix = "<credentials-redacted>@" if parsed.username or parsed.password else ""
+    return urlunsplit((parsed.scheme, f"{prefix}{authority}", "", "", ""))
+
+
+def configured_profile_choice(env_path: Path) -> str:
+    """Map persisted enabled-service flags to the init profile menu."""
+    stremio_enabled = env_flag_enabled("STREMIO_ENABLED", True, env_path=env_path)
+    comet_enabled = env_flag_enabled("COMET_ENABLED", True, env_path=env_path)
+    if comet_enabled and not stremio_enabled:
+        return "2"
+    if stremio_enabled and not comet_enabled:
+        return "3"
+    return "1"
+
+
+def configured_access_choice(env_path: Path, *, comet_only: bool) -> str:
+    """Return the persisted access-mode choice, defaulting safely to LAN."""
+    public_url_key = (
+        "COMET_GATEWAY_PUBLIC_BASE_URL"
+        if comet_only and env_flag_enabled("COMET_GATEWAY_ENABLED", True, env_path=env_path)
+        else "COMET_PUBLIC_BASE_URL"
+        if comet_only
+        else "EXTERNAL_BASE_URL"
+    )
+    return "2" if env_file_value(env_path, public_url_key) else "1"
 
 
 def configure_external_access(env_path: Path, is_proxied: bool, comet_only: bool = False) -> None:
@@ -33,9 +131,13 @@ def configure_external_access(env_path: Path, is_proxied: bool, comet_only: bool
                 host_port = int(port_raw)
 
         if is_proxied:
-            bind_addrs = _prompt_proxy_bind_address(host_port=host_port)
+            bind_addrs = _prompt_proxy_bind_address(
+                host_port=host_port, default_address=_first_bind_address(env_path)
+            )
         else:
-            bind_addrs = _prompt_direct_bind_addresses(host_port=host_port)
+            bind_addrs = _prompt_direct_bind_addresses(
+                host_port=host_port, default_addresses=_existing_bind_addresses(env_path)
+            )
 
         bind_value = ",".join(bind_addrs)
         write_env_setting(env_path, "STREMIO_BIND_ADDRS", bind_value)
@@ -68,9 +170,13 @@ def configure_external_access(env_path: Path, is_proxied: bool, comet_only: bool
     write_env_setting(env_path, "STREMIO_HOST_PORT", str(host_port))
 
     if is_proxied:
-        bind_addrs = _prompt_proxy_bind_address(host_port=host_port)
+        bind_addrs = _prompt_proxy_bind_address(
+            host_port=host_port, default_address=_first_bind_address(env_path)
+        )
     else:
-        bind_addrs = _prompt_direct_bind_addresses(host_port=host_port)
+        bind_addrs = _prompt_direct_bind_addresses(
+            host_port=host_port, default_addresses=_existing_bind_addresses(env_path)
+        )
 
     bind_value = ",".join(bind_addrs)
     write_env_setting(env_path, "STREMIO_BIND_ADDRS", bind_value)
@@ -80,7 +186,10 @@ def configure_external_access(env_path: Path, is_proxied: bool, comet_only: bool
         logger.info(f"Stremio will not publish {host_port} on any host interface.")
 
     if is_proxied:
-        domain = _prompt_public_domain()
+        existing_url = env_file_value(env_path, "EXTERNAL_BASE_URL") or ""
+        domain = _prompt_public_domain(
+            existing_url.removeprefix("https://").removeprefix("http://")
+        )
         external_url = f"https://{domain}"
         write_env_setting(env_path, "EXTERNAL_BASE_URL", external_url)
         logger.info(f"Clients will reach Stremio via {external_url}.")
@@ -142,6 +251,7 @@ def _print_reverse_proxy_checklist(
 def _prompt_proxy_bind_address(
     *,
     host_port: int = DEFAULT_STREMIO_HOST_PORT,
+    default_address: str | None = None,
 ) -> list[str]:
     typer.echo("")
     typer.echo("Your reverse proxy needs to reach Stremio on this host.")
@@ -154,7 +264,9 @@ def _prompt_proxy_bind_address(
     typer.echo("  If your proxy runs directly on this host (apt-installed nginx, Caddy binary):")
     typer.echo("    127.0.0.1 is fine — proxy and Stremio share the host network.")
     while True:
-        raw = typer.prompt(f"Bind address for port {host_port}").strip()
+        raw = typer.prompt(
+            f"Bind address for port {host_port}", default=default_address or ""
+        ).strip()
         if raw == "0.0.0.0":
             return [raw]
         try:
@@ -180,6 +292,7 @@ def _prompt_proxy_bind_address(
 def _prompt_direct_bind_addresses(
     *,
     host_port: int = DEFAULT_STREMIO_HOST_PORT,
+    default_addresses: list[str] | None = None,
 ) -> list[str]:
     typer.echo("")
     typer.echo(f"Which addresses should publish Stremio's streaming port ({host_port})?")
@@ -194,7 +307,10 @@ def _prompt_direct_bind_addresses(
     typer.echo("    LAN:       ip -4 addr show | grep 'inet ' or hostname -I")
     typer.echo("    Tailscale: tailscale ip -4")
     while True:
-        raw = typer.prompt("How many bind addresses?", default="1").strip()
+        raw = typer.prompt(
+            "How many bind addresses?",
+            default=str(len(default_addresses)) if default_addresses is not None else "1",
+        ).strip()
         try:
             count = int(raw)
         except ValueError:
@@ -211,7 +327,14 @@ def _prompt_direct_bind_addresses(
     addresses: list[str] = []
     for index in range(count):
         while True:
-            address = _prompt_single_bind_addr(host_port=host_port, index=index + 1)
+            default_address = (
+                default_addresses[index]
+                if default_addresses is not None and index < len(default_addresses)
+                else None
+            )
+            address = _prompt_single_bind_addr(
+                host_port=host_port, index=index + 1, default_address=default_address
+            )
             if address in addresses:
                 typer.echo(f"  Address {address} is already listed.")
                 continue
@@ -224,12 +347,13 @@ def _prompt_single_bind_addr(
     *,
     host_port: int = DEFAULT_STREMIO_HOST_PORT,
     index: int | None = None,
+    default_address: str | None = None,
 ) -> str:
     typer.echo("")
     label = f" #{index}" if index is not None else ""
     typer.echo(f"Bind address{label} for port {host_port}:")
     while True:
-        raw = typer.prompt("Address").strip()
+        raw = typer.prompt("Address", default=default_address or "").strip()
         if raw == "0.0.0.0":
             return raw
         try:
@@ -245,7 +369,7 @@ def _prompt_single_bind_addr(
         return str(ip)
 
 
-def _prompt_public_domain() -> str:
+def _prompt_public_domain(default: str | None = None) -> str:
     typer.echo("")
     typer.echo("What domain will clients use? (e.g., stremio.example.com)")
     typer.echo(
@@ -253,7 +377,7 @@ def _prompt_public_domain() -> str:
         "cert, and the proxy upstream pointed at this host's LAN IP on port 11470."
     )
     while True:
-        raw = typer.prompt("Domain").strip().lower().rstrip("/")
+        raw = typer.prompt("Domain", default=default or "").strip().lower().rstrip("/")
         if raw.startswith(("http://", "https://")):
             typer.echo("  Enter just the hostname, no scheme.")
             continue
@@ -263,9 +387,22 @@ def _prompt_public_domain() -> str:
         return raw
 
 
+def _existing_bind_addresses(env_path: Path) -> list[str]:
+    raw = env_file_value(env_path, "STREMIO_BIND_ADDRS") or ""
+    return [address.strip() for address in raw.split(",") if address.strip()]
+
+
+def _first_bind_address(env_path: Path) -> str | None:
+    addresses = _existing_bind_addresses(env_path)
+    return addresses[0] if addresses else None
+
+
 def configure_optional_stremio_settings(env_path: Path) -> None:
     logger.info("Optional Stremio tweaks:")
-    apply_patches = typer.confirm("Enable the Stremio compatibility patch bundle?", default=True)
+    apply_patches = typer.confirm(
+        "Enable the Stremio compatibility patch bundle?",
+        default=env_flag_enabled("STREMIO_APPLY_PATCHES", True, env_path=env_path),
+    )
     write_env_setting(env_path, "STREMIO_APPLY_PATCHES", "1" if apply_patches else "0")
     if not apply_patches:
         logger.warning(
@@ -275,7 +412,8 @@ def configure_optional_stremio_settings(env_path: Path) -> None:
         )
 
     skip_hw_probe = typer.confirm(
-        "Skip repeated hardware probe checks to keep reconnect logs quieter?", default=True
+        "Skip repeated hardware probe checks to keep reconnect logs quieter?",
+        default=env_flag_enabled("STREMIO_SKIP_HW_PROBE", True, env_path=env_path),
     )
     write_env_setting(env_path, "STREMIO_SKIP_HW_PROBE", "1" if skip_hw_probe else "0")
     if skip_hw_probe:
