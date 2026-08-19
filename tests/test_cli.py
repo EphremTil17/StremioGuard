@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -19,65 +22,92 @@ from stremioguard.cli.commands import general as general_cmd_mod
 from stremioguard.config import MANAGED_STACK_ENV
 from stremioguard.env import env_file_value
 
+general_mod = general_cmd_mod
+
 
 class NordVpnTests(unittest.TestCase):
-    def test_vpn_setup_checklist_includes_general_linux_requirements(self) -> None:
-        checklist = nordvpn_mod.vpn_setup_checklist()
-        self.assertIn("Docker with the Compose plugin", checklist)
-        self.assertIn("/dev/net/tun", checklist)
-        self.assertIn("VPN provider account", checklist)
-        self.assertNotIn("nordvpn CLI", checklist)
+    def test_fetch_nordvpn_credentials_from_token_success(self) -> None:
+        token = "test-token-12345"
+        key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        payload = json.dumps(
+            {
+                "nordlynx_private_key": key,
+                "username": "svc-user",
+                "password": "svc-password",
+            }
+        ).encode("utf-8")
 
-    def test_vpn_setup_checklist_includes_nordvpn_specific_requirements(self) -> None:
-        checklist = nordvpn_mod.vpn_setup_checklist("nordvpn")
-        self.assertIn("nordvpn CLI", checklist)
-        self.assertIn("nordvpn login", checklist)
-        self.assertIn("wireguard-tools", checklist)
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = payload
+        mock_response.__enter__.return_value = mock_response
 
-    def test_missing_nordvpn_dependencies_lists_all_missing_tools(self) -> None:
-        with mock.patch("shutil.which", return_value=None):
-            missing = nordvpn_mod.missing_nordvpn_dependencies()
-        self.assertEqual(len(missing), 2)
-        self.assertIn("nordvpn CLI", missing[0])
-        self.assertIn("wireguard-tools", missing[1])
+        with mock.patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
+            result_key, user, password = nordvpn_mod.fetch_nordvpn_credentials_from_token(token)
 
-    def test_preflight_nordvpn_setup_fails_with_single_aggregated_message(self) -> None:
+        self.assertEqual(result_key, key)
+        self.assertEqual(user, "svc-user")
+        self.assertEqual(password, "svc-password")
+        req = mock_urlopen.call_args[0][0]
+        self.assertIn("Authorization", req.headers)
+        self.assertTrue(req.headers["Authorization"].startswith("Basic "))
+
+    def test_fetch_nordvpn_wireguard_key_from_token_empty_token_fails(self) -> None:
+        with self.assertRaises(typer.Exit):
+            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("   ")
+
+    def test_fetch_nordvpn_wireguard_key_from_token_http_401_fails(self) -> None:
+        http_error = urllib.error.HTTPError(
+            url="https://api.nordvpn.com",
+            code=401,
+            msg="Unauthorized",
+            hdrs=mock.MagicMock(),
+            fp=None,
+        )
         with (
-            mock.patch.object(
-                nordvpn_mod,
-                "missing_nordvpn_dependencies",
-                return_value=["- nordvpn CLI", "- wireguard-tools"],
-            ),
-            self.assertRaises(typer.Exit) as ctx,
+            mock.patch("urllib.request.urlopen", side_effect=http_error),
+            self.assertRaises(typer.Exit),
         ):
-            nordvpn_mod.preflight_nordvpn_setup()
-        self.assertEqual(ctx.exception.exit_code, 1)
+            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("invalid-token")
 
-    def test_get_nordvpn_wireguard_key_manual_path_skips_host_extraction(self) -> None:
+    def test_fetch_nordvpn_wireguard_key_from_token_url_error_fails(self) -> None:
+        url_error = urllib.error.URLError("Connection refused")
         with (
-            mock.patch.object(nordvpn_mod, "_prompt_nordvpn_key_setup_mode", return_value="manual"),
-            mock.patch.object(
-                nordvpn_mod, "_prompt_manual_wireguard_key", return_value="manual-key"
-            ),
-            mock.patch.object(nordvpn_mod, "preflight_nordvpn_setup") as preflight,
+            mock.patch("urllib.request.urlopen", side_effect=url_error),
+            self.assertRaises(typer.Exit),
         ):
-            key = nordvpn_mod.get_nordvpn_wireguard_key()
-        self.assertEqual(key, "manual-key")
-        preflight.assert_not_called()
+            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("token")
 
-    def test_get_nordvpn_wireguard_key_auto_path_checks_prerequisites(self) -> None:
+    def test_fetch_nordvpn_wireguard_key_from_token_missing_key_fails(self) -> None:
+        payload = json.dumps({"user_id": 123}).encode("utf-8")
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = payload
+        mock_response.__enter__.return_value = mock_response
+
         with (
-            mock.patch.object(nordvpn_mod, "_prompt_nordvpn_key_setup_mode", return_value="auto"),
-            mock.patch.object(typer, "confirm", return_value=True),
-            mock.patch.object(nordvpn_mod, "preflight_nordvpn_setup") as preflight,
-            mock.patch.object(nordvpn_mod, "_extract_wireguard_key", return_value="auto-key"),
-            mock.patch.object(nordvpn_mod, "logger"),
+            mock.patch("urllib.request.urlopen", return_value=mock_response),
+            self.assertRaises(typer.Exit),
         ):
-            key = nordvpn_mod.get_nordvpn_wireguard_key()
-        self.assertEqual(key, "auto-key")
-        preflight.assert_called_once()
+            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("token")
 
-    def test_configure_nordvpn_openvpn_writes_credentials_and_clears_wireguard_key(self) -> None:
+    def test_fetch_nordvpn_wireguard_key_from_token_invalid_key_format_fails(self) -> None:
+        payload = json.dumps({"nordlynx_private_key": "not-a-valid-wireguard-key"}).encode("utf-8")
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = payload
+        mock_response.__enter__.return_value = mock_response
+
+        with (
+            mock.patch("urllib.request.urlopen", return_value=mock_response),
+            self.assertRaises(typer.Exit),
+        ):
+            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("token")
+
+    def test_prompt_manual_wireguard_key_success(self) -> None:
+        key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        with mock.patch.object(typer, "prompt", return_value=key):
+            result = nordvpn_mod._prompt_manual_wireguard_key()
+        self.assertEqual(result, key)
+
+    def test_configure_nordvpn_openvpn_manual_writes_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
             env.write_text(
@@ -87,6 +117,9 @@ class NordVpnTests(unittest.TestCase):
             )
             with (
                 mock.patch.object(nordvpn_mod, "_prompt_nordvpn_protocol", return_value="openvpn"),
+                mock.patch.object(
+                    nordvpn_mod, "_prompt_nordvpn_openvpn_setup_mode", return_value="manual"
+                ),
                 mock.patch.object(
                     nordvpn_mod,
                     "_prompt_openvpn_credentials",
@@ -100,7 +133,67 @@ class NordVpnTests(unittest.TestCase):
             self.assertEqual(env_file_value(env, "OPENVPN_PASSWORD"), "svc-pass")
             self.assertEqual(env_file_value(env, "WIREGUARD_PRIVATE_KEY"), "")
 
-    def test_configure_nordvpn_wireguard_writes_key_and_clears_openvpn_credentials(self) -> None:
+    def test_configure_nordvpn_openvpn_token_writes_credentials(self) -> None:
+        key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "VPN_TYPE=wireguard\nWIREGUARD_PRIVATE_KEY=<paste-key-here>\n"
+                "OPENVPN_USER=\nOPENVPN_PASSWORD=\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(nordvpn_mod, "_prompt_nordvpn_protocol", return_value="openvpn"),
+                mock.patch.object(
+                    nordvpn_mod, "_prompt_nordvpn_openvpn_setup_mode", return_value="token"
+                ),
+                mock.patch.object(typer, "prompt", return_value="token-123"),
+                mock.patch.object(
+                    nordvpn_mod,
+                    "fetch_nordvpn_credentials_from_token",
+                    return_value=(key, "svc-user", "svc-pass"),
+                ),
+                mock.patch.object(nordvpn_mod, "logger"),
+            ):
+                nordvpn_mod.configure_nordvpn(env)
+            self.assertEqual(env_file_value(env, "VPN_TYPE"), "openvpn")
+            self.assertEqual(env_file_value(env, "OPENVPN_USER"), "svc-user")
+            self.assertEqual(env_file_value(env, "OPENVPN_PASSWORD"), "svc-pass")
+            self.assertEqual(env_file_value(env, "WIREGUARD_PRIVATE_KEY"), key)
+
+    def test_configure_nordvpn_wireguard_token_writes_key_and_credentials(self) -> None:
+        key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "VPN_TYPE=openvpn\nWIREGUARD_PRIVATE_KEY=\n"
+                "OPENVPN_USER=old-user\nOPENVPN_PASSWORD=old-pass\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    nordvpn_mod, "_prompt_nordvpn_protocol", return_value="wireguard"
+                ),
+                mock.patch.object(
+                    nordvpn_mod, "_prompt_nordvpn_key_setup_mode", return_value="token"
+                ),
+                mock.patch.object(typer, "prompt", return_value="token-123"),
+                mock.patch.object(
+                    nordvpn_mod,
+                    "fetch_nordvpn_credentials_from_token",
+                    return_value=(key, "new-user", "new-pass"),
+                ),
+                mock.patch.object(nordvpn_mod, "logger"),
+            ):
+                nordvpn_mod.configure_nordvpn(env)
+            self.assertEqual(env_file_value(env, "VPN_TYPE"), "wireguard")
+            self.assertEqual(env_file_value(env, "WIREGUARD_PRIVATE_KEY"), key)
+            self.assertEqual(env_file_value(env, "WIREGUARD_ADDRESSES"), "10.5.0.2/32")
+            self.assertEqual(env_file_value(env, "OPENVPN_USER"), "new-user")
+            self.assertEqual(env_file_value(env, "OPENVPN_PASSWORD"), "new-pass")
+
+    def test_configure_nordvpn_wireguard_manual_writes_key_and_clears_openvpn(self) -> None:
+        key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
             env.write_text(
@@ -112,17 +205,95 @@ class NordVpnTests(unittest.TestCase):
                 mock.patch.object(
                     nordvpn_mod, "_prompt_nordvpn_protocol", return_value="wireguard"
                 ),
-                mock.patch.object(nordvpn_mod, "get_nordvpn_wireguard_key", return_value="wg-key"),
+                mock.patch.object(
+                    nordvpn_mod, "_prompt_nordvpn_key_setup_mode", return_value="manual"
+                ),
+                mock.patch.object(nordvpn_mod, "_prompt_manual_wireguard_key", return_value=key),
                 mock.patch.object(nordvpn_mod, "logger"),
             ):
                 nordvpn_mod.configure_nordvpn(env)
             self.assertEqual(env_file_value(env, "VPN_TYPE"), "wireguard")
-            self.assertEqual(env_file_value(env, "WIREGUARD_PRIVATE_KEY"), "wg-key")
+            self.assertEqual(env_file_value(env, "WIREGUARD_PRIVATE_KEY"), key)
+            self.assertEqual(env_file_value(env, "WIREGUARD_ADDRESSES"), "10.5.0.2/32")
             self.assertEqual(env_file_value(env, "OPENVPN_USER"), "")
             self.assertEqual(env_file_value(env, "OPENVPN_PASSWORD"), "")
 
 
 class InitPromptTests(unittest.TestCase):
+    def test_existing_setup_summary_is_env_derived_and_redacts_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "STREMIO_ENABLED=0\nCOMET_ENABLED=1\n"
+                "VPN_SERVICE_PROVIDER=nordvpn\nVPN_TYPE=openvpn\n"
+                "OPENVPN_USER=private-user\nOPENVPN_PASSWORD=private-password\n"
+                "STREMIO_BIND_ADDRS=10.0.0.5,100.64.0.2\n"
+                "COMET_GATEWAY_PUBLIC_BASE_URL=https://public-user:public-password@comet.example.test\n"
+                "SERVER_COUNTRIES=United States\nSERVER_CITIES=Seattle\n",
+                encoding="utf-8",
+            )
+
+            summary = "\n".join(init_mod.existing_setup_summary(env))
+
+        self.assertIn("Comet-only", summary)
+        self.assertIn("nordvpn / openvpn (configured)", summary)
+        self.assertIn("countries=United States", summary)
+        self.assertIn("cities=Seattle", summary)
+        self.assertIn("<credentials-redacted>@comet.example.test", summary)
+        self.assertNotIn("private-user", summary)
+        self.assertNotIn("private-password", summary)
+        self.assertNotIn("public-user", summary)
+        self.assertNotIn("public-password", summary)
+
+    def test_public_url_summary_fails_closed_for_sensitive_or_malformed_values(self) -> None:
+        self.assertEqual(
+            init_mod._redacted_public_url("https://comet.example.test/configure?token=private"),
+            "https://comet.example.test",
+        )
+        self.assertEqual(
+            init_mod._redacted_public_url("https://comet.example.test:not-a-port"),
+            "configured (redacted)",
+        )
+
+    def test_existing_setup_defaults_preserve_profile_access_and_bind_addresses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text(
+                "STREMIO_ENABLED=0\nCOMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=1\n"
+                "COMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.test\n"
+                "STREMIO_BIND_ADDRS=10.0.0.5,100.64.0.2\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(init_mod.configured_profile_choice(env), "2")
+            self.assertEqual(init_mod.configured_access_choice(env, comet_only=True), "2")
+            with (
+                mock.patch.object(
+                    typer, "prompt", side_effect=["2", "10.0.0.5", "100.64.0.2"]
+                ) as prompt,
+                mock.patch.object(typer, "echo"),
+            ):
+                addresses = init_mod._prompt_direct_bind_addresses(
+                    default_addresses=["10.0.0.5", "100.64.0.2"]
+                )
+
+        self.assertEqual(addresses, ["10.0.0.5", "100.64.0.2"])
+        self.assertEqual(prompt.call_args_list[0].kwargs["default"], "2")
+        self.assertEqual(prompt.call_args_list[1].kwargs["default"], "10.0.0.5")
+        self.assertEqual(prompt.call_args_list[2].kwargs["default"], "100.64.0.2")
+
+    def test_optional_stremio_prompts_default_to_existing_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("STREMIO_APPLY_PATCHES=0\nSTREMIO_SKIP_HW_PROBE=0\n", encoding="utf-8")
+            with (
+                mock.patch.object(typer, "confirm", side_effect=[False, False]) as confirm,
+                mock.patch.object(init_mod, "logger"),
+            ):
+                init_mod.configure_optional_stremio_settings(env)
+
+        self.assertFalse(confirm.call_args_list[0].kwargs["default"])
+        self.assertFalse(confirm.call_args_list[1].kwargs["default"])
+
     def test_configure_external_access_tier_one_writes_lan_bind_and_clears_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
@@ -333,6 +504,14 @@ class WatchdogCliTests(unittest.TestCase):
 
 
 class UnifiedCliTests(unittest.TestCase):
+    def test_status_runs_guard_status_and_comet_status(self) -> None:
+        with (
+            mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
+            mock.patch.object(general_cmd_mod, "_comet_enabled", return_value=False),
+        ):
+            general_cmd_mod.status()
+        run_guard.assert_called_once_with("status", file_logging=False)
+
     def test_start_calls_run_guard_and_starts_watchdog(self) -> None:
         with (
             mock.patch.object(general_cmd_mod, "_warn_for_optional_stremio_settings"),
@@ -426,7 +605,76 @@ class CliCommandTests(unittest.TestCase):
 
             self.assertEqual(call_order, ["optional", "access", "key"])
 
-    def test_init_always_prompts_credentials_even_when_already_set(self) -> None:
+    def test_init_resumes_valid_existing_setup_without_mutating_or_prompting_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            env_example = temp_root / ".env.example"
+            env_file = temp_root / ".env"
+            env_example.write_text("VPN_SERVICE_PROVIDER=nordvpn\n", encoding="utf-8")
+            original = (
+                "STREMIO_ENABLED=1\nCOMET_ENABLED=1\n"
+                "VPN_SERVICE_PROVIDER=nordvpn\nVPN_TYPE=openvpn\n"
+                "OPENVPN_USER=private-user\nOPENVPN_PASSWORD=private-password\n"
+            )
+            env_file.write_text(original, encoding="utf-8")
+
+            with (
+                mock.patch.object(general_cmd_mod, "ENV_EXAMPLE", env_example),
+                mock.patch.object(general_cmd_mod, "ENV_FILE", env_file),
+                mock.patch.object(general_cmd_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "confirm", return_value=True) as confirm,
+                mock.patch.object(typer, "prompt") as prompt,
+                mock.patch.object(general_cmd_mod, "configure_nordvpn") as configure_nordvpn,
+                mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
+                mock.patch.object(general_cmd_mod, "restart") as restart,
+                mock.patch.object(general_cmd_mod, "logger"),
+            ):
+                general_cmd_mod.init()
+
+            self.assertEqual(env_file.read_text(encoding="utf-8"), original)
+            confirm.assert_called_once_with(
+                "Reuse this setup and restart without changing it?", default=True
+            )
+            prompt.assert_not_called()
+            configure_nordvpn.assert_not_called()
+            run_guard.assert_called_once_with("pull", file_logging=False)
+            restart.assert_called_once()
+
+    def test_init_editing_valid_setup_keeps_nordvpn_credentials_when_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            env_example = temp_root / ".env.example"
+            env_file = temp_root / ".env"
+            env_example.write_text("VPN_SERVICE_PROVIDER=nordvpn\n", encoding="utf-8")
+            original = (
+                "STREMIO_ENABLED=1\nCOMET_ENABLED=1\n"
+                "VPN_SERVICE_PROVIDER=nordvpn\nVPN_TYPE=openvpn\n"
+                "OPENVPN_USER=private-user\nOPENVPN_PASSWORD=private-password\n"
+            )
+            env_file.write_text(original, encoding="utf-8")
+
+            with (
+                mock.patch.object(general_cmd_mod, "ENV_EXAMPLE", env_example),
+                mock.patch.object(general_cmd_mod, "ENV_FILE", env_file),
+                mock.patch.object(general_cmd_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(general_cmd_mod, "is_interactive", return_value=True),
+                mock.patch.object(typer, "confirm", side_effect=[False, True]),
+                mock.patch.object(typer, "prompt", side_effect=["1", "1"]),
+                mock.patch.object(general_cmd_mod, "prompt_provider", return_value="nordvpn"),
+                mock.patch.object(general_cmd_mod, "configure_optional_stremio_settings"),
+                mock.patch.object(general_cmd_mod, "prompt_comet_setup"),
+                mock.patch.object(general_cmd_mod, "configure_external_access"),
+                mock.patch.object(general_cmd_mod, "configure_nordvpn") as configure_nordvpn,
+                mock.patch.object(general_cmd_mod, "run_guard"),
+                mock.patch.object(general_cmd_mod, "restart"),
+                mock.patch.object(general_cmd_mod, "logger"),
+            ):
+                general_cmd_mod.init()
+
+            self.assertEqual(env_file.read_text(encoding="utf-8"), original)
+            configure_nordvpn.assert_not_called()
+
+    def test_init_configures_nordvpn_and_restarts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp_root = Path(directory)
             env_example = temp_root / ".env.example"
@@ -435,29 +683,26 @@ class CliCommandTests(unittest.TestCase):
                 "VPN_SERVICE_PROVIDER=nordvpn\nWIREGUARD_PRIVATE_KEY=<paste-key-here>\n",
                 encoding="utf-8",
             )
-            env_file.write_text(
-                "VPN_SERVICE_PROVIDER=nordvpn\nWIREGUARD_PRIVATE_KEY=bad-key\n",
-                encoding="utf-8",
-            )
-
             with (
                 mock.patch.object(general_cmd_mod, "ENV_EXAMPLE", env_example),
                 mock.patch.object(general_cmd_mod, "ENV_FILE", env_file),
+                mock.patch.object(general_cmd_mod, "ROOT_DIR", temp_root),
                 mock.patch.object(general_cmd_mod, "is_interactive", return_value=True),
                 mock.patch.object(typer, "prompt", return_value="1"),
+                mock.patch.object(typer, "confirm", return_value=False),
                 mock.patch.object(general_cmd_mod, "prompt_provider", return_value="nordvpn"),
-                mock.patch.object(general_cmd_mod, "configure_external_access"),
                 mock.patch.object(general_cmd_mod, "configure_optional_stremio_settings"),
                 mock.patch.object(general_cmd_mod, "prompt_comet_setup"),
-                mock.patch.object(typer, "confirm", return_value=False),
-                mock.patch.object(general_cmd_mod, "run_guard"),
+                mock.patch.object(general_cmd_mod, "configure_external_access"),
                 mock.patch.object(general_cmd_mod, "configure_nordvpn") as cfg_nordvpn,
+                mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
                 mock.patch.object(general_cmd_mod, "restart") as restart,
                 mock.patch.object(general_cmd_mod, "logger"),
             ):
                 general_cmd_mod.init()
 
             cfg_nordvpn.assert_called_once()
+            run_guard.assert_called_once_with("pull", file_logging=False)
             restart.assert_called_once()
 
     def test_init_prompts_provider_even_when_env_is_not_template_clean(self) -> None:
@@ -664,6 +909,58 @@ class ToolchainPathTests(unittest.TestCase):
         command = watchdog_mod._uv_command("python", "-c", "pass")
         self.assertEqual(command[:2], ["uv", "--cache-dir"])
         self.assertEqual(command[2], str(watchdog_mod.UV_CACHE))
+
+
+class UnlockCommandTests(unittest.TestCase):
+    def test_cli_unlock_when_no_lockout_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                mock.patch("stremioguard.cli.commands.general.ROOT_DIR", root),
+                mock.patch("stremioguard.cli.commands.general.logger") as mock_logger,
+            ):
+                general_mod.unlock()
+                mock_logger.info.assert_called_with("No VPN lockout is active.")
+
+    def test_cli_unlock_confirmed_clears_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lockout_file = root / ".stremio" / "vpn-lockout.json"
+            lockout_file.parent.mkdir(parents=True, exist_ok=True)
+            lockout_file.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-20T00:00:00Z",
+                        "reason": "auth_rejected",
+                        "outage_duration_seconds": 12.0,
+                        "remediation": "Run ./stremio init",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch("stremioguard.cli.commands.general.ROOT_DIR", root),
+                mock.patch("stremioguard.cli.commands.general.typer.confirm", return_value=True),
+                mock.patch("stremioguard.cli.commands.general.logger") as mock_logger,
+            ):
+                general_mod.unlock()
+                self.assertFalse(lockout_file.exists())
+                mock_logger.success.assert_called_once()
+
+    def test_cli_unlock_declined_retains_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lockout_file = root / ".stremio" / "vpn-lockout.json"
+            lockout_file.parent.mkdir(parents=True, exist_ok=True)
+            lockout_file.write_text('{"reason": "auth_rejected"}\n', encoding="utf-8")
+            with (
+                mock.patch("stremioguard.cli.commands.general.ROOT_DIR", root),
+                mock.patch("stremioguard.cli.commands.general.typer.confirm", return_value=False),
+                mock.patch("stremioguard.cli.commands.general.logger") as mock_logger,
+            ):
+                general_mod.unlock()
+                self.assertTrue(lockout_file.exists())
+                mock_logger.info.assert_called_with("Lockout marker retained.")
 
 
 if __name__ == "__main__":

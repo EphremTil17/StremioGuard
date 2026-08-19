@@ -59,10 +59,19 @@ class EnvUtilTests(unittest.TestCase):
             )
             self.assertTrue(env.env_needs_init(path))
 
+    def test_env_needs_init_when_wireguard_key_is_malformed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("WIREGUARD_PRIVATE_KEY=not-a-key\n", encoding="utf-8")
+            self.assertTrue(env.env_needs_init(path))
+
     def test_env_needs_init_false_when_key_populated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
-            path.write_text("WIREGUARD_PRIVATE_KEY=aGVsbG8td29ybGQ=\n", encoding="utf-8")
+            path.write_text(
+                "WIREGUARD_PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+                encoding="utf-8",
+            )
             self.assertFalse(env.env_needs_init(path))
 
     def test_env_needs_init_false_when_nordvpn_openvpn_credentials_populated(self) -> None:
