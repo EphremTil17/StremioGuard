@@ -7,7 +7,7 @@ from pathlib import Path
 
 from stremioguard.comet import CometManager
 from stremioguard.comet_gateway import CometGatewayConfig, CometGatewayManager
-from stremioguard.config import CometConfig
+from stremioguard.config import MANAGED_STACK_ENV, CometConfig
 
 # Path resolution: src/stremioguard/cli/context.py
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent.parent
@@ -47,6 +47,7 @@ class RunContext:
 
     def env(self, *, background: bool = False, file_logging: bool = True) -> dict[str, str]:
         env = os.environ.copy()
+        env[MANAGED_STACK_ENV] = "1"
         env.setdefault("INSTALL_MISSING_DEPS", "1")
         env["STREMIO_RUN_ID"] = self.run_id
         if file_logging:
@@ -57,6 +58,25 @@ class RunContext:
             env["STREMIO_LOG_SESSION"] = "0"
         if background:
             env["STREMIO_BACKGROUND"] = "1"
+
+        if ENV_FILE.exists():
+            from stremioguard.env import env_file_value
+            from stremioguard.resolver import resolve_nordvpn_endpoint
+
+            provider = env_file_value(ENV_FILE, "VPN_SERVICE_PROVIDER")
+            explicit_hostname = env_file_value(ENV_FILE, "SERVER_HOSTNAMES")
+            if provider == "nordvpn" and not explicit_hostname:
+                country = env_file_value(ENV_FILE, "SERVER_COUNTRIES")
+                city = env_file_value(ENV_FILE, "SERVER_CITIES")
+                cache_path = STATE_DIR / "nordvpn-endpoint-cache.json"
+                endpoint = resolve_nordvpn_endpoint(
+                    country=country, city=city, cache_path=cache_path
+                )
+                if endpoint:
+                    _, ip = endpoint
+                    env.setdefault("OPENVPN_ENDPOINT_IP", ip)
+                    env.setdefault("WIREGUARD_ENDPOINT_IP", ip)
+
         return env
 
 
