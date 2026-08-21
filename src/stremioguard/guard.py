@@ -9,6 +9,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from enum import Enum
 
 from loguru import logger
@@ -17,13 +18,14 @@ from stremioguard.comet_gateway import CometGatewayConfig
 from stremioguard.config import (
     DEFAULT_STREMIO_CONTAINER_PORT,
     DEFAULT_STREMIO_HOST_PORT,
+    MANAGED_STACK_ENV,
     CometConfig,
     Config,
     Runner,
     SubprocessRunner,
     parse_public_ip,
 )
-from stremioguard.env import env_file_value, env_int_value
+from stremioguard.env import atomic_write_text, env_file_value, env_int_value
 from stremioguard.preflight import (
     require_docker,
     require_matching_daemon,
@@ -39,6 +41,15 @@ class PublicIPAssessment(Enum):
     SAFE = "SAFE"
     UNSAFE_DEFINITIVE = "UNSAFE_DEFINITIVE"
     UNKNOWN = "UNKNOWN"
+
+
+class GluetunUnavailableError(RuntimeError):
+    """Gluetun started but did not establish a verifiable safe tunnel.
+
+    This is distinct from configuration and Compose errors: startup may hand
+    this transient runtime state to the watchdog without starting protected
+    services. Other preflight failures remain fatal.
+    """
 
 
 class GluetunGuard:
@@ -63,6 +74,82 @@ class GluetunGuard:
     def log_lines(self, text: str) -> None:
         for line in text.splitlines() or [""]:
             logger.info(line)
+
+    def read_vpn_lockout(self) -> dict[str, object] | None:
+        if not self.config.vpn_lockout_file.exists():
+            return None
+        try:
+            data = json.loads(self.config.vpn_lockout_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+        return None
+
+    def check_vpn_lockout(self, *, allow_recovery: bool = False) -> None:
+        if not self.config.vpn_lockout_file.exists():
+            return
+        if allow_recovery:
+            self.log(
+                "Existing VPN lockout marker detected; proceeding under explicit recovery mode."
+            )
+            return
+
+        lockout = self.read_vpn_lockout()
+        reason = (
+            lockout.get("reason", "unknown") if lockout else "corrupted or malformed lockout marker"
+        )
+        timestamp = lockout.get("timestamp", "unknown") if lockout else "unknown"
+        remediation = (
+            lockout.get(
+                "remediation",
+                "Run `./stremio init` to update credentials or "
+                "`./stremio restart` to attempt recovery.",
+            )
+            if lockout
+            else "Inspect/clear marker via `./stremio unlock` or retry with `./stremio restart`."
+        )
+        raise RuntimeError(
+            f"VPN circuit breaker is active (locked out at {timestamp}, reason: {reason}).\n"
+            f"{remediation}\n"
+            "To clear the lockout manually without starting services, run `./stremio unlock`."
+        )
+
+    def write_vpn_lockout(self, *, reason: str, outage_duration_seconds: float) -> None:
+        container_id = self.service_container_id("gluetun") or "unknown"
+        provider = env_file_value(self._env_path, "VPN_SERVICE_PROVIDER") or "unknown"
+        vpn_type = env_file_value(self._env_path, "VPN_TYPE") or "unknown"
+        payload = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "reason": reason,
+            "outage_duration_seconds": round(outage_duration_seconds, 1),
+            "gluetun_container_id": container_id,
+            "provider": provider,
+            "vpn_type": vpn_type,
+            "remediation": (
+                "Update VPN credentials via `./stremio init` or "
+                "attempt recovery via `./stremio restart`."
+                if reason == "auth_rejected"
+                else "Verify network connectivity/provider status, then run `./stremio restart`."
+            ),
+        }
+        atomic_write_text(
+            self.config.vpn_lockout_file, json.dumps(payload, indent=2) + "\n", mode=0o600
+        )
+
+    def clear_vpn_lockout(self) -> None:
+        if self.config.vpn_lockout_file.exists():
+            try:
+                self.config.vpn_lockout_file.unlink()
+                self.log("Cleared VPN lockout marker.")
+            except OSError as error:
+                self.warn(
+                    f"Failed to clear VPN lockout marker at {self.config.vpn_lockout_file}: {error}"
+                )
+                raise RuntimeError(
+                    f"Failed to remove VPN lockout marker at {self.config.vpn_lockout_file}: "
+                    f"{error}. Refusing to resume services while a stale lockout marker remains."
+                ) from error
 
     def bind_addresses(self) -> list[str]:
         raw = env_file_value(self._env_path, "STREMIO_BIND_ADDRS")
@@ -155,7 +242,11 @@ class GluetunGuard:
         )
 
     def compose(
-        self, *args: str, check: bool = True, capture: bool = True
+        self,
+        *args: str,
+        check: bool = True,
+        capture: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Query/teardown compose call: uses the override if one exists, but
         never publishes one.
@@ -165,13 +256,23 @@ class GluetunGuard:
         produced yet — a stack whose bundle is missing could not even be
         inspected or brought down. Lifecycle calls use `compose_fresh`.
         """
-        return self.runner.run(self._compose_command(*args), check=check, capture=capture)
+        call_env = {MANAGED_STACK_ENV: "1", **os.environ, **(env or {})}
+        return self.runner.run(
+            self._compose_command(*args), check=check, capture=capture, env=call_env
+        )
 
     def compose_fresh(
-        self, *args: str, check: bool = True, capture: bool = True
+        self,
+        *args: str,
+        check: bool = True,
+        capture: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.write_compose_override()
-        return self.runner.run(self._compose_command(*args), check=check, capture=capture)
+        call_env = {MANAGED_STACK_ENV: "1", **os.environ, **(env or {})}
+        return self.runner.run(
+            self._compose_command(*args), check=check, capture=capture, env=call_env
+        )
 
     def _compose_command(self, *args: str) -> list[str]:
         override = self.config.compose_override_file
@@ -203,16 +304,33 @@ class GluetunGuard:
         )
         return result.returncode == 0 and (result.stdout or "").strip() == "healthy"
 
-    def gluetun_recent_logs(self, lines: int = 20) -> str:
+    def gluetun_recent_logs(self, lines: int = 20, since_epoch: float | None = None) -> str:
         container_id = self.service_container_id("gluetun")
         if not container_id:
             return ""
+        cmd = ["docker", "logs", "--tail", str(lines)]
+        if since_epoch is not None:
+            cmd.extend(["--since", str(int(since_epoch))])
+        cmd.append(container_id)
         result = self.runner.run(
-            ["docker", "logs", "--tail", str(lines), container_id],
+            cmd,
             check=False,
         )
         parts = [p for p in (result.stdout or "", result.stderr or "") if p.strip()]
         return "\n".join(parts).strip()
+
+    def gluetun_auth_failed(self, lines: int = 50, since_epoch: float | None = None) -> bool:
+        recent = self.gluetun_recent_logs(lines=lines, since_epoch=since_epoch)
+        if not recent:
+            return False
+        auth_markers = (
+            "AUTH_FAILED",
+            "Your credentials might be wrong",
+            "authentication failure",
+            "AUTH: Received control message: AUTH_FAILED",
+            "incorrect key size",
+        )
+        return any(m in recent for m in auth_markers)
 
     def wait_for_gluetun_healthy(self) -> None:
         deadline = time.monotonic() + self.config.gluetun_healthy_timeout_seconds
@@ -222,19 +340,18 @@ class GluetunGuard:
                 return
             time.sleep(2)
 
-        recent = self.gluetun_recent_logs()
+        recent = self.gluetun_recent_logs(lines=20)
         if recent:
             self.warn("Last gluetun log lines:")
             self.log_lines(recent)
 
-        auth_markers = ("AUTH_FAILED", "Your credentials might be wrong", "authentication failure")
-        if any(m in recent for m in auth_markers):
-            raise RuntimeError(
+        if self.gluetun_auth_failed():
+            raise GluetunUnavailableError(
                 "Gluetun VPN credentials were rejected (AUTH_FAILED). "
                 "Re-run `./stremio init` to update your VPN credentials."
             )
 
-        raise RuntimeError(
+        raise GluetunUnavailableError(
             f"Gluetun did not become healthy within "
             f"{self.config.gluetun_healthy_timeout_seconds}s. "
             "Check the log lines above or run `docker logs gluetun` for details."
@@ -427,7 +544,14 @@ class GluetunGuard:
             logger.opt(exception=True).debug("gluetun image pull failed unexpectedly.")
             self.warn("gluetun image pull failed; starting with the existing image.")
 
-    def preflight(self) -> None:
+    def preflight(self, *, allow_recovery: bool = False, defer_vpn_recovery: bool = False) -> bool:
+        """Prepare Gluetun and verify a safe tunnel.
+
+        If ``defer_vpn_recovery`` is enabled, an unavailable tunnel returns
+        ``False`` after Gluetun has been launched. The caller must immediately
+        launch the watchdog and must not start protected services. Configuration
+        and Compose failures still raise normally.
+        """
         self.require_commands()
         if not self._env_path.exists():
             raise RuntimeError(
@@ -435,6 +559,7 @@ class GluetunGuard:
                 "first-time setup, or copy .env.example to .env and populate the "
                 "chosen VPN credentials manually (see README.md → First-time setup)."
             )
+        self.check_vpn_lockout(allow_recovery=allow_recovery)
         self.check_bind_addresses()
 
         comet_config = CometConfig.from_env(self.config.root_dir)
@@ -450,9 +575,28 @@ class GluetunGuard:
         # override so bind/mount changes apply BEFORE the VPN is verified,
         # not via a surprise dependency-recreate during the services `up`.
         self.compose_fresh("up", "-d", "gluetun", capture=False)
-        self.wait_for_gluetun_healthy()
+        try:
+            self.wait_for_gluetun_healthy()
+        except GluetunUnavailableError:
+            if not defer_vpn_recovery:
+                raise
+            self.warn(
+                "Gluetun is unavailable at startup. Protected services remain stopped; "
+                "the watchdog will own the bounded recovery window."
+            )
+            return False
         if not self.public_ip_safe(log_observation=True):
+            if defer_vpn_recovery:
+                self.warn(
+                    "Gluetun is healthy but its public IP cannot be verified at startup. "
+                    "Protected services remain stopped; the watchdog will continue "
+                    "fail-closed monitoring."
+                )
+                return False
             raise RuntimeError("Public IP check failed via gluetun; refusing to start services.")
+        self.clear_vpn_lockout()
+
+        return True
 
     def ensure_data_dir(self) -> None:
         data_dir = self.config.root_dir / "stremio-data"
@@ -487,6 +631,67 @@ class GluetunGuard:
     def stop_active_services(self, services: list[str] | None = None) -> None:
         if services is None:
             services = self.enabled_runtime_services()
-        self.log(f"Stopping active services: {', '.join(services)}.")
-        self.compose("stop", *services, check=False)
-        self.success("Active services are stopped.")
+        running_services = [s for s in services if self.container_running([s])]
+        if not running_services:
+            return
+        self.log(f"Stopping active services: {', '.join(running_services)}.")
+        result = self.compose("stop", *running_services, check=False)
+        still_running = [s for s in running_services if self.container_running([s])]
+        if still_running or result.returncode != 0:
+            target = ", ".join(still_running or running_services)
+            self.warn(f"Failed to confirm shutdown of services: {target}.")
+        else:
+            self.success("Active services are stopped.")
+
+    def stop_gluetun(self) -> None:
+        self.log("Stopping gluetun VPN container.")
+        result = self.compose("stop", "gluetun", check=False)
+        if self.container_running(["gluetun"]) or result.returncode != 0:
+            container_id = self.service_container_id("gluetun")
+            if container_id:
+                self.runner.run(["docker", "stop", "-t", "5", container_id], check=False)
+            if self.container_running(["gluetun"]):
+                self.warn(
+                    "FATAL: Gluetun VPN container could not be stopped. "
+                    "Container may still be running in the background."
+                )
+                return
+        self.success("Gluetun VPN container is stopped.")
+
+    def restart_gluetun(self) -> None:
+        self.log("Restarting gluetun service (best-effort candidate reselection).")
+        env_override: dict[str, str] = {}
+        if self._env_path.exists():
+            from stremioguard.env import env_file_value
+            from stremioguard.resolver import resolve_nordvpn_endpoint
+
+            provider = env_file_value(self._env_path, "VPN_SERVICE_PROVIDER")
+            explicit_hostname = env_file_value(self._env_path, "SERVER_HOSTNAMES")
+            if provider == "nordvpn" and not explicit_hostname:
+                country = env_file_value(self._env_path, "SERVER_COUNTRIES")
+                city = env_file_value(self._env_path, "SERVER_CITIES")
+                cache_path = self.config.root_dir / ".stremio" / "nordvpn-endpoint-cache.json"
+                endpoint = resolve_nordvpn_endpoint(
+                    country=country, city=city, cache_path=cache_path, force_refresh=True
+                )
+                if endpoint:
+                    _, ip = endpoint
+                    env_override["OPENVPN_ENDPOINT_IP"] = ip
+                    env_override["WIREGUARD_ENDPOINT_IP"] = ip
+
+        if env_override:
+            self.compose("up", "-d", "--force-recreate", "gluetun", check=False, env=env_override)
+        else:
+            self.compose("restart", "gluetun", check=False)
+
+    def restart_gluetun_relaxed(self) -> None:
+        self.log("Restarting gluetun service with relaxed broad country pool.")
+        env_override = {
+            "SERVER_REGIONS": "",
+            "SERVER_CITIES": "",
+            "SERVER_HOSTNAMES": "",
+            "SERVER_CATEGORIES": "",
+            "OPENVPN_ENDPOINT_IP": "",
+            "WIREGUARD_ENDPOINT_IP": "",
+        }
+        self.compose("up", "-d", "--force-recreate", "gluetun", check=False, env=env_override)

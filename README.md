@@ -33,20 +33,14 @@ Switching to any of [gluetun's 30+ supported providers](https://github.com/qdm12
 Before the first run on Linux, make sure these are in place:
 
 - Docker with the Compose plugin installed and working.
-- Your Linux user able to talk to Docker without sudo (for example via the `docker` group or Docker Desktop WSL integration). `docker ps` should work before you run `./stremio`.
+- Your Linux user able to talk to Docker without sudo (for example via the `docker` group or rootless Docker). `docker ps` should work before you run `./stremio`.
 - `/dev/net/tun` available on the Linux host or WSL2 guest.
-- A VPN provider account and the client or credentials needed for your chosen setup.
-- For the NordVPN fallback extraction path specifically:
-  - the NordVPN Linux CLI installed and available on `PATH`
-  - `nordvpn login` already completed
-  - `wireguard-tools` installed so `wg` is callable
+- A VPN provider account and the credentials needed for your chosen setup.
 
 On Debian/Ubuntu/WSL, that usually means:
 
 ```bash
-sudo apt install wireguard-tools
 ls /dev/net/tun
-nordvpn login
 ```
 
 Run the guided initializer:
@@ -55,7 +49,7 @@ Run the guided initializer:
 ./stremio init
 ```
 
-This creates `.env` from `.env.example` if needed, offers a couple of optional Stremio toggles up front, and then walks through NordVPN protocol setup. Re-running `init` is idempotent: once the chosen protocol credentials are populated, the setup step is skipped.
+This creates `.env` from `.env.example` if needed, offers a couple of optional Stremio toggles up front, and then walks through NordVPN protocol setup. On a later `./stremio init`, a structurally valid `.env` is summarized with secrets redacted; accept the default to reuse it and restart without re-entering credentials, or decline to edit the setup with its current values as prompt defaults. `.stremio` JSON and generated runtime files are not setup inputs: they are operational state and never override `.env`.
 The same guided flow now also offers an optional Comet branch so you can leave
 Comet disabled on Stremio-only deployments or configure it in the same pass.
 
@@ -68,28 +62,20 @@ During guided setup, Stremio asks which deployment **tier** you're running:
 
 For NordVPN, `init` offers two protocol paths:
 
-- Recommended: **WireGuard / NordLynx**
-- Alternative: **OpenVPN** with NordVPN service credentials
+- Recommended: **WireGuard / NordLynx** (for performance and instant handshakes)
+- Alternative: **OpenVPN** with NordVPN manual service credentials
 
-If you choose **WireGuard**, `init` offers two key-setup paths:
+If you choose **WireGuard**, `init` allows you to:
 
-- Recommended: paste an existing WireGuard private key if you already have one.
-- Fallback: extract it automatically from the host NordVPN CLI.
+- **Generate via NordVPN Access Token (recommended)**: Paste an Access Token from your [Nord Account Dashboard](https://my.nordaccount.com/dashboard/nordvpn/access-tokens/). StremioGuard queries NordVPN's API directly to retrieve your account's permanent WireGuard private key without any host routing changes or sudo requirements.
+- **Paste an existing WireGuard private key**: Paste a known 44-character Base64 WireGuard key directly.
 
-The fallback extraction path temporarily connects **the Linux host itself** to NordVPN. That can interrupt SSH sessions, LAN access, or other active host traffic while the key is being captured.
-
-If you choose **OpenVPN**, `init` prompts for your NordVPN **service credentials** and writes them into `.env`.
+If you choose **OpenVPN**, `init` prompts for your NordVPN **service credentials** (from your Nord Account manual setup section) and writes them into `.env`.
 
 The initializer does **not** install these for you:
 
-- The NordVPN Linux CLI must be installed and logged in if you choose the fallback host extraction path for WireGuard. `init` will print a clear pointer if either check fails.
-- `wireguard-tools` must be installed if you choose the fallback host extraction path for WireGuard, since `wg show` is used to capture the key: `sudo apt install wireguard-tools` (or your distro's equivalent).
-- NordVPN OpenVPN uses **service credentials**, not your account email/password. You can retrieve them from Nord Account under manual setup.
 - WSL2 needs `/dev/net/tun`. Modern WSL2 kernels (≥5.6) include it by default. Verify with `ls /dev/net/tun`; if missing, `sudo modprobe tun` enables it for the session.
-
-After `init` succeeds, the host-level NordVPN CLI is no longer needed at runtime unless you intentionally use the WireGuard extraction fallback again; gluetun handles the tunnel itself.
-
-Paste the printed key into `.env` as `WIREGUARD_PRIVATE_KEY=...`.
+- NordVPN OpenVPN uses **service credentials**, not your account email/password. You can retrieve them from Nord Account under manual setup.
 
 ## First run
 
@@ -309,7 +295,7 @@ With no arguments, `./stremio` behaves like `./stremio start`.
 Command guide:
 
 - `./stremio init`
-  Guided first-time setup. Creates `.env` from `.env.example` when needed, collects optional Stremio settings, and then helps you configure NordVPN through either WireGuard or OpenVPN before starting the stack.
+  Guided setup and safe re-init. Creates `.env` from `.env.example` when needed; later runs offer a redacted `.env` summary and can restart unchanged configuration without re-entering secrets. Declining reuse opens the guided editor with existing non-secret values as defaults. Generated `.stremio` files are runtime state, never a second configuration source.
 
 - `./stremio start`
   Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then launches the watchdog in the background and returns to the shell. When `COMET_ENABLED=1`, it also prepares and starts Comet automatically.
@@ -433,6 +419,7 @@ For advanced deployments where you want **automatic crash recovery** (restarts S
    PIDFile=/path/to/StremioGuard/.stremio/watchdog.pid
    Restart=always
    RestartSec=10
+   RestartPreventExitStatus=78
 
    [Install]
    WantedBy=multi-user.target

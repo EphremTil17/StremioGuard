@@ -58,6 +58,7 @@ class FakeRunner:
     ) -> None:
         self.responses = responses
         self.calls: list[list[str]] = []
+        self.envs: list[dict[str, str] | None] = []
 
     def run(
         self,
@@ -66,8 +67,10 @@ class FakeRunner:
         check: bool = False,
         capture: bool = True,
         timeout: float | None = None,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
+        self.envs.append(env)
         key = tuple(args)
         response = self.responses.get(key)
         if isinstance(response, list):
@@ -77,6 +80,8 @@ class FakeRunner:
         else:
             if len(args) >= 3 and args[-3:] == ["ps", "-q", args[-1]]:
                 result = subprocess.CompletedProcess(args, 0, f"{args[-1]}\n", "")
+            elif len(args) >= 4 and args[:4] == ["docker", "inspect", "-f", "{{.State.Running}}"]:
+                result = subprocess.CompletedProcess(args, 0, "true\n", "")
             else:
                 result = subprocess.CompletedProcess(args, 0, "", "")
 
@@ -124,6 +129,14 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
         "stremio_enabled": True,
         "ip_crosscheck_interval_seconds": 300,
         "public_ip_failure_threshold": 3,
+        "vpn_recovery_budget_seconds": 300,
+        "vpn_restart_cadence_seconds": 45,
+        "vpn_lockout_file": state_dir / "vpn-lockout",
+        "server_countries": None,
+        "server_regions": None,
+        "server_cities": None,
+        "server_hostnames": None,
+        "server_categories": None,
     }
     values.update(overrides)
     return Config(**values)  # type: ignore[arg-type]
