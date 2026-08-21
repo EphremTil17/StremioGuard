@@ -28,6 +28,7 @@ from stremioguard.cli.watchdog import (
 from stremioguard.comet import prompt_comet_setup
 from stremioguard.env import (
     env_flag_enabled,
+    env_needs_init,
     fail,
     read_env_provider,
     write_env_setting,
@@ -35,6 +36,9 @@ from stremioguard.env import (
 from stremioguard.init import (
     configure_external_access,
     configure_optional_stremio_settings,
+    configured_access_choice,
+    configured_profile_choice,
+    existing_setup_summary,
     print_manual_setup_pointer,
     prompt_provider,
 )
@@ -93,13 +97,14 @@ def print_welcome_banner() -> None:
 
 
 def init() -> None:
-    """First-time setup: create .env, configure VPN credentials, then start."""
+    """Create or edit `.env`; a valid existing setup can be resumed without re-entry."""
     if not is_interactive():
         fail("`init` needs an interactive terminal (stdin/stdout must be a TTY).")
 
     print_welcome_banner()
 
-    if not ENV_FILE.exists():
+    existing_setup = ENV_FILE.exists()
+    if not existing_setup:
         if not ENV_EXAMPLE.exists():
             fail(f"{ENV_EXAMPLE.name} not found; cannot bootstrap .env.")
         shutil.copy(ENV_EXAMPLE, ENV_FILE)
@@ -107,7 +112,17 @@ def init() -> None:
     else:
         logger.info(f"{ENV_FILE.name} already exists.")
 
-    profile_choice = "1"
+    if existing_setup and not env_needs_init(ENV_FILE):
+        typer.echo("")
+        for line in existing_setup_summary(ENV_FILE):
+            typer.echo(line)
+        typer.echo("")
+        if typer.confirm("Reuse this setup and restart without changing it?", default=True):
+            logger.info("Reusing the existing .env configuration; no secrets were read or changed.")
+            _pull_and_restart()
+            return
+
+    profile_choice = configured_profile_choice(ENV_FILE)
     while True:
         typer.echo("")
         typer.echo("1. Deployment Profile")
@@ -122,7 +137,7 @@ def init() -> None:
         )
         typer.echo("  3) Stremio-Only: Run only the Stremio server")
         typer.echo("     Deploys only the Stremio server. Best if you do not use Comet add-ons.")
-        profile_choice = typer.prompt("Choose [1-3]", default="1").strip()
+        profile_choice = typer.prompt("Choose [1-3]", default=profile_choice).strip()
         if profile_choice in {"1", "2", "3"}:
             break
         typer.echo("Invalid choice. Please select 1, 2, or 3.")
@@ -147,7 +162,14 @@ def init() -> None:
     typer.echo("  1) LAN + Tailscale only — no public domain  [default]")
     typer.echo("     Clients connect via local IP or Tailscale. No public ports/domains required.")
     typer.echo("  2) Reverse-proxied behind a domain (NPM, Caddy, Traefik, raw nginx)")
-    choice = typer.prompt("Choose [1-2]", default="1").strip().lower()
+    choice = (
+        typer.prompt(
+            "Choose [1-2]",
+            default=configured_access_choice(ENV_FILE, comet_only=not stremio_enabled),
+        )
+        .strip()
+        .lower()
+    )
     is_proxied = choice in {"2", "proxy", "domain", "reverse-proxy"}
 
     if is_proxied:
@@ -184,15 +206,34 @@ def init() -> None:
     logger.info("Pulling the latest VPN container image...")
     run_guard("pull", file_logging=False)
 
-    provider = prompt_provider(read_env_provider(ENV_FILE))
+    previous_provider = read_env_provider(ENV_FILE)
+    provider = prompt_provider(previous_provider)
     if provider == "nordvpn":
-        logger.info("Walking through NordVPN credential setup.")
-        configure_nordvpn(ENV_FILE)
-        logger.info("Setup complete. Restarting stack so Docker reloads the updated VPN config.")
+        keep_existing_vpn = (
+            previous_provider == "nordvpn"
+            and not env_needs_init(ENV_FILE)
+            and typer.confirm("Keep the existing NordVPN protocol and credentials?", default=True)
+        )
+        if keep_existing_vpn:
+            logger.info(
+                "Keeping existing NordVPN credentials; they were not displayed or rewritten."
+            )
+        else:
+            logger.info("Walking through NordVPN credential setup.")
+            configure_nordvpn(ENV_FILE)
+        logger.info("Setup complete. Restarting stack so Docker reloads the VPN configuration.")
         restart()
         return
 
     print_manual_setup_pointer()
+
+
+def _pull_and_restart() -> None:
+    """Retain init's pull-before-restart lifecycle for new and resumed setups."""
+    logger.info("Pulling the latest VPN container image...")
+    run_guard("pull", file_logging=False)
+    logger.info("Setup complete. Restarting stack so Docker reloads the VPN configuration.")
+    restart()
 
 
 def start() -> None:
@@ -240,6 +281,44 @@ def record_home_ip() -> None:
     run_guard("record-home-ip", file_logging=False)
 
 
+def unlock() -> None:
+    """Inspect and clear an active VPN lockout marker."""
+    lockout_file = ROOT_DIR / ".stremio" / "vpn-lockout.json"
+    if not lockout_file.exists():
+        logger.info("No VPN lockout is active.")
+        return
+
+    import json
+
+    try:
+        data = json.loads(lockout_file.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+
+    timestamp = data.get("timestamp", "unknown")
+    reason = data.get("reason", "unknown")
+    remediation = data.get("remediation", "unknown")
+    duration = data.get("outage_duration_seconds", "unknown")
+
+    logger.warning("Active VPN Lockout Marker:")
+    logger.warning(f"  Timestamp: {timestamp}")
+    logger.warning(f"  Reason: {reason}")
+    logger.warning(f"  Outage Duration: {duration}s")
+    logger.warning(f"  Remediation: {remediation}")
+    typer.echo("")
+
+    confirm = typer.confirm("Do you want to clear the VPN lockout marker?", default=False)
+    if not confirm:
+        logger.info("Lockout marker retained.")
+        return
+
+    try:
+        lockout_file.unlink()
+        logger.success("VPN lockout marker cleared successfully. Stack services were not started.")
+    except OSError as error:
+        fail(f"Failed to clear lockout marker: {error}")
+
+
 def check() -> None:
     """Run Ruff, Pyright, and pytest through uv."""
     _require_uv()
@@ -257,4 +336,5 @@ def register(app: typer.Typer) -> None:
     app.command()(status)
     app.command()(logs)
     app.command("record-home-ip")(record_home_ip)
+    app.command()(unlock)
     app.command()(check)

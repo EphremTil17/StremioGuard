@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import tempfile
 import time
@@ -15,7 +16,7 @@ from stremioguard import guard as guard_mod
 from stremioguard import preflight as preflight_mod
 from stremioguard.guard import GluetunGuard, PublicIPAssessment
 
-from .conftest import FakeRunner, completed, make_config
+from .conftest import FakeRunner, completed, compose_args_prefix, make_config
 
 GLUETUN_HEALTH_INSPECT = (
     "docker",
@@ -369,6 +370,46 @@ class GluetunGuardTests(unittest.TestCase):
             compose_fresh_mock.assert_called_once_with("up", "-d", "gluetun", capture=False)
             compose_mock.assert_not_called()
 
+    def test_preflight_defers_unavailable_gluetun_to_watchdog_without_service_promotion(
+        self,
+    ) -> None:
+        # A start-time timeout must hand ownership to the watchdog rather than
+        # abort before it starts; no protected-service promotion is permitted.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            with (
+                mock.patch.object(guard, "require_commands"),
+                mock.patch.object(guard, "check_bind_addresses"),
+                mock.patch.object(
+                    guard,
+                    "wait_for_gluetun_healthy",
+                    side_effect=guard_mod.GluetunUnavailableError("timed out"),
+                ),
+                mock.patch.object(guard, "compose_fresh") as compose_fresh_mock,
+                mock.patch.object(guard, "public_ip_safe") as public_ip_safe_mock,
+            ):
+                self.assertFalse(guard.preflight(defer_vpn_recovery=True))
+
+            compose_fresh_mock.assert_called_once_with("up", "-d", "gluetun", capture=False)
+            public_ip_safe_mock.assert_not_called()
+
+    def test_preflight_rejects_unverifiable_ip_without_recovery_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            with (
+                mock.patch.object(guard, "require_commands"),
+                mock.patch.object(guard, "check_bind_addresses"),
+                mock.patch.object(guard, "wait_for_gluetun_healthy"),
+                mock.patch.object(guard, "compose_fresh"),
+                mock.patch.object(guard, "public_ip_safe", return_value=False),
+                self.assertRaisesRegex(RuntimeError, "Public IP check failed"),
+            ):
+                guard.preflight()
+
     def _preflight_with_pull(self, runner: FakeRunner) -> GluetunGuard:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -563,6 +604,9 @@ class ComposeOverrideBootstrapTests(unittest.TestCase):
             guard.compose("ps", check=False)
             self.assertEqual(runner.calls[-1].count("-f"), 1)
             self.assertNotIn("docker-compose.bindings.yml", " ".join(runner.calls[-1]))
+            self.assertIsNotNone(runner.envs[-1])
+            assert runner.envs[-1] is not None
+            self.assertEqual(runner.envs[-1].get("STREMIOGUARD_MANAGED"), "1")
 
     def test_instance_check_does_not_publish(self) -> None:
         # Regression: publishing here required a rendered Comet bundle, which
@@ -653,3 +697,280 @@ class DaemonIdentityTests(unittest.TestCase):
             with mock.patch.object(guard_mod, "require_docker", return_value=None):
                 guard.require_commands()
             self.assertEqual(self._record(tmp_path).read_text(encoding="utf-8").strip(), "daemon-a")
+
+    def test_gluetun_auth_failed_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            with mock.patch.object(guard, "service_container_id", return_value="gluetun-123"):
+                with mock.patch.object(
+                    guard,
+                    "gluetun_recent_logs",
+                    return_value="2026-08-20 AUTH: Received control message: AUTH_FAILED",
+                ) as mock_logs:
+                    self.assertTrue(guard.gluetun_auth_failed(since_epoch=1700000000.0))
+                    mock_logs.assert_called_once_with(lines=50, since_epoch=1700000000.0)
+
+                with mock.patch.object(
+                    guard, "gluetun_recent_logs", return_value="normal wireguard handshake"
+                ):
+                    self.assertFalse(guard.gluetun_auth_failed())
+
+    def test_read_and_write_vpn_lockout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            env_path = tmp_path / ".env"
+            env_path.write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\nVPN_TYPE=wireguard\n", encoding="utf-8"
+            )
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            with mock.patch.object(guard, "service_container_id", return_value="gluetun-abc"):
+                guard.write_vpn_lockout(reason="auth_rejected", outage_duration_seconds=15.4)
+
+            lockout_file = guard.config.vpn_lockout_file
+            self.assertTrue(lockout_file.exists())
+            mode = stat.S_IMODE(lockout_file.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+
+            data = guard.read_vpn_lockout()
+            self.assertIsNotNone(data)
+            assert data is not None
+            self.assertEqual(data["reason"], "auth_rejected")
+            self.assertEqual(data["outage_duration_seconds"], 15.4)
+            self.assertEqual(data["gluetun_container_id"], "gluetun-abc")
+            self.assertEqual(data["provider"], "nordvpn")
+            self.assertEqual(data["vpn_type"], "wireguard")
+            self.assertIn("init", str(data["remediation"]))
+
+            guard.clear_vpn_lockout()
+            self.assertFalse(lockout_file.exists())
+            self.assertIsNone(guard.read_vpn_lockout())
+
+    def test_preflight_blocks_on_lockout_and_allows_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            env_path = tmp_path / ".env"
+            env_path.write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            guard.write_vpn_lockout(
+                reason="recovery_budget_exhausted", outage_duration_seconds=300.0
+            )
+
+            # Blocked start
+            with self.assertRaises(RuntimeError) as ctx:
+                guard.preflight(allow_recovery=False)
+            self.assertIn("VPN circuit breaker is active", str(ctx.exception))
+            self.assertIn("recovery_budget_exhausted", str(ctx.exception))
+
+            # Allowed recovery
+            with (
+                mock.patch.object(guard, "require_commands"),
+                mock.patch.object(guard, "check_bind_addresses"),
+                mock.patch.object(guard, "refresh_gluetun_image"),
+                mock.patch.object(guard, "compose_fresh"),
+                mock.patch.object(guard, "wait_for_gluetun_healthy"),
+                mock.patch.object(guard, "public_ip_safe", return_value=True),
+            ):
+                guard.preflight(allow_recovery=True)
+            # Lockout marker must be cleared after healthy preflight
+            self.assertFalse(guard.config.vpn_lockout_file.exists())
+
+    def test_state_aware_stop_active_services(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+
+            # When containers are NOT running, compose stop is skipped
+            with mock.patch.object(guard, "container_running", return_value=False):
+                guard.stop_active_services(["stremio"])
+            prefix = compose_args_prefix(tmp_path)
+            self.assertNotIn([*prefix, "stop", "stremio"], runner.calls)
+
+            # When containers ARE running, compose stop is executed
+            with mock.patch.object(guard, "container_running", return_value=True):
+                guard.stop_active_services(["stremio"])
+            self.assertIn([*prefix, "stop", "stremio"], runner.calls)
+
+    def test_stop_and_restart_gluetun_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            prefix = compose_args_prefix(tmp_path)
+
+            guard.stop_gluetun()
+            self.assertIn([*prefix, "stop", "gluetun"], runner.calls)
+
+            guard.restart_gluetun()
+            self.assertIn([*prefix, "restart", "gluetun"], runner.calls)
+
+            guard.restart_gluetun_relaxed()
+            self.assertIn([*prefix, "up", "-d", "--force-recreate", "gluetun"], runner.calls)
+
+    def test_stop_gluetun_fallback_and_failure_handling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+
+            # Scenario 1: Compose stop fails (e.g. nonzero return or container still running),
+            # fallback docker stop succeeds
+            running_states = [True, False]
+
+            def fake_running_succeeds(*args: object, **kwargs: object) -> bool:
+                return running_states.pop(0) if running_states else False
+
+            with (
+                mock.patch.object(guard, "service_container_id", return_value="gluetun-xyz"),
+                mock.patch.object(guard, "container_running", side_effect=fake_running_succeeds),
+                mock.patch.object(guard, "success") as mock_success,
+                mock.patch.object(guard, "warn") as mock_warn,
+            ):
+                guard.stop_gluetun()
+                self.assertIn(["docker", "stop", "-t", "5", "gluetun-xyz"], runner.calls)
+                mock_success.assert_called_once_with("Gluetun VPN container is stopped.")
+                mock_warn.assert_not_called()
+
+            # Scenario 2: Both Compose stop and fallback docker stop fail
+            # (container remains running)
+            with (
+                mock.patch.object(guard, "service_container_id", return_value="gluetun-xyz"),
+                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "success") as mock_success,
+                mock.patch.object(guard, "warn") as mock_warn,
+            ):
+                guard.stop_gluetun()
+                mock_warn.assert_called_once()
+                self.assertIn(
+                    "FATAL: Gluetun VPN container could not be stopped",
+                    mock_warn.call_args[0][0],
+                )
+                mock_success.assert_not_called()
+
+    def test_stop_active_services_warns_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+
+            with (
+                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "warn") as mock_warn,
+                mock.patch.object(guard, "success") as mock_success,
+            ):
+                guard.stop_active_services(["stremio"])
+                mock_warn.assert_called_once()
+                self.assertIn("Failed to confirm shutdown", mock_warn.call_args[0][0])
+                mock_success.assert_not_called()
+
+    def test_check_vpn_lockout_fails_closed_on_corrupt_or_empty_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+
+            # Empty file
+            guard.config.vpn_lockout_file.write_text("", encoding="utf-8")
+            with self.assertRaises(RuntimeError) as ctx:
+                guard.check_vpn_lockout(allow_recovery=False)
+            self.assertIn("VPN circuit breaker is active", str(ctx.exception))
+            self.assertIn("corrupted or malformed", str(ctx.exception))
+
+            # Invalid JSON
+            guard.config.vpn_lockout_file.write_text("{not valid json...", encoding="utf-8")
+            with self.assertRaises(RuntimeError) as ctx:
+                guard.check_vpn_lockout(allow_recovery=False)
+            self.assertIn("VPN circuit breaker is active", str(ctx.exception))
+
+    def test_clear_vpn_lockout_raises_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            guard.config.vpn_lockout_file.write_text("{}", encoding="utf-8")
+
+            with mock.patch.object(Path, "unlink", side_effect=PermissionError("read-only")):
+                with self.assertRaises(RuntimeError) as ctx:
+                    guard.clear_vpn_lockout()
+                self.assertIn("Failed to remove VPN lockout marker", str(ctx.exception))
+
+    def test_gluetun_recent_logs_passes_bounded_tail_and_since(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            with mock.patch.object(guard, "service_container_id", return_value="gluetun-abc"):
+                guard.gluetun_recent_logs(lines=30, since_epoch=1700000000.0)
+            self.assertIn(
+                ["docker", "logs", "--tail", "30", "--since", "1700000000", "gluetun-abc"],
+                runner.calls,
+            )
+
+    def test_gluetun_compose_projects_server_filters_to_environment(self) -> None:
+        compose_content = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        for key in (
+            "SERVER_COUNTRIES",
+            "SERVER_REGIONS",
+            "SERVER_CITIES",
+            "SERVER_HOSTNAMES",
+            "SERVER_CATEGORIES",
+            "OPENVPN_ENDPOINT_IP",
+            "WIREGUARD_ENDPOINT_IP",
+        ):
+            self.assertIn(f'{key}: "${{{key}:-}}"', compose_content)
+
+    def test_restart_gluetun_force_refreshes_dynamic_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            (tmp_path / ".env").write_text(
+                "VPN_SERVICE_PROVIDER=nordvpn\n"
+                "SERVER_COUNTRIES=United States\n"
+                "SERVER_CITIES=Seattle\n",
+                encoding="utf-8",
+            )
+            runner = FakeRunner({})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            with (
+                mock.patch(
+                    "stremioguard.resolver.resolve_nordvpn_endpoint",
+                    return_value=("us-new.nordvpn.com", "187.15.99.99"),
+                ) as mock_resolve,
+                mock.patch.object(guard, "compose") as mock_compose,
+            ):
+                guard.restart_gluetun()
+                mock_resolve.assert_called_once()
+                self.assertTrue(mock_resolve.call_args[1]["force_refresh"])
+                mock_compose.assert_called_once_with(
+                    "up",
+                    "-d",
+                    "--force-recreate",
+                    "gluetun",
+                    check=False,
+                    env={
+                        "OPENVPN_ENDPOINT_IP": "187.15.99.99",
+                        "WIREGUARD_ENDPOINT_IP": "187.15.99.99",
+                    },
+                )
+
+    def test_restart_gluetun_relaxed_clears_endpoint_ips(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            with mock.patch.object(guard, "compose") as mock_compose:
+                guard.restart_gluetun_relaxed()
+                mock_compose.assert_called_once_with(
+                    "up",
+                    "-d",
+                    "--force-recreate",
+                    "gluetun",
+                    check=False,
+                    env={
+                        "SERVER_REGIONS": "",
+                        "SERVER_CITIES": "",
+                        "SERVER_HOSTNAMES": "",
+                        "SERVER_CATEGORIES": "",
+                        "OPENVPN_ENDPOINT_IP": "",
+                        "WIREGUARD_ENDPOINT_IP": "",
+                    },
+                )
