@@ -312,11 +312,11 @@ Introduce a declarative spec per override in `overrides/bundle.py`:
 ```python
 @dataclass(frozen=True)
 class OverrideSpec:
-    name: str                  # "stream", "torrentio", ...
-    feature: str               # user-facing: "TV-readable stream naming and gateway playback URLs"
-    container_path: str        # "/app/comet/api/endpoints/stream.py"
-    output_name: str           # "stream.py" (file written under state_dir)
-    requirement: Requirement   # REQUIRED, REQUIRED_WHEN_GATEWAY, OPTIONAL
+    name: str  # "stream", "torrentio", ...
+    feature: str  # user-facing: "TV-readable stream naming and gateway playback URLs"
+    container_path: str  # "/app/comet/api/endpoints/stream.py"
+    output_name: str  # "stream.py" (file written under state_dir)
+    requirement: Requirement  # REQUIRED, REQUIRED_WHEN_GATEWAY, OPTIONAL
     render: Callable[[Path, RenderContext], str | None]
 ```
 

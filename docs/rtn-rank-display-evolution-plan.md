@@ -94,10 +94,12 @@ It makes exactly two source edits:
    the map from the already-ranked native mapping:
 
    ```python
-   rtn_ranks={
-       info_hash: ranked_torrent.rank
-       for info_hash, ranked_torrent in torrent_manager.ranked_torrents.items()
-   },
+   rtn_ranks = (
+       {
+           info_hash: ranked_torrent.rank
+           for info_hash, ranked_torrent in torrent_manager.ranked_torrents.items()
+       },
+   )
    ```
 
 Use the active image's exact result-construction anchor. Do not modify
