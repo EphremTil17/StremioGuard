@@ -59,8 +59,13 @@ def render_orchestration_override(repo_dir: Path) -> str:
         *,
         episode: int | None = None,
         file_index: int | None = None,
+        is_season_pack: bool = False,
     ) -> None:
         if self.media_type != "series" or self.search_episode is None:
+            return
+
+        if is_season_pack:
+            self.pack_backed_hashes.add(info_hash)
             return
 
         candidate = self._pack_backed_candidates.setdefault(
@@ -95,18 +100,36 @@ def render_orchestration_override(repo_dir: Path) -> str:
             except ImportError:
                 from stremioguard.metadata import get_season_episode_count
             total_eps = await get_season_episode_count(self.media_id, self.search_season)
-            if total_eps:
-                return max(parsed_episodes) >= total_eps
-            # Design Note: If metadata lookup fails (e.g. Cinemeta outage or database miss),
-            # default to treating the multi-episode candidate as a season pack.
+            if total_eps and max(parsed_episodes) >= total_eps:
+                return True
+            elif not total_eps:
+                # Design Note: If metadata lookup fails (e.g. Cinemeta outage or database miss),
+                # default to treating the multi-episode candidate as a season pack.
+                return True
+
+        if (
+            self.search_season is not None
+            and parsed.seasons
+            and self.search_season in parsed.seasons
+            and not parsed_episodes
+        ):
             return True
-        if isinstance(file_index, int):
-            return file_index > 0 or not parsed_episodes
-        if isinstance(file_index, str) and file_index.isdigit():
-            return int(file_index) > 0 or not parsed_episodes
-        if file_index is None:
-            return False
-        return not parsed_episodes
+
+        if file_index is not None:
+            if not parsed_episodes:
+                return True
+            if (
+                (isinstance(file_index, int) and file_index >= 0)
+                or (isinstance(file_index, str) and file_index.isdigit() and int(file_index) >= 0)
+            ):
+                if (
+                    self.search_season is not None
+                    and parsed.seasons
+                    and self.search_season in parsed.seasons
+                ):
+                    return True
+
+        return False
 
 """
     if "_record_pack_backed_candidate(" not in content:
@@ -266,6 +289,10 @@ def render_orchestration_override(repo_dir: Path) -> str:
         '                row["info_hash"],\n'
         '                episode=row["episode"],\n'
         '                file_index=row["file_index"],\n'
+        "                is_season_pack=(\n"
+        '                    row["episode"] is None\n'
+        '                    and (row["file_index"] is None or row["file_index"] == 0)\n'
+        "                ),\n"
         "            )\n"
     )
     edits: tuple[tuple[str, tuple[tuple[str, str], ...], int | None], ...] = (

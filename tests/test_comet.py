@@ -213,24 +213,46 @@ def _write_upstream_patch_sources(cfg) -> None:
         encoding="utf-8",
     )
     torrentio_file.write_text(
-        "import re\n"
-        "\n"
-        "DATA_PATTERN = re.compile(\n"
-        '    r"(?:👤 (\\d+) )?💾 ([\\\\d.]+ [KMGT]B)(?: ⚙️ (\\\\w+))?", re.IGNORECASE\n'
-        ")\n"
-        "\n"
-        "def scrape(self, torrent, torrents, title, seeders, size, tracker):\n"
-        "    torrents.append(\n"
-        "        {\n"
-        '            "title": title,\n'
-        '            "infoHash": torrent["infoHash"].lower(),\n'
-        '            "fileIndex": torrent.get("fileIdx", None),\n'
-        '            "seeders": seeders,\n'
-        '            "size": size,\n'
-        '            "tracker": f"Torrentio|{tracker}",\n'
-        '            "sources": torrent.get("sources", []),\n'
-        "        }\n"
-        "    )\n",
+        """import re
+
+DATA_PATTERN = re.compile(
+    r"(?:👤 (\\d+) )?💾 ([\\d.]+ [KMGT]B)(?: ⚙️ (\\w+))?", re.IGNORECASE
+)
+
+class TorrentioScraper:
+    async def scrape(self, request):
+        results = {"streams": []}
+        torrents = []
+        for torrent in results["streams"]:
+            title_full = torrent["title"]
+
+            if "\\n💾" in title_full:
+                title = title_full.split("\\n💾")[0].split("\\n")[-1]
+            else:
+                title = title_full.split("\\n")[0]
+
+            match = DATA_PATTERN.search(title_full)
+
+            seeders = int(match.group(1)) if match and match.group(1) else None
+            size = (
+                size_to_bytes(match.group(2)) if match and match.group(2) else None
+            )
+            tracker = (
+                match.group(3) if match and match.group(3) else "KnightCrawler"
+            )
+
+            torrents.append(
+                {
+                    "title": title,
+                    "infoHash": torrent["infoHash"].lower(),
+                    "fileIndex": torrent.get("fileIdx", None),
+                    "seeders": seeders,
+                    "size": size,
+                    "tracker": f"Torrentio|{tracker}",
+                    "sources": torrent.get("sources", []),
+                }
+            )
+""",
         encoding="utf-8",
     )
     filtering_file.write_text(
@@ -632,11 +654,8 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn("sourceTitle", torrentio_override)
             self.assertIn("resolvedFileName", torrentio_override)
             self.assertIn("metadata_lines = [", torrentio_override)
-            self.assertIn(
-                "display_title = max(metadata_lines, key=_line_score)", torrentio_override
-            )
-            self.assertIn('"title": display_title,', torrentio_override)
-            self.assertIn("fallback_filename", torrentio_override)
+            self.assertIn("release_title = (", torrentio_override)
+            self.assertIn('"title": release_title,', torrentio_override)
             self.assertIn('"resolvedFileName": resolved_filename,', torrentio_override)
             formatting_override = (cfg.state_dir / "formatting.py").read_text(encoding="utf-8")
             self.assertIn("def _strip_redundant_hdr_tokens(", formatting_override)
