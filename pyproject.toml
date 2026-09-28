@@ -16,9 +16,9 @@ packages = ["src/stremioguard"]
 
 [dependency-groups]
 dev = [
-    "pyright>=1.1.411",
+    "pyright>=1.1.414",
     "pytest>=9.1.1",
-    "ruff>=0.16.6",
+    "ruff>=0.16.9",
 ]
 
 [tool.pytest.ini_options]
