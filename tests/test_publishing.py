@@ -15,6 +15,7 @@ from stremioguard.publishing import (
 )
 
 from .conftest import (
+    API_APP_OUTPUT,
     FakeRunner,
     make_comet_config,
     make_comet_gateway_config,
@@ -248,6 +249,7 @@ class TestPublisherFailClosed(unittest.TestCase):
             state_dir = root / ".stremio" / "comet"
             state_dir.mkdir(parents=True)
             outputs = {
+                "app.py": "/app/comet/api/app.py",
                 "stream.py": "/app/comet/api/endpoints/stream.py",
                 "config.py": "/app/comet/api/endpoints/config.py",
                 "media_search.py": "/app/comet/services/media_search.py",
@@ -282,7 +284,12 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
             state_dir.mkdir(parents=True)
             (state_dir / "bundle-manifest.json").write_text(
                 json.dumps(
-                    {"outputs": {"media_search.py": "/app/comet/services/media_search.py"}},
+                    {
+                        "outputs": {
+                            "media_search.py": "/app/comet/services/media_search.py",
+                            **API_APP_OUTPUT,
+                        }
+                    },
                 ),
                 encoding="utf-8",
             )
@@ -307,7 +314,12 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
             state_dir.mkdir(parents=True)
             (state_dir / "bundle-manifest.json").write_text(
                 json.dumps(
-                    {"outputs": {"media_search.py": "/app/comet/services/media_search.py"}},
+                    {
+                        "outputs": {
+                            "media_search.py": "/app/comet/services/media_search.py",
+                            **API_APP_OUTPUT,
+                        }
+                    },
                 ),
                 encoding="utf-8",
             )
@@ -328,7 +340,12 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
             state_dir.mkdir(parents=True)
             (state_dir / "bundle-manifest.json").write_text(
                 json.dumps(
-                    {"outputs": {"media_search.py": "/app/comet/services/media_search.py"}},
+                    {
+                        "outputs": {
+                            "media_search.py": "/app/comet/services/media_search.py",
+                            **API_APP_OUTPUT,
+                        }
+                    },
                 ),
                 encoding="utf-8",
             )

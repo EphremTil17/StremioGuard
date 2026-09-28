@@ -105,20 +105,20 @@ class TestTunableInt(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "STREMIO_IP_CROSSCHECK_INTERVAL_SECONDS": "60",
-                    "IP_CROSSCHECK_INTERVAL_SECONDS": "120",
+                    "STREMIO_EGRESS_PROBE_INTERVAL_SECONDS": "60",
+                    "EGRESS_PROBE_INTERVAL_SECONDS": "120",
                 },
             ):
-                self.assertEqual(_tunable_int(env_file, "IP_CROSSCHECK_INTERVAL_SECONDS", 300), 60)
+                self.assertEqual(_tunable_int(env_file, "EGRESS_PROBE_INTERVAL_SECONDS", 300), 60)
 
     def test_reads_env_file_and_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env_file = Path(directory) / ".env"
-            env_file.write_text("IP_CROSSCHECK_INTERVAL_SECONDS=45\n", encoding="utf-8")
+            env_file.write_text("EGRESS_PROBE_INTERVAL_SECONDS=45\n", encoding="utf-8")
             with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("IP_CROSSCHECK_INTERVAL_SECONDS", None)
-                os.environ.pop("STREMIO_IP_CROSSCHECK_INTERVAL_SECONDS", None)
-                self.assertEqual(_tunable_int(env_file, "IP_CROSSCHECK_INTERVAL_SECONDS", 300), 45)
+                os.environ.pop("EGRESS_PROBE_INTERVAL_SECONDS", None)
+                os.environ.pop("STREMIO_EGRESS_PROBE_INTERVAL_SECONDS", None)
+                self.assertEqual(_tunable_int(env_file, "EGRESS_PROBE_INTERVAL_SECONDS", 300), 45)
                 self.assertEqual(_tunable_int(env_file, "MISSING_KEY", 300), 300)
 
     def test_rejects_invalid_and_below_minimum(self) -> None:

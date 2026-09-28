@@ -145,6 +145,7 @@ curl -i https://comet.example.com/badtoken/manifest.json
 curl -i https://comet.example.com/comet/<token>/<config>/manifest.json
 ./stremio comet gateway-logs
 ./stremio comet doctor
+./stremio comet log-canary
 ```
 
 Expected results:
@@ -154,6 +155,7 @@ Expected results:
 - valid gateway paths proxy to Comet
 - `./stremio comet doctor` confirms Comet shares gluetun and egresses through
   the VPN
+- `./stremio comet log-canary` passes on every sink
 
 ## Rate Limiting and Log Hygiene
 
@@ -173,12 +175,61 @@ Access logs record a masked request line: the entire path after `/comet/` —
 the token and the base64 config blob after it, which can embed debrid API
 keys — is replaced with `***`, so neither secret ever lands in `access.log`.
 
-This applies to the generated gateway log only. Configure your external reverse
-proxy to redact or avoid logging `/comet/` request paths too; it sees the token
-and configuration blob before the request reaches the gateway.
+nginx itself appends the raw request line to every error-log entry made while
+serving a request, so the generated config sets `error_log … crit`: upstream
+failures (`connection refused`, timeouts, resets) are logged at `[error]` and
+stay out of the error log, and the masked access line records them instead
+This reinforces API key management hardening across gateway services. Comet's own
+per-request log is sanitized by the `api_app` override (see `comet-patches.md`).
+
+This applies to the generated gateway and Comet logs only. Your reverse proxy
+sees the full URL (token and config blob) before the gateway does and must not
+log it either. For Nginx Proxy Manager, put this in the proxy host's
+**Advanced** tab (NPM inserts that text at server level, after its own log
+directives), keeping your existing `location /` settings:
+
+```nginx
+# Server level: NPM's Force-SSL/Block-Exploits includes `return` and read an
+# uninitialized variable *before* a location is chosen, and both log the full
+# request line through the server-level logs.
+access_log off;
+uninitialized_variable_warn off;
+
+location / {
+    access_log off;
+    error_log /data/logs/proxy-host-<id>_error.log crit;
+    # ... existing proxy_set_header / proxy_pass lines ...
+}
+```
+
+A location-level `error_log` alone is not enough: nginx writes to every error
+log defined at one level, and server-phase warnings never reach the location.
+Do not edit `data/nginx/proxy_host/<id>.conf` directly; NPM regenerates it
+from its database. The gateway's masked access log keeps per-request status
+and timings, so nothing useful is lost.
+
+### Log canary
+
+```bash
+./stremio comet log-canary
+```
+
+Sends a fresh random value shaped like a gateway token through the public URL
+(`COMET_GATEWAY_PUBLIC_BASE_URL`, over HTTPS and, if open, plain HTTP) and
+directly to Comet, then searches every sink for it: the gateway and Comet
+container logs, this run's StremioGuard logs, and every file matched by
+`COMET_LOG_CANARY_GLOBS` (comma-separated; point it at your reverse
+proxy's logs). It prints only the canary's fingerprint and a PASS / FAIL /
+UNVERIFIED line per sink, and exits 1 unless the public HTTPS probe reached
+the gateway and every sink passed. A sink it cannot read, or a glob that
+matches nothing, is UNVERIFIED rather than PASS. The same check runs as an
+advisory warning after `./stremio start` and `./stremio restart`.
+
+Logs owned by root-only runtimes (for example a rootful Docker daemon's
+`json-file` logs) are outside the automated check; scan them once with root.
 
 ## Tradeoffs
 
 This is a pragmatic small-scale access model. Tokens in URLs are easy to share
-and revoke, but they are not a full identity platform. If a token leaks, rotate
+and revoke, but they are not a full identity platform. If a token is compromised, rotate
 or revoke it.

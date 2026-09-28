@@ -60,7 +60,12 @@ class GluetunGuard:
         self.last_observed_ip: str | None = None
         self._warned_stale_home_ip = False
         self._control_server_failed = False
-        self._last_crosscheck_time = 0.0
+        # Last SAFE live egress verification; only SAFE outcomes are cached so
+        # every non-SAFE tick re-probes.
+        self._verified_egress_ip: str | None = None
+        self._verified_control_ip: str | None = None
+        self._last_egress_probe_time = 0.0
+        self._warned_snapshot_pair: tuple[str, str] | None = None
 
     def log(self, message: str) -> None:
         logger.info(message)
@@ -357,18 +362,26 @@ class GluetunGuard:
             "Check the log lines above or run `docker logs gluetun` for details."
         )
 
-    def public_ip(self) -> str | None:
+    def public_ip(self, *, version: int | None = None) -> str | None:
+        """This host's direct public IP, optionally restricted to one IP family.
+
+        Proxy environment variables are ignored: the answer must describe the
+        host's own route, never a proxy's. A result of the wrong family is
+        skipped rather than returned, because comparing an IPv6 host address
+        with an IPv4 tunnel egress could never match and would pass silently.
+        """
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for url in self.config.ip_check_urls:
             try:
                 request = urllib.request.Request(url, headers={"User-Agent": "stremio-vpn-guard/1"})
-                with urllib.request.urlopen(
+                with opener.open(
                     request, timeout=self.config.public_ip_timeout_seconds
                 ) as response:
                     body = response.read(128).decode("utf-8", errors="replace")
             except (OSError, urllib.error.URLError, TimeoutError):
                 continue
             ip = parse_public_ip(body)
-            if ip:
+            if ip and (version is None or ipaddress.ip_address(ip).version == version):
                 return ip
         return None
 
@@ -447,44 +460,86 @@ class GluetunGuard:
 
         return None
 
-    def public_ip_assessment(self, *, log_observation: bool = False) -> PublicIPAssessment:
-        control_ip = self.public_ip_via_control_server()
-        resolved_ip = control_ip
+    def public_ip_assessment(
+        self, *, log_observation: bool = False, force_probe: bool = False
+    ) -> PublicIPAssessment:
+        """Verify that traffic leaves through the tunnel, not this host's own route.
 
-        if not control_ip:
-            resolved_ip = self.public_ip_via_gluetun()
-            if not resolved_ip:
-                self.warn("Could not determine public IP via gluetun or control server.")
-                return PublicIPAssessment.UNKNOWN
-        else:
-            now = time.monotonic()
-            if now - self._last_crosscheck_time >= self.config.ip_crosscheck_interval_seconds:
-                self._last_crosscheck_time = now
-                external_ip = self.public_ip_via_gluetun()
-                if external_ip and external_ip != control_ip:
-                    self.warn(
-                        f"IP mismatch detected during cross-check: control server IP={control_ip}, "
-                        f"external probe IP={external_ip}. Threat vector possible, marking unsafe."
-                    )
-                    return PublicIPAssessment.UNSAFE_DEFINITIVE
+        The authority is a live probe from inside gluetun compared with this
+        host's live direct IP (or the recorded home baseline when the host
+        probe fails). Gluetun's control-server IP is a snapshot taken once per
+        gluetun start and goes stale after an in-tunnel reconnect, so it is
+        only a cheap change trigger and a diagnostic, never proof of anything.
+
+        A SAFE verification is trusted for `egress_probe_interval_seconds`;
+        egress verification latency is therefore bounded by that interval.
+        """
+        control_ip = self.public_ip_via_control_server()
+        now = time.monotonic()
+        due = (
+            force_probe
+            or self._verified_egress_ip is None
+            or control_ip != self._verified_control_ip
+            or now - self._last_egress_probe_time >= self.config.egress_probe_interval_seconds
+        )
+        if not due:
+            return PublicIPAssessment.SAFE
+
+        self._verified_egress_ip = None
+        egress_ip = self.public_ip_via_gluetun()
+        if not egress_ip:
+            self.warn("Could not determine the tunnel egress IP via gluetun.")
+            return PublicIPAssessment.UNKNOWN
 
         if log_observation:
-            self.log(f"Observed public IP: {resolved_ip}")
-        elif self.last_observed_ip and self.last_observed_ip != resolved_ip:
-            self.log(f"Public IP changed from {self.last_observed_ip} to {resolved_ip}.")
-        self.last_observed_ip = resolved_ip
+            self.log(f"Observed public IP: {egress_ip}")
+        elif self.last_observed_ip and self.last_observed_ip != egress_ip:
+            self.log(f"Public IP changed from {self.last_observed_ip} to {egress_ip}.")
+        self.last_observed_ip = egress_ip
 
-        if self.config.expected_vpn_ip and resolved_ip != self.config.expected_vpn_ip:
+        home_ip = None
+        if self.config.home_ip_file.exists():
+            self._warn_if_home_ip_stale()
+            # A malformed baseline counts as missing, so it cannot stand in for a
+            # failed host probe.
+            home_ip = parse_public_ip(self.config.home_ip_file.read_text(encoding="utf-8"))
+
+        host_ip = self.public_ip(version=ipaddress.ip_address(egress_ip).version)
+        if host_ip == egress_ip:
+            self.warn(
+                f"Tunnel egress IP {egress_ip} equals this host's direct public IP; "
+                "traffic is not leaving through the VPN."
+            )
+            return PublicIPAssessment.UNSAFE_DEFINITIVE
+        if host_ip is None and home_ip is None:
+            self.warn(
+                "Could not determine this host's direct public IP and no valid home-IP "
+                "baseline is recorded, so the tunnel egress cannot be proven to differ from it. "
+                "Run `./stremio record-home-ip` while gluetun is stopped."
+            )
+            return PublicIPAssessment.UNKNOWN
+
+        if self.config.expected_vpn_ip and egress_ip != self.config.expected_vpn_ip:
             self.warn(f"Public IP does not match EXPECTED_VPN_IP={self.config.expected_vpn_ip}.")
             return PublicIPAssessment.UNSAFE_DEFINITIVE
 
-        if self.config.home_ip_file.exists():
-            self._warn_if_home_ip_stale()
-            home_ip = self.config.home_ip_file.read_text(encoding="utf-8").strip()
-            if home_ip and resolved_ip == home_ip:
-                self.warn(f"Public IP matches saved home IP baseline ({home_ip}); possible leak.")
-                return PublicIPAssessment.UNSAFE_DEFINITIVE
+        if home_ip and egress_ip == home_ip:
+            self.warn(f"Public IP matches saved home IP baseline ({home_ip}); possible leak.")
+            return PublicIPAssessment.UNSAFE_DEFINITIVE
 
+        if control_ip and control_ip != egress_ip:
+            pair = (control_ip, egress_ip)
+            if pair != self._warned_snapshot_pair:
+                self._warned_snapshot_pair = pair
+                self.warn(
+                    f"Gluetun control server reports {control_ip} but the live tunnel egress "
+                    f"is {egress_ip}. Gluetun only fetches its public IP once per start, so "
+                    "this is expected after an in-tunnel reconnect; the live egress is used."
+                )
+
+        self._verified_egress_ip = egress_ip
+        self._verified_control_ip = control_ip
+        self._last_egress_probe_time = now
         return PublicIPAssessment.SAFE
 
     def public_ip_safe(self, *, log_observation: bool = False) -> bool:

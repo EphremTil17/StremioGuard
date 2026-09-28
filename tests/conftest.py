@@ -127,7 +127,7 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
         "log_file": None,
         "log_session": True,
         "stremio_enabled": True,
-        "ip_crosscheck_interval_seconds": 300,
+        "egress_probe_interval_seconds": 300,
         "public_ip_failure_threshold": 3,
         "vpn_recovery_budget_seconds": 300,
         "vpn_restart_cadence_seconds": 45,
@@ -223,6 +223,7 @@ def write_minimal_bundle_manifest(comet_config: CometConfig) -> None:
         json.dumps(
             {
                 "outputs": {
+                    "app.py": "/app/comet/api/app.py",
                     "stream.py": "/app/comet/api/endpoints/stream.py",
                     "media_search.py": "/app/comet/services/media_search.py",
                     "config.py": "/app/comet/api/endpoints/config.py",
@@ -232,3 +233,37 @@ def write_minimal_bundle_manifest(comet_config: CometConfig) -> None:
         ),
         encoding="utf-8",
     )
+
+
+# Current upstream shape of comet/api/app.py's request logger (the parts the
+# api_app override touches).
+COMET_API_APP_SOURCE = """\
+from loguru import logger
+
+Request = object  # upstream: from fastapi import Request
+
+STREMIO_API_PREFIX = "/s/secret-token"
+
+
+def _metrics_route(request: Request) -> str:
+    route = getattr(request.scope.get("route"), "path", "unmatched")
+    if STREMIO_API_PREFIX and route.startswith(STREMIO_API_PREFIX):
+        return route.replace(STREMIO_API_PREFIX, "/s/{token}", 1)
+    return route
+
+
+async def dispatch(request, method, status_code, process_time):
+    logger.log(
+        "API",
+        f"{method} {request.url.path} - {status_code} - {process_time:.2f}s",
+    )
+"""
+
+
+API_APP_OUTPUT = {"app.py": "/app/comet/api/app.py"}
+
+
+def write_comet_api_app(repo_root: Path, source: str = COMET_API_APP_SOURCE) -> None:
+    app_file = repo_root / "comet" / "api" / "app.py"
+    app_file.parent.mkdir(parents=True, exist_ok=True)
+    app_file.write_text(source, encoding="utf-8")

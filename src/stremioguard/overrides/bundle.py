@@ -9,6 +9,7 @@ from pathlib import Path
 from loguru import logger
 
 from stremioguard.env import atomic_write_text
+from stremioguard.overrides.api_app import render_api_app_override
 from stremioguard.overrides.config import render_config_override
 from stremioguard.overrides.filtering import render_filtering_override
 from stremioguard.overrides.formatter import render_formatter_override
@@ -56,6 +57,14 @@ class BundleReport:
 
 
 SPECS = [
+    OverrideSpec(
+        name="api_app",
+        feature="hardened API key management in request logs",
+        container_path="/app/comet/api/app.py",
+        output_name="app.py",
+        requirement=Requirement.REQUIRED,
+        render=lambda repo_dir, ctx: render_api_app_override(repo_dir),
+    ),
     OverrideSpec(
         name="formatter",
         feature="custom format styles (e.g. emoji badges)",

@@ -7,6 +7,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +19,17 @@ from pathlib import Path
 from loguru import logger
 
 from stremioguard.comet.lock import CometLock
+from stremioguard.comet.log_canary import (
+    CanaryReport,
+    DockerLogSink,
+    FileGlobSink,
+    Probe,
+    SinkStatus,
+    new_canary,
+    public_probes,
+    run_log_canary,
+    wget_status,
+)
 from stremioguard.comet.probe import PlaybackProbeResult, probe_playback_url
 from stremioguard.comet.state import STATE_FILE_NAME, CandidateDigest, CometState
 from stremioguard.comet.validation import ephemeral_boot_check, import_smoke_test
@@ -712,6 +724,10 @@ class CometManager:
 
     def prepare_runtime(self, *, deep: bool = False) -> None:
         self.write_runtime_env()
+        if self.gateway_config().enabled:
+            # nginx.conf is generated, not mounted from the repo: render it on
+            # every start so template changes (e.g. log masking) actually deploy.
+            self.gateway_manager().prepare_runtime()
         state = self.load_state()
         if state.active_digest is None:
             self._bootstrap_active_digest(deep=deep)
@@ -1137,6 +1153,88 @@ class CometManager:
                 f"Comet public IP {comet_ip} does not match gluetun public IP {gluetun_ip}."
             )
         self.success("Comet doctor checks passed.")
+
+    def log_canary(self) -> CanaryReport:
+        """Send a fresh token-shaped canary through every hop and search every sink.
+
+        Hops: the public URL (HTTPS and its plain-HTTP twin) through the reverse
+        proxy to the gateway, plus a direct request to Comet inside gluetun's
+        namespace (a fake token never gets past the gateway, so Comet's own
+        request log is exercised separately). Sinks: both container logs, this
+        run's StremioGuard logs, and COMET_LOG_CANARY_GLOBS (reverse-proxy
+        logs). The canary is never logged; only its fingerprint is.
+        """
+        gateway = self.gateway_config()
+        if not gateway.enabled:
+            raise RuntimeError("The log canary needs the Comet gateway (COMET_GATEWAY_ENABLED=1).")
+        canary = new_canary(gateway.token_length)
+        window_start = time.time() - 5
+        if gateway.public_base_url:
+            probes = public_probes(gateway.public_base_url, canary)
+        else:
+            probes = [
+                Probe("public URL (COMET_GATEWAY_PUBLIC_BASE_URL unset)", lambda: None, frozenset())
+            ]
+        gluetun_id = self.gluetun_container_id()
+        probes.append(
+            Probe(
+                "comet direct",
+                lambda: wget_status(
+                    self.runner, gluetun_id, f"http://127.0.0.1:8000/{canary}/probe/manifest.json"
+                ),
+                frozenset({404}),
+            )
+        )
+        since = str(int(window_start))
+        sinks: list = [
+            DockerLogSink(
+                "comet-gateway container log",
+                self.gateway_manager().service_container_id(),
+                self.runner,
+                since,
+            ),
+            DockerLogSink(
+                "comet container log",
+                self.service_container_id(self.config.service_name),
+                self.runner,
+                since,
+            ),
+            FileGlobSink(
+                "StremioGuard run logs",
+                str(self.config.root_dir / "logs" / "*.log"),
+                modified_since=window_start,
+            ),
+            *(FileGlobSink(pattern, pattern) for pattern in self.config.log_canary_globs),
+        ]
+        report = run_log_canary(canary, probes, sinks)
+        self._report_log_canary(report)
+        return report
+
+    def _report_log_canary(self, report: CanaryReport) -> None:
+        self.log(f"Log canary fingerprint {report.canary_fingerprint}.")
+        for probe in report.probes:
+            if probe.reached:
+                self.log(f"  probe {probe.name}: HTTP {probe.status_code} (reached)")
+            elif probe.acceptable:
+                self.log(f"  probe {probe.name}: no response (hop closed; nothing to log)")
+            else:
+                self.warn(f"  probe {probe.name}: HTTP {probe.status_code or '-'} (NOT REACHED)")
+        for sink in report.sinks:
+            line = f"  {sink.status.value:<10} {sink.name} hits={sink.hits}"
+            line += f" ({sink.detail})" if sink.detail else ""
+            if sink.status == SinkStatus.PASS:
+                self.log(line)
+            else:
+                self.warn(line)
+        if not self.config.log_canary_globs:
+            self.warn(
+                "  No reverse-proxy logs configured; set COMET_LOG_CANARY_GLOBS so "
+                "the hops in front of the gateway are checked too."
+            )
+        if report.passed:
+            self.success("Log canary passed: no sink recorded the request path.")
+        else:
+            self.warn("Log canary did NOT pass: a sink recorded the path or was not verified.")
 
     def probe_playback(self, url: str, *, expect_proxy: bool = True) -> PlaybackProbeResult:
         result = probe_playback_url(url)

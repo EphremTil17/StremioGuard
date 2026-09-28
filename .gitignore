@@ -31,8 +31,9 @@ gluetun-data/
 .DS_Store
 Thumbs.db
 CLAUDE.md
-certs/host.tailnet.ts.net.crt
-certs/host.tailnet.ts.net.key
+# Local TLS material (e.g. Tailscale Serve certificates)
+certs/*.crt
+certs/*.key
 
 # Local lessons learned ledger (must not be committed to remote)
 docs/lessons_learned_and_anti_patterns.md

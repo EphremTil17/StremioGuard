@@ -72,6 +72,13 @@ def comet_doctor() -> None:
     manager.doctor()
 
 
+def comet_log_canary() -> None:
+    """Prove no log sink records addon request paths (exit 1 unless every sink passes)."""
+    manager = _comet_manager()
+    if not manager.log_canary().passed:
+        raise typer.Exit(1)
+
+
 def comet_probe_playback(
     url: str = typer.Option(..., "--url", help="Comet playback URL to probe."),
 ) -> None:
@@ -124,6 +131,7 @@ def register(app: typer.Typer) -> None:
     app.command("stop")(comet_stop)
     app.command("status")(comet_status)
     app.command("doctor")(comet_doctor)
+    app.command("log-canary")(comet_log_canary)
     app.command("probe-playback")(comet_probe_playback)
     app.command("logs")(comet_logs)
     app.command("vendor-sync", hidden=True)(comet_vendor_sync)
