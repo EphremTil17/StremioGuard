@@ -3,6 +3,7 @@ Description=Guard Stremio behind the gluetun VPN container
 After=docker.service
 
 [Service]
+# Adjust these paths if StremioGuard is not cloned to ~/StremioGuard.
 Type=forking
 WorkingDirectory=%h/StremioGuard
 ExecStart=%h/StremioGuard/stremio start

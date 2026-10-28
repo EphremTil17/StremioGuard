@@ -23,7 +23,7 @@ from stremioguard.comet import manager as manager_mod
 from stremioguard.comet.manager import CometManager
 from stremioguard.comet.state import CandidateDigest, CometState
 
-from .conftest import FakeRunner, completed, make_comet_config
+from .conftest import FakeRunner, completed, make_comet_config, make_comet_gateway_config
 from .test_comet import _write_lock, _write_upstream_patch_sources
 
 SHA_LATEST = "sha256:" + "1" * 64
@@ -422,6 +422,29 @@ class PrepareRuntimeDigestTests(unittest.TestCase):
                 manager.prepare_runtime()
             bootstrap.assert_not_called()
             ensure_image.assert_called_once_with(f"g0ldyy/comet@{SHA_LATEST}")
+
+    def test_prepare_runtime_renders_gateway_config_only_when_enabled(self) -> None:
+        # `./stremio start` must deploy nginx template changes (log masking);
+        # before this, only token commands re-rendered nginx.conf.
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                tmp_path = Path(directory)
+                manager = CometManager(make_comet_config(tmp_path), FakeRunner({}))
+                manager.save_state(CometState(active_digest=SHA_LATEST))
+                gateway = mock.Mock()
+                with (
+                    mock.patch.object(
+                        manager,
+                        "gateway_config",
+                        return_value=make_comet_gateway_config(tmp_path, enabled=enabled),
+                    ),
+                    mock.patch.object(manager, "gateway_manager", return_value=gateway),
+                    mock.patch.object(manager, "ensure_image", return_value=SHA_LATEST),
+                    mock.patch.object(manager, "_manifest_cache_valid", return_value=True),
+                    mock.patch.object(manager, "write_stack_override_file"),
+                ):
+                    manager.prepare_runtime()
+                self.assertEqual(gateway.prepare_runtime.call_count, 1 if enabled else 0)
 
 
 class ActiveImageRefTests(unittest.TestCase):

@@ -20,7 +20,13 @@ from stremioguard.env import env_file_value
 from stremioguard.overrides import write_override_bundle
 from stremioguard.publishing import render_stack_compose_override
 
-from .conftest import FakeRunner, completed, make_comet_config, make_config
+from .conftest import (
+    FakeRunner,
+    completed,
+    make_comet_config,
+    make_config,
+    write_comet_api_app,
+)
 
 
 def _write_lock(
@@ -45,6 +51,7 @@ def _write_lock(
 
 
 def _write_upstream_patch_sources(cfg) -> None:
+    write_comet_api_app(cfg.repo_dir)
     formatting_file = cfg.repo_dir / "comet" / "utils" / "formatting.py"
     stream_file = cfg.repo_dir / "comet" / "api" / "endpoints" / "stream.py"
     media_search_file = cfg.repo_dir / "comet" / "services" / "media_search.py"

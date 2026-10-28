@@ -14,6 +14,8 @@ from stremioguard.overrides.bundle import (
 from stremioguard.overrides.media_search import render_media_search_override
 from stremioguard.overrides.stream import render_stream_override
 
+from .conftest import write_comet_api_app
+
 MEDIA_SEARCH_SOURCE = """\
 from dataclasses import dataclass, field
 
@@ -87,6 +89,7 @@ class RankContextOverrideTests(unittest.TestCase):
         stream_file.parent.mkdir(parents=True)
         media_file.write_text(media, encoding="utf-8")
         stream_file.write_text(STREAM_SOURCE, encoding="utf-8")
+        write_comet_api_app(root)
 
     def test_rank_map_is_carried_without_recomputing_or_reordering(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

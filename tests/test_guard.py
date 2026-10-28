@@ -216,7 +216,10 @@ class GluetunGuardTests(unittest.TestCase):
             cfg = make_config(tmp_path)
             cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
             guard = GluetunGuard(cfg, FakeRunner({}))
-            with mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"):
+            with (
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
+                mock.patch.object(guard, "public_ip", return_value=None),
+            ):
                 self.assertTrue(guard.public_ip_safe())
 
     def test_public_ip_safe_rejects_saved_home_ip(self) -> None:
@@ -225,7 +228,10 @@ class GluetunGuardTests(unittest.TestCase):
             cfg = make_config(tmp_path)
             cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
             guard = GluetunGuard(cfg, FakeRunner({}))
-            with mock.patch.object(guard, "public_ip_via_gluetun", return_value="198.51.100.10"):
+            with (
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value="198.51.100.10"),
+                mock.patch.object(guard, "public_ip", return_value=None),
+            ):
                 self.assertFalse(guard.public_ip_safe())
 
     def test_public_ip_safe_warns_once_on_stale_home_ip_baseline(self) -> None:
@@ -239,10 +245,14 @@ class GluetunGuardTests(unittest.TestCase):
             warnings: list[str] = []
             with (
                 mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
+                mock.patch.object(guard, "public_ip", return_value=None),
                 mock.patch.object(guard, "warn", side_effect=warnings.append),
             ):
-                self.assertTrue(guard.public_ip_safe())
-                self.assertTrue(guard.public_ip_safe())
+                # force_probe: re-read the baseline on each call, not a cached SAFE.
+                for _ in range(2):
+                    self.assertEqual(
+                        guard.public_ip_assessment(force_probe=True), PublicIPAssessment.SAFE
+                    )
             stale_warnings = [w for w in warnings if "days old" in w]
             self.assertEqual(len(stale_warnings), 1)
 
@@ -255,6 +265,7 @@ class GluetunGuardTests(unittest.TestCase):
             warnings: list[str] = []
             with (
                 mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
+                mock.patch.object(guard, "public_ip", return_value=None),
                 mock.patch.object(guard, "warn", side_effect=warnings.append),
             ):
                 self.assertTrue(guard.public_ip_safe())
@@ -566,21 +577,6 @@ class GluetunGuardTests(unittest.TestCase):
                 ip = guard.public_ip_via_control_server()
             self.assertIsNone(ip)
             self.assertFalse(guard._control_server_failed)
-
-    def test_public_ip_assessment_crosscheck_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            guard = GluetunGuard(
-                make_config(tmp_path, ip_crosscheck_interval_seconds=0), FakeRunner({})
-            )
-            with (
-                mock.patch.object(
-                    guard, "public_ip_via_control_server", return_value="203.0.113.5"
-                ),
-                mock.patch.object(guard, "public_ip_via_gluetun", return_value="198.51.100.10"),
-            ):
-                assessment = guard.public_ip_assessment()
-            self.assertEqual(assessment, PublicIPAssessment.UNSAFE_DEFINITIVE)
 
 
 if __name__ == "__main__":
@@ -974,3 +970,190 @@ class DaemonIdentityTests(unittest.TestCase):
                         "WIREGUARD_ENDPOINT_IP": "",
                     },
                 )
+
+
+class EgressAssessmentTests(unittest.TestCase):
+    """The live in-tunnel probe is the egress authority; gluetun's control-server
+    IP is a once-per-start snapshot and only a change trigger."""
+
+    HOST = "198.51.100.10"
+    EGRESS = "203.0.113.171"
+    SNAPSHOT = "203.0.113.169"
+
+    def _guard(self, tmp_path: Path, **overrides: object) -> GluetunGuard:
+        return GluetunGuard(make_config(tmp_path, **overrides), FakeRunner({}))
+
+    def _probes(
+        self,
+        guard: GluetunGuard,
+        *,
+        control: str | None = SNAPSHOT,
+        egress: str | None = EGRESS,
+        host: str | None = HOST,
+    ):
+        warnings: list[str] = []
+        patches = (
+            mock.patch.object(guard, "public_ip_via_control_server", return_value=control),
+            mock.patch.object(guard, "public_ip_via_gluetun", return_value=egress),
+            mock.patch.object(guard, "public_ip", return_value=host),
+            mock.patch.object(guard, "warn", side_effect=warnings.append),
+        )
+        return patches, warnings
+
+    def _assess(self, guard: GluetunGuard, patches, **kwargs: bool) -> PublicIPAssessment:
+        with patches[0], patches[1], patches[2], patches[3]:
+            return guard.public_ip_assessment(**kwargs)
+
+    def test_stale_control_snapshot_stays_safe_and_warns_once(self) -> None:
+        # Regression: 2026-09 restart loop. Gluetun kept its first public-IP
+        # fetch after an in-tunnel reconnect moved the egress to another IP.
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory))
+            patches, warnings = self._probes(guard)
+            for _ in range(3):
+                self.assertEqual(
+                    self._assess(guard, patches, force_probe=True), PublicIPAssessment.SAFE
+                )
+            self.assertEqual(guard.last_observed_ip, self.EGRESS)
+            snapshot_warnings = [w for w in warnings if "Gluetun control server reports" in w]
+            self.assertEqual(len(snapshot_warnings), 1)
+
+    def test_new_snapshot_pair_warns_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory))
+            patches, warnings = self._probes(guard)
+            self._assess(guard, patches, force_probe=True)
+            patches, more = self._probes(guard, egress="203.0.113.172")
+            self._assess(guard, patches, force_probe=True)
+            self.assertEqual(
+                len([w for w in warnings + more if "Gluetun control server reports" in w]), 2
+            )
+
+    def test_egress_equal_to_host_direct_ip_is_definitive_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory))
+            patches, warnings = self._probes(guard, egress=self.HOST)
+            self.assertEqual(self._assess(guard, patches), PublicIPAssessment.UNSAFE_DEFINITIVE)
+            self.assertTrue(any("not leaving through the VPN" in w for w in warnings))
+
+    def test_host_probe_uses_egress_ip_family(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory))
+            patches, _ = self._probes(guard)
+            with patches[0], patches[1], patches[2] as host_probe, patches[3]:
+                guard.public_ip_assessment()
+            host_probe.assert_called_once_with(version=4)
+
+    def test_tunnel_probe_failure_is_unknown_and_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory))
+            patches, _ = self._probes(guard, egress=None)
+            with patches[0], patches[1] as egress_probe, patches[2], patches[3]:
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNKNOWN)
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNKNOWN)
+            self.assertEqual(egress_probe.call_count, 2)
+
+    def test_host_probe_failure_without_baseline_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory))
+            patches, warnings = self._probes(guard, host=None)
+            self.assertEqual(self._assess(guard, patches), PublicIPAssessment.UNKNOWN)
+            self.assertTrue(any("record-home-ip" in w for w in warnings))
+
+    def test_malformed_baseline_cannot_replace_failed_host_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory))
+            guard.config.home_ip_file.write_text("\x00garbage", encoding="utf-8")
+            patches, _ = self._probes(guard, host=None)
+            self.assertEqual(self._assess(guard, patches), PublicIPAssessment.UNKNOWN)
+
+    def test_host_probe_failure_falls_back_to_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            guard = self._guard(tmp_path)
+            guard.config.home_ip_file.write_text(f"{self.HOST}\n", encoding="utf-8")
+            patches, _ = self._probes(guard, host=None)
+            self.assertEqual(self._assess(guard, patches), PublicIPAssessment.SAFE)
+            patches, _ = self._probes(guard, host=None, egress=self.HOST)
+            self.assertEqual(
+                self._assess(guard, patches, force_probe=True),
+                PublicIPAssessment.UNSAFE_DEFINITIVE,
+            )
+
+    def test_verified_egress_is_trusted_until_interval_elapses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory), egress_probe_interval_seconds=300)
+            patches, _ = self._probes(guard)
+            with (
+                patches[0],
+                patches[1] as egress_probe,
+                patches[2],
+                patches[3],
+                mock.patch.object(
+                    guard_mod.time, "monotonic", side_effect=[1000.0, 1299.0, 1300.0]
+                ),
+            ):
+                for _ in range(3):
+                    self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.SAFE)
+            # t=1000 probes, t=1299 is inside the interval, t=1300 is due again.
+            self.assertEqual(egress_probe.call_count, 2)
+
+    def test_control_ip_change_forces_probe_before_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory), egress_probe_interval_seconds=300)
+            with (
+                mock.patch.object(
+                    guard,
+                    "public_ip_via_control_server",
+                    side_effect=[self.SNAPSHOT, "203.0.113.200"],
+                ),
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value=self.EGRESS) as p,
+                mock.patch.object(guard, "public_ip", return_value=self.HOST),
+                mock.patch.object(guard, "warn"),
+            ):
+                guard.public_ip_assessment()
+                guard.public_ip_assessment()
+            self.assertEqual(p.call_count, 2)
+
+    def test_force_probe_ignores_cached_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory), egress_probe_interval_seconds=300)
+            patches, _ = self._probes(guard)
+            with patches[0], patches[1] as egress_probe, patches[2], patches[3]:
+                guard.public_ip_assessment()
+                guard.public_ip_assessment(force_probe=True)
+            self.assertEqual(egress_probe.call_count, 2)
+
+    def test_unsafe_outcome_is_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory), egress_probe_interval_seconds=300)
+            patches, _ = self._probes(guard, egress=self.HOST)
+            with patches[0], patches[1] as egress_probe, patches[2], patches[3]:
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNSAFE_DEFINITIVE)
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNSAFE_DEFINITIVE)
+            self.assertEqual(egress_probe.call_count, 2)
+
+    def test_public_ip_skips_answers_of_the_wrong_family(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = GluetunGuard(
+                make_config(
+                    Path(directory),
+                    ip_check_urls=("https://v6.example.test", "https://v4.example.test"),
+                ),
+                FakeRunner({}),
+            )
+            answers = {
+                "https://v6.example.test": b"2001:db8::1\n",
+                "https://v4.example.test": b"198.51.100.10\n",
+            }
+
+            class Opener:
+                def open(self, request, timeout):  # noqa: ANN001
+                    body = answers[request.full_url]
+                    response = mock.MagicMock()
+                    response.__enter__.return_value.read.return_value = body
+                    return response
+
+            with mock.patch.object(guard_mod.urllib.request, "build_opener", return_value=Opener()):
+                self.assertEqual(guard.public_ip(version=4), "198.51.100.10")
+                self.assertEqual(guard.public_ip(), "2001:db8::1")

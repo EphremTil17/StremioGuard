@@ -141,7 +141,7 @@ class Config:
     log_file: Path | None
     log_session: bool
     stremio_enabled: bool
-    ip_crosscheck_interval_seconds: int
+    egress_probe_interval_seconds: int
     public_ip_failure_threshold: int
     vpn_recovery_budget_seconds: int
     vpn_restart_cadence_seconds: int
@@ -201,8 +201,8 @@ class Config:
                 ).split(",")
                 if url.strip()
             ),
-            ip_crosscheck_interval_seconds=_tunable_int(
-                env_file, "IP_CROSSCHECK_INTERVAL_SECONDS", 300
+            egress_probe_interval_seconds=_tunable_int(
+                env_file, "EGRESS_PROBE_INTERVAL_SECONDS", 300
             ),
             public_ip_failure_threshold=_tunable_int(env_file, "PUBLIC_IP_FAILURE_THRESHOLD", 3),
             vpn_recovery_budget_seconds=_tunable_int(
@@ -302,6 +302,9 @@ class CometConfig:
     gateway_public_base_url: str | None = None
     gateway_token_length: int = 8
     gateway_enabled: bool = False
+    # Log files outside StremioGuard (e.g. a reverse proxy's) that the log
+    # canary must also verify.
+    log_canary_globs: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, root_dir: Path | None = None) -> CometConfig:
@@ -334,6 +337,11 @@ class CometConfig:
         gateway_public_base_url = env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL") or None
         gateway_token_length = env_int_value(
             env_file, "COMET_GATEWAY_TOKEN_LENGTH", 8, minimum=4, maximum=32
+        )
+        log_canary_globs = tuple(
+            item.strip()
+            for item in (env_file_value(env_file, "COMET_LOG_CANARY_GLOBS") or "").split(",")
+            if item.strip()
         )
         public_base_url = env_file_value(env_file, "COMET_PUBLIC_BASE_URL") or None
         _validate_public_url(public_base_url, key="COMET_PUBLIC_BASE_URL")
@@ -434,4 +442,5 @@ class CometConfig:
             gateway_public_base_url=gateway_public_base_url,
             gateway_token_length=gateway_token_length,
             gateway_enabled=gateway_enabled,
+            log_canary_globs=log_canary_globs,
         )

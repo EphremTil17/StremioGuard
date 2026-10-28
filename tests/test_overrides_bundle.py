@@ -7,14 +7,21 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from stremioguard.overrides.api_app import render_api_app_override
 from stremioguard.overrides.bundle import (
+    SPECS,
     OverrideSpec,
     Requirement,
     write_override_bundle,
 )
 from stremioguard.publishing import StackPublisher
 
-from .conftest import make_comet_config, make_comet_gateway_config
+from .conftest import (
+    COMET_API_APP_SOURCE,
+    make_comet_config,
+    make_comet_gateway_config,
+    write_comet_api_app,
+)
 
 
 class TestOverridesBundle(unittest.TestCase):
@@ -131,6 +138,7 @@ class TestOverridesBundle(unittest.TestCase):
                 "applied": ["formatter", "stream", "media_search"],
                 "skipped": [],
                 "outputs": {
+                    "app.py": "/app/comet/api/app.py",
                     "formatting.py": "/app/comet/utils/formatting.py",
                     "stream.py": "/app/comet/api/endpoints/stream.py",
                     "media_search.py": "/app/comet/services/media_search.py",
@@ -594,3 +602,65 @@ class ReplaceFirstMatchingEveryOccurrenceTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             replace_first_matching("z\n", (("x\n", "y\n"),), error="anchor gone", expected=None)
+
+
+class RenderApiAppOverrideTests(unittest.TestCase):
+    def test_request_log_uses_route_template_not_raw_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_comet_api_app(root)
+            rendered = render_api_app_override(root)
+
+        self.assertNotIn("request.url.path", rendered)
+        self.assertIn(
+            'f"{method} {_metrics_route(request)} - {status_code} - {process_time:.2f}s",',
+            rendered,
+        )
+        compile(rendered, "app.py", "exec")
+
+    def test_logged_path_carries_no_token_or_config(self) -> None:
+        # Execute the patched logger against a real addon path shape.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_comet_api_app(root)
+            rendered = render_api_app_override(root)
+
+        namespace: dict[str, object] = {}
+        exec(compile(rendered, "app.py", "exec"), namespace)
+        route = mock.Mock(path="/s/secret-token/{b64config}/playback/{hash}")
+        request = mock.Mock()
+        request.scope = {"route": route}
+        request.url.path = "/s/secret-token/eyJhcGlLZXkiOiJzZWNyZXQifQ==/playback/abc"
+        logged: list[str] = []
+        with mock.patch.object(
+            namespace["logger"], "log", side_effect=lambda _lvl, msg: logged.append(msg)
+        ):
+            import asyncio
+
+            asyncio.run(namespace["dispatch"](request, "GET", 200, 0.5))  # type: ignore[operator]
+
+        self.assertEqual(logged, ["GET /s/{token}/{b64config}/playback/{hash} - 200 - 0.50s"])
+
+    def test_unknown_log_shape_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_comet_api_app(
+                root,
+                COMET_API_APP_SOURCE.replace("{request.url.path} - ", "{request.url} - "),
+            )
+            with self.assertRaisesRegex(RuntimeError, "request log line has changed"):
+                render_api_app_override(root)
+
+    def test_missing_sanitizer_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_comet_api_app(
+                root, COMET_API_APP_SOURCE.replace("def _metrics_route", "def _route_label")
+            )
+            with self.assertRaisesRegex(RuntimeError, "no longer defines _metrics_route"):
+                render_api_app_override(root)
+
+    def test_api_app_patch_is_required(self) -> None:
+        spec = next(spec for spec in SPECS if spec.name == "api_app")
+        self.assertEqual(spec.requirement, Requirement.REQUIRED)
+        self.assertEqual(spec.container_path, "/app/comet/api/app.py")

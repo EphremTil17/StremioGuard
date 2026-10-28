@@ -105,6 +105,40 @@ class OrchestratorTests(unittest.TestCase):
 
             manager_cls.assert_called_once_with(comet_cfg, runner)
             advisory_manager.advisory_update_check.assert_called_once()
+            # No gateway, no public addon path to canary.
+            advisory_manager.log_canary.assert_not_called()
+
+    def test_start_runs_log_canary_advisory_when_gateway_enabled(self) -> None:
+        for canary_error in (None, RuntimeError("proxy unreachable")):
+            with self.subTest(error=canary_error), tempfile.TemporaryDirectory() as directory:
+                tmp_path = Path(directory)
+                runner = FakeRunner(
+                    {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
+                )
+                guard = GluetunGuard(make_config(tmp_path, stremio_enabled=False), runner)
+                orch = Orchestrator(guard)
+                comet_cfg = make_comet_config(tmp_path, enabled=True, gateway_enabled=True)
+                write_minimal_bundle_manifest(comet_cfg)
+                gateway_cfg = make_comet_gateway_config(tmp_path, enabled=False)
+                advisory_manager = mock.MagicMock()
+                advisory_manager.log_canary.side_effect = canary_error
+                with (
+                    mock.patch.object(guard, "require_commands", return_value=None),
+                    mock.patch.object(guard, "preflight", return_value=None),
+                    mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
+                    mock.patch(
+                        "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
+                    ),
+                    mock.patch(
+                        "stremioguard.comet_gateway.CometGatewayConfig.from_env",
+                        return_value=gateway_cfg,
+                    ),
+                    mock.patch("stremioguard.comet.CometManager", return_value=advisory_manager),
+                    mock.patch("stremioguard.orchestrator.time.sleep"),
+                ):
+                    orch.setup_active_services(reset=True)  # a canary error must not raise
+
+                advisory_manager.log_canary.assert_called_once()
 
     def test_comet_advisory_error_never_fails_a_successful_start(self) -> None:
         # Plan 5.2: no advisory-path exception may escape — the services are
@@ -306,8 +340,11 @@ class OrchestratorTests(unittest.TestCase):
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
-            with mock.patch.object(guard, "public_ip", return_value="198.51.100.10"):
+            with mock.patch.object(guard, "public_ip", return_value="198.51.100.10") as probe:
                 orch.record_home_ip()
+
+            # An IPv6 baseline could never match the IPv4 tunnel egress.
+            probe.assert_called_once_with(version=4)
 
             self.assertEqual(
                 guard.config.home_ip_file.read_text(encoding="utf-8").strip(), "198.51.100.10"
@@ -666,13 +703,15 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(guard, "gluetun_healthy", return_value=True),
                 mock.patch.object(
                     guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
-                ),
+                ) as mock_assessment,
                 mock.patch.object(guard, "clear_vpn_lockout") as mock_clear_lockout,
                 mock.patch.object(guard, "container_running", return_value=False),
                 mock.patch.object(guard, "compose_fresh") as mock_compose_fresh,
             ):
                 orch.watch_once()
 
+                # Egress changes on reconnect: recovery must not trust a cached SAFE.
+                mock_assessment.assert_called_once_with(force_probe=True)
                 mock_clear_lockout.assert_called_once()
                 mock_compose_fresh.assert_called_once()
                 self.assertIsNone(orch.outage_started_at)

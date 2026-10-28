@@ -157,6 +157,7 @@ Comet commands:
 ./stremio comet start
 ./stremio comet status
 ./stremio comet doctor
+./stremio comet log-canary
 ./stremio comet probe-playback --url 'http://<comet-host>:18000/.../playback/...'
 ./stremio comet logs
 ./stremio comet update [check [--deep]|apply|rollback]
@@ -184,7 +185,9 @@ Recommended phase-1 shape:
 surface, gluetun network-namespace sharing, matching VPN egress IPs, and
 required proxy settings. `./stremio comet probe-playback` is the proof tool: it
 checks whether a playback URL stays on the Comet endpoint or redirects the
-client to a provider URL.
+client to a provider URL. `./stremio comet log-canary` verifies that no hop
+(your reverse proxy, the gateway, Comet) logs addon URL paths, which carry
+debrid credentials; see [docs/comet-gateway.md](docs/comet-gateway.md#log-canary).
 
 For the current end-to-end Tailscale/MagicDNS/Serve workflow, see
 [docs/tailscale-runbook.md](docs/tailscale-runbook.md).
@@ -265,10 +268,13 @@ With no arguments, `./stremio` behaves like `./stremio start`.
 1. Checks that `uv`, `docker`, and `docker compose` are available.
 2. Confirms `.env` exists and is populated.
 3. Starts `gluetun` and waits for its healthcheck to pass.
-4. Probes the public IP from inside gluetun's network namespace.
+4. Probes the tunnel egress IP live from inside gluetun's network namespace
+   and this host's direct public IP from outside it.
 5. Refuses to continue if the VPN looks unsafe:
-   - the IP matches your saved home-IP baseline, or
-   - `EXPECTED_VPN_IP` is set and does not match.
+   - the egress IP equals this host's direct public IP,
+   - the egress IP matches your saved home-IP baseline,
+   - `EXPECTED_VPN_IP` is set and does not match, or
+   - neither the host's IP nor a baseline is available to compare against.
 6. Starts Stremio inside gluetun's network namespace.
 7. If `COMET_ENABLED=1`, prepares the vendored Comet runtime and starts Comet
    plus its PostgreSQL dependency inside the same gluetun network namespace.
@@ -325,7 +331,7 @@ The watchdog polls gluetun health and the egress IP every 10 seconds by default.
 
 Additional watchdog parameters:
 - `PUBLIC_IP_FAILURE_THRESHOLD`: The number of consecutive failed public IP checks (returning `UNKNOWN` status) before the watchdog shuts down the stack to fail closed (default: `3`).
-- `IP_CROSSCHECK_INTERVAL_SECONDS`: The interval in seconds at which the watchdog cross-checks the Gluetun control server IP against external public IP providers (default: `300`).
+- `EGRESS_PROBE_INTERVAL_SECONDS`: How long a verified tunnel egress IP is trusted before the watchdog re-probes it live and re-compares it with this host's direct IP (default: `300`). This bounds leak-detection latency. Recovery after a VPN outage always re-probes immediately. Gluetun's control-server IP is only fetched once per gluetun start and goes stale after an in-tunnel reconnect, so a difference between it and the live egress is logged once and never stops services.
 
 Log summaries are decoupled from the poll cadence and default to every 5 minutes. Tune them with `WATCHDOG_LOG_INTERVAL_SECONDS=300 ./stremio start`. After changing either interval, restart with `./stremio stop` and `./stremio start`.
 
@@ -374,7 +380,7 @@ For an extra check, while gluetun is stopped (or has not been brought up yet) an
 ./stremio record-home-ip
 ```
 
-This saves your non-VPN public IP to `.stremio/home-ip`. Later, the guard refuses to run Stremio if the egress IP observed via gluetun matches that baseline. The command refuses to run while gluetun is healthy, since that would record a VPN IP as home.
+This saves your non-VPN public IPv4 address to `.stremio/home-ip`. The guard already compares the tunnel egress with this host's live direct IP; the baseline is the fallback when that host-side lookup fails. Without either, the check returns UNKNOWN and repeated UNKNOWNs stop services. The command refuses to run while gluetun is healthy, since that would record a VPN IP as home.
 
 If your VPN endpoint has a stable IP, you can make the check stricter:
 

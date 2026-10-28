@@ -100,7 +100,7 @@ class Orchestrator:
         g.log(f"Starting services: {', '.join(services)}.")
         g.compose_fresh("up", "-d", *services, capture=False)
         g.success("Active services are running behind gluetun.")
-        self._comet_update_advisory()
+        self._comet_post_start_advisories()
 
     def start_active_services(self) -> None:
         if not self.guard.compose_instance_exists():
@@ -117,9 +117,9 @@ class Orchestrator:
         g.log(f"Starting services: {', '.join(services)}.")
         g.compose_fresh("up", "-d", *services, capture=False)
         g.success("Active services are running behind gluetun.")
-        self._comet_update_advisory()
+        self._comet_post_start_advisories()
 
-    def _comet_update_advisory(self) -> None:
+    def _comet_post_start_advisories(self) -> None:
         # Plan 5.2: advisory-only, runs AFTER services are up so it can never
         # delay a start/restart. Deferred import to avoid a circular import
         # (orchestrator -> comet.manager -> publishing -> config), matching
@@ -133,9 +133,15 @@ class Orchestrator:
                 return
             from stremioguard.comet import CometManager
 
-            CometManager(comet_config, self.guard.runner).advisory_update_check()
+            manager = CometManager(comet_config, self.guard.runner)
+            manager.advisory_update_check()
+            if comet_config.gateway_enabled:
+                # Advisory too: a redaction failure must be loud, but stopping a
+                # VPN-verified stack over it would trade availability for
+                # nothing. `./stremio comet log-canary` exits nonzero instead.
+                manager.log_canary()
         except Exception:
-            logger.opt(exception=True).debug("Comet update advisory skipped due to an error.")
+            logger.opt(exception=True).debug("Comet post-start advisories skipped due to an error.")
 
     def watch_stremio(self) -> None:
         self.guard.require_commands()
@@ -298,7 +304,9 @@ class Orchestrator:
 
         # Gluetun is healthy
         if self.outage_started_at is not None:
-            assessment = g.public_ip_assessment()
+            # The egress IP changes exactly on reconnect; never resume on a
+            # verification cached from before the outage.
+            assessment = g.public_ip_assessment(force_probe=True)
             if assessment != PublicIPAssessment.SAFE:
                 self._handle_unhealthy_ip_assessment(assessment, services)
                 return
@@ -393,9 +401,11 @@ class Orchestrator:
                 "Stop gluetun first (`docker compose stop gluetun`), then rerun."
             )
 
-        ip = g.public_ip()
+        # IPv4: the tunnel egress it is compared against is IPv4, and an IPv6
+        # baseline could never match it.
+        ip = g.public_ip(version=4)
         if not ip:
-            raise RuntimeError("Could not determine public IP.")
+            raise RuntimeError("Could not determine public IPv4 address.")
 
         if g.config.expected_vpn_ip and ip == g.config.expected_vpn_ip:
             raise RuntimeError(

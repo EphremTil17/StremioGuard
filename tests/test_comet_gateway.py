@@ -171,6 +171,16 @@ class TestCometGatewayManager:
         # The concrete token value must never appear anywhere in the rendered conf.
         assert token not in rendered
 
+    def test_render_nginx_keeps_request_lines_out_of_error_log(self, tmp_path: Path) -> None:
+        # nginx appends the raw request line (token + base64 config) to every
+        # request-context error entry; upstream failures log at [error].
+        rendered = CometGatewayManager(make_comet_gateway_config(tmp_path)).render_nginx_conf()
+
+        error_logs = [line for line in rendered.splitlines() if line.startswith("error_log")]
+        assert error_logs == ["error_log /var/log/nginx/error.log crit;"]
+        # Failure diagnostics move to the masked access log instead.
+        assert "upstream=$upstream_status urt=$upstream_response_time rt=$request_time" in rendered
+
     def test_mask_regex_hides_token_and_config_blob(self, tmp_path: Path) -> None:
         # Plan 0.1: verify the mask against a real playback request line. It
         # carries the token AND the base64 config blob after it (which can
