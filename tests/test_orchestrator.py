@@ -10,7 +10,8 @@ from unittest import mock
 import typer
 
 from stremioguard import guard as guard_mod
-from stremioguard.guard import GluetunGuard, PublicIPAssessment
+from stremioguard import orchestrator as orchestrator_mod
+from stremioguard.guard import GluetunGuard, LockoutActiveError, PublicIPAssessment
 from stremioguard.orchestrator import Orchestrator
 
 from .conftest import (
@@ -51,7 +52,7 @@ class OrchestratorTests(unittest.TestCase):
             prefix = compose_args_prefix(tmp_path)
             self.assertIn([*prefix, "down", "--remove-orphans", "--timeout", "10"], runner.calls)
             self.assertIn([*prefix, "build", "stremio"], runner.calls)
-            self.assertIn([*prefix, "up", "-d", "stremio"], runner.calls)
+            self.assertIn([*prefix, "up", "-d", "--no-deps", "stremio"], runner.calls)
 
     def test_setup_active_services_skips_comet_advisory_when_comet_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -191,7 +192,7 @@ class OrchestratorTests(unittest.TestCase):
 
             prefix = compose_args_prefix(tmp_path)
             self.assertIn([*prefix, "build", "stremio"], runner.calls)
-            self.assertIn([*prefix, "up", "-d", "stremio"], runner.calls)
+            self.assertIn([*prefix, "up", "-d", "--no-deps", "stremio"], runner.calls)
             self.assertNotIn([*prefix, "down", "--remove-orphans", "--timeout", "10"], runner.calls)
 
     def test_setup_defers_service_activation_until_watchdog_owns_vpn_recovery(self) -> None:
@@ -206,8 +207,18 @@ class OrchestratorTests(unittest.TestCase):
             ):
                 orch.setup_active_services(reset=False)
 
-            preflight_mock.assert_called_once_with(allow_recovery=True, defer_vpn_recovery=True)
+            # First-time setup reached from `start` is not a recovery request:
+            # it must honour a lockout like any other start.
+            preflight_mock.assert_called_once_with(allow_recovery=False, defer_vpn_recovery=True)
             compose_fresh_mock.assert_not_called()
+
+    def test_first_time_setup_never_clears_a_lockout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = GluetunGuard(make_config(Path(directory)), FakeRunner({}))
+            guard.config.vpn_lockout_file.write_text("{}", encoding="utf-8")
+            with mock.patch.object(guard, "preflight", return_value=False):
+                Orchestrator(guard).setup_active_services(reset=False)
+            self.assertTrue(guard.config.vpn_lockout_file.exists())
 
     def test_watch_once_stops_stremio_when_gluetun_unhealthy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -221,7 +232,7 @@ class OrchestratorTests(unittest.TestCase):
 
             prefix = compose_args_prefix(tmp_path)
             self.assertIn([*prefix, "stop", "stremio"], runner.calls)
-            self.assertNotIn([*prefix, "up", "-d", "stremio"], runner.calls)
+            self.assertNotIn([*prefix, "up", "-d", "--no-deps", "stremio"], runner.calls)
             self.assertEqual(orch.vpn_drop_count, 1)
 
     def test_watch_once_stops_stremio_when_ip_fails(self) -> None:
@@ -259,7 +270,7 @@ class OrchestratorTests(unittest.TestCase):
                 orch.watch_once()
 
             prefix = compose_args_prefix(tmp_path)
-            self.assertIn([*prefix, "up", "-d", "--build", "stremio"], runner.calls)
+            self.assertIn([*prefix, "up", "-d", "--no-deps", "--build", "stremio"], runner.calls)
 
     def test_watch_once_does_not_log_healthy_tick_before_summary_interval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -385,7 +396,8 @@ class OrchestratorTests(unittest.TestCase):
                 [*prefix, "build", "comet", "comet-postgres", "comet-gateway"], runner.calls
             )
             self.assertIn(
-                [*prefix, "up", "-d", "comet", "comet-postgres", "comet-gateway"], runner.calls
+                [*prefix, "up", "-d", "--no-deps", "comet", "comet-postgres", "comet-gateway"],
+                runner.calls,
             )
             self.assertNotIn([*prefix, "build", "stremio"], runner.calls)
 
@@ -452,10 +464,19 @@ class OrchestratorTests(unittest.TestCase):
 
             prefix = compose_args_prefix(tmp_path)
             self.assertIn(
-                [*prefix, "up", "-d", "--build", "comet", "comet-postgres", "comet-gateway"],
+                [
+                    *prefix,
+                    "up",
+                    "-d",
+                    "--no-deps",
+                    "--build",
+                    "comet",
+                    "comet-postgres",
+                    "comet-gateway",
+                ],
                 runner.calls,
             )
-            self.assertNotIn([*prefix, "up", "-d", "stremio"], runner.calls)
+            self.assertNotIn([*prefix, "up", "-d", "--no-deps", "stremio"], runner.calls)
 
     def test_watch_once_unknown_debounce(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -712,12 +733,14 @@ class OrchestratorTests(unittest.TestCase):
 
                 # Egress changes on reconnect: recovery must not trust a cached SAFE.
                 mock_assessment.assert_called_once_with(force_probe=True)
-                mock_clear_lockout.assert_called_once()
+                # Only an operator lifts a lockout; the loop never writes one
+                # it keeps running under, so there is nothing to clear here.
+                mock_clear_lockout.assert_not_called()
                 mock_compose_fresh.assert_called_once()
                 self.assertIsNone(orch.outage_started_at)
                 self.assertEqual(
                     mock_compose_fresh.call_args.args,
-                    ("up", "-d", "--build", "stremio"),
+                    ("up", "-d", "--no-deps", "--build", "stremio"),
                 )
                 self.assertIsNone(orch.outage_start_wall)
                 self.assertFalse(orch.escalation_triggered)
@@ -874,6 +897,150 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.exit_code, 78)
                 mock_stop_services.assert_called_once()
                 mock_stop_gluetun.assert_called_once()
+
+
+class SupervisedWatchdogTests(unittest.TestCase):
+    """Behaviour the systemd unit relies on: lockout gate, heartbeat, fail-safe."""
+
+    def _orchestrator(self, tmp_path: Path) -> Orchestrator:
+        return Orchestrator(GluetunGuard(make_config(tmp_path), FakeRunner({})))
+
+    def test_watchdog_refuses_to_run_under_a_lockout(self) -> None:
+        # A systemd restart or manual `systemctl start` must not resume
+        # services that the circuit breaker or the fail-safe shut down.
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            orch.guard.config.vpn_lockout_file.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(orch.guard, "require_commands"),
+                mock.patch.object(orchestrator_mod, "notify") as notify,
+                mock.patch.object(orch, "_watch_loop") as loop,
+                self.assertRaises(LockoutActiveError),
+            ):
+                orch.watch_stremio()
+            loop.assert_not_called()
+            notify.assert_not_called()
+
+    def test_lockout_maps_to_exit_status_78(self) -> None:
+        with (
+            mock.patch.object(orchestrator_mod.Config, "from_env"),
+            mock.patch.object(orchestrator_mod, "configure_file_logging"),
+            mock.patch.object(orchestrator_mod, "GluetunGuard"),
+            mock.patch.object(orchestrator_mod, "Orchestrator"),
+            self.assertRaises(typer.Exit) as ctx,
+        ):
+            orchestrator_mod._run_command(
+                lambda o: (_ for _ in ()).throw(LockoutActiveError("locked"))
+            )
+        self.assertEqual(ctx.exception.exit_code, 78)
+
+    def test_watchdog_reports_ready_only_after_preconditions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            events: list[str] = []
+            with (
+                mock.patch.object(
+                    orch.guard, "require_commands", side_effect=lambda: events.append("checked")
+                ),
+                mock.patch.object(
+                    orchestrator_mod, "notify", side_effect=lambda state: events.append(state)
+                ),
+                mock.patch.object(orch, "_watch_loop", side_effect=lambda: events.append("loop")),
+            ):
+                orch.watch_stremio()
+            self.assertEqual(events, ["checked", "READY=1", "loop"])
+
+    def test_second_watchdog_instance_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._orchestrator(Path(directory))
+            second = self._orchestrator(Path(directory))
+            held = first._acquire_instance_lock()
+            try:
+                with self.assertRaises(RuntimeError):
+                    second._acquire_instance_lock()
+            finally:
+                held.close()
+            # Released with its holder, so a restarted watchdog gets it back.
+            second._acquire_instance_lock().close()
+
+    def test_sleep_pings_systemd_at_least_every_chunk(self) -> None:
+        clock = {"now": 0.0}
+
+        def fake_sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        with (
+            mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
+            mock.patch.object(orchestrator_mod.time, "sleep", side_effect=fake_sleep) as sleep,
+            mock.patch.object(orchestrator_mod, "notify") as notify,
+        ):
+            Orchestrator._sleep_with_heartbeat(100)
+        chunk = orchestrator_mod.HEARTBEAT_SLEEP_CHUNK_SECONDS
+        self.assertTrue(all(call.args[0] <= chunk for call in sleep.call_args_list))
+        self.assertEqual(notify.call_count, sleep.call_count)
+
+    def test_fail_safe_locks_out_and_stops_services(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            g = orch.guard
+            with (
+                mock.patch.object(g, "require_commands"),
+                mock.patch.object(g, "stop_active_services", return_value=True) as stop,
+            ):
+                orch.fail_safe()
+            stop.assert_called_once_with()
+            self.assertEqual(g.read_vpn_lockout()["reason"], "watchdog_unstable")  # type: ignore[index]
+
+    def test_fail_safe_keeps_the_original_lockout_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            g = orch.guard
+            g.config.vpn_lockout_file.write_text('{"reason": "auth_rejected"}', encoding="utf-8")
+            with (
+                mock.patch.object(g, "require_commands"),
+                mock.patch.object(g, "stop_active_services", return_value=True),
+            ):
+                orch.fail_safe()
+            self.assertEqual(g.read_vpn_lockout(), {"reason": "auth_rejected"})
+
+    def test_fail_safe_stops_services_even_if_marker_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            g = orch.guard
+            with (
+                mock.patch.object(g, "write_vpn_lockout", side_effect=OSError("read-only")),
+                mock.patch.object(g, "require_commands"),
+                mock.patch.object(g, "stop_active_services", return_value=True) as stop,
+            ):
+                orch.fail_safe()
+            stop.assert_called_once()
+
+    def test_fail_safe_fails_when_shutdown_is_unconfirmed(self) -> None:
+        # A nonzero exit makes systemd retry the fail-safe unit.
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            g = orch.guard
+            with (
+                mock.patch.object(g, "require_commands"),
+                mock.patch.object(g, "stop_active_services", return_value=False),
+                self.assertRaises(RuntimeError),
+            ):
+                orch.fail_safe()
+
+    def test_deferred_recovery_hands_the_lockout_to_the_watchdog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            g = orch.guard
+            g.config.vpn_lockout_file.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(g, "compose"),
+                mock.patch.object(g, "preflight", return_value=False),
+                mock.patch.object(g, "start_services") as start_services,
+                mock.patch.object(orchestrator_mod.time, "sleep"),
+            ):
+                orch.setup_active_services(reset=True)
+            self.assertFalse(g.config.vpn_lockout_file.exists())
+            start_services.assert_not_called()
 
 
 if __name__ == "__main__":

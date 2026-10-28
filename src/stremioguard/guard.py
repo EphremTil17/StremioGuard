@@ -32,6 +32,7 @@ from stremioguard.preflight import (
     verify_bind_addresses,
 )
 from stremioguard.publishing import StackPublisher
+from stremioguard.resolver import nordvpn_endpoint_env
 
 HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
 GLUETUN_PULL_TIMEOUT_SECONDS = 180
@@ -41,6 +42,28 @@ class PublicIPAssessment(Enum):
     SAFE = "SAFE"
     UNSAFE_DEFINITIVE = "UNSAFE_DEFINITIVE"
     UNKNOWN = "UNKNOWN"
+
+
+class LockoutActiveError(RuntimeError):
+    """A lockout marker blocks normal starts until an operator recovers.
+
+    Mapped to exit status 78 (CIRCUIT_BREAKER_EXIT_CODE) so supervisors with
+    RestartPreventExitStatus=78 stop retrying instead of looping on it.
+    """
+
+
+LOCKOUT_REMEDIATION = {
+    "auth_rejected": (
+        "Update VPN credentials via `./stremio init` or attempt recovery via `./stremio restart`."
+    ),
+    "watchdog_unstable": (
+        "The watchdog kept failing under systemd. Inspect "
+        "`journalctl --user -u stremioguard-watchdog.service`, then run `./stremio restart`."
+    ),
+}
+DEFAULT_LOCKOUT_REMEDIATION = (
+    "Verify network connectivity/provider status, then run `./stremio restart`."
+)
 
 
 class GluetunUnavailableError(RuntimeError):
@@ -114,13 +137,13 @@ class GluetunGuard:
             if lockout
             else "Inspect/clear marker via `./stremio unlock` or retry with `./stremio restart`."
         )
-        raise RuntimeError(
+        raise LockoutActiveError(
             f"VPN circuit breaker is active (locked out at {timestamp}, reason: {reason}).\n"
             f"{remediation}\n"
             "To clear the lockout manually without starting services, run `./stremio unlock`."
         )
 
-    def write_vpn_lockout(self, *, reason: str, outage_duration_seconds: float) -> None:
+    def write_vpn_lockout(self, *, reason: str, outage_duration_seconds: float = 0.0) -> None:
         container_id = self.service_container_id("gluetun") or "unknown"
         provider = env_file_value(self._env_path, "VPN_SERVICE_PROVIDER") or "unknown"
         vpn_type = env_file_value(self._env_path, "VPN_TYPE") or "unknown"
@@ -131,12 +154,7 @@ class GluetunGuard:
             "gluetun_container_id": container_id,
             "provider": provider,
             "vpn_type": vpn_type,
-            "remediation": (
-                "Update VPN credentials via `./stremio init` or "
-                "attempt recovery via `./stremio restart`."
-                if reason == "auth_rejected"
-                else "Verify network connectivity/provider status, then run `./stremio restart`."
-            ),
+            "remediation": LOCKOUT_REMEDIATION.get(reason, DEFAULT_LOCKOUT_REMEDIATION),
         }
         atomic_write_text(
             self.config.vpn_lockout_file, json.dumps(payload, indent=2) + "\n", mode=0o600
@@ -683,20 +701,48 @@ class GluetunGuard:
                 return False
         return True
 
-    def stop_active_services(self, services: list[str] | None = None) -> None:
+    def start_services(
+        self, services: list[str], *, build: bool = False, check: bool = True
+    ) -> None:
+        """Start protected services against the gluetun that is already running.
+
+        `--no-deps` keeps this from touching gluetun: Compose otherwise
+        recreates a dependency whose interpolated config differs from its
+        container, so a stale endpoint IP in this process's environment would
+        replace the tunnel that was just verified with an unverified one.
+        Every enabled runtime service is listed explicitly, so no dependency
+        between them is skipped.
+        """
+        build_args = ("--build",) if build else ()
+        self.compose_fresh(
+            "up", "-d", "--no-deps", *build_args, *services, check=check, capture=False
+        )
+
+    def services_confirmed_stopped(self, services: list[str]) -> bool:
+        """Whether Docker positively reports none of ``services`` running.
+
+        A failed query is not proof of a stopped container, so it counts as
+        still running here; ``container_running`` alone treats it as stopped.
+        """
+        result = self.runner.run(
+            self._compose_command("ps", "--status", "running", "-q", *services), check=False
+        )
+        return result.returncode == 0 and not (result.stdout or "").strip()
+
+    def stop_active_services(self, services: list[str] | None = None) -> bool:
+        """Stop ``services`` and return whether the shutdown was verified."""
         if services is None:
             services = self.enabled_runtime_services()
         running_services = [s for s in services if self.container_running([s])]
         if not running_services:
-            return
+            return self.services_confirmed_stopped(services)
         self.log(f"Stopping active services: {', '.join(running_services)}.")
         result = self.compose("stop", *running_services, check=False)
-        still_running = [s for s in running_services if self.container_running([s])]
-        if still_running or result.returncode != 0:
-            target = ", ".join(still_running or running_services)
-            self.warn(f"Failed to confirm shutdown of services: {target}.")
-        else:
+        if result.returncode == 0 and self.services_confirmed_stopped(running_services):
             self.success("Active services are stopped.")
+            return True
+        self.warn(f"Failed to confirm shutdown of services: {', '.join(running_services)}.")
+        return False
 
     def stop_gluetun(self) -> None:
         self.log("Stopping gluetun VPN container.")
@@ -715,25 +761,11 @@ class GluetunGuard:
 
     def restart_gluetun(self) -> None:
         self.log("Restarting gluetun service (best-effort candidate reselection).")
-        env_override: dict[str, str] = {}
-        if self._env_path.exists():
-            from stremioguard.env import env_file_value
-            from stremioguard.resolver import resolve_nordvpn_endpoint
-
-            provider = env_file_value(self._env_path, "VPN_SERVICE_PROVIDER")
-            explicit_hostname = env_file_value(self._env_path, "SERVER_HOSTNAMES")
-            if provider == "nordvpn" and not explicit_hostname:
-                country = env_file_value(self._env_path, "SERVER_COUNTRIES")
-                city = env_file_value(self._env_path, "SERVER_CITIES")
-                cache_path = self.config.root_dir / ".stremio" / "nordvpn-endpoint-cache.json"
-                endpoint = resolve_nordvpn_endpoint(
-                    country=country, city=city, cache_path=cache_path, force_refresh=True
-                )
-                if endpoint:
-                    _, ip = endpoint
-                    env_override["OPENVPN_ENDPOINT_IP"] = ip
-                    env_override["WIREGUARD_ENDPOINT_IP"] = ip
-
+        env_override = nordvpn_endpoint_env(
+            self._env_path,
+            self.config.root_dir / ".stremio" / "nordvpn-endpoint-cache.json",
+            force_refresh=True,
+        )
         if env_override:
             self.compose("up", "-d", "--force-recreate", "gluetun", check=False, env=env_override)
         else:

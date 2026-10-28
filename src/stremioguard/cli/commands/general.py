@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
 from contextlib import suppress
+from pathlib import Path
 
 import typer
 from loguru import logger
 
+from stremioguard.cli import supervisor
 from stremioguard.cli.context import (
     ENV_EXAMPLE,
     ENV_FILE,
@@ -17,15 +20,9 @@ from stremioguard.cli.context import (
     _comet_enabled,
     _comet_manager,
 )
-from stremioguard.cli.watchdog import (
-    _latest_log,
-    _require_uv,
-    _start_watchdog,
-    _stop_watchdog,
-    _uv_command,
-    run_guard,
-)
+from stremioguard.cli.toolchain import _require_uv, _uv_command, run_guard
 from stremioguard.comet import prompt_comet_setup
+from stremioguard.config import Config
 from stremioguard.env import (
     env_flag_enabled,
     env_needs_init,
@@ -237,34 +234,55 @@ def _pull_and_restart() -> None:
 
 
 def start() -> None:
-    """Initialize if needed, start active services, and launch the watchdog."""
+    """Initialize if needed, start active services, and start the supervised watchdog."""
     _warn_for_optional_stremio_settings()
+    # Proven before any container starts: services must never run without a
+    # watchdog that systemd can keep alive.
+    units_changed = supervisor.prepare_supervision()
     context = RunContext.create()
     run_guard("start", context=context)
-    _start_watchdog(context)
+    supervisor.start_watchdog(context, units_changed=units_changed)
 
 
 def restart() -> None:
-    """Reset/build/start active services and relaunch the watchdog."""
+    """Reset/build/start active services and restart the supervised watchdog."""
     _warn_for_optional_stremio_settings()
+    units_changed = supervisor.prepare_supervision()
+    if not supervisor.stop_watchdog():
+        fail("The watchdog could not be confirmed stopped; refusing to reset the stack under it.")
     context = RunContext.create()
-    _stop_watchdog()
     run_guard("reset", context=context)
-    _start_watchdog(context)
+    supervisor.start_watchdog(context, units_changed=units_changed)
 
 
 def stop() -> None:
     """Stop the watchdog and all active services."""
-    _stop_watchdog()
+    watchdog_stopped = supervisor.stop_watchdog()
+    # Stopping services is never less safe, so it happens either way.
     run_guard("stop", file_logging=False)
+    if not watchdog_stopped:
+        fail(
+            "Services were stopped, but the watchdog could not be confirmed stopped and may "
+            f"start them again. Check `systemctl --user status {supervisor.WATCHDOG_UNIT}`."
+        )
 
 
 def status() -> None:
-    """Show VPN, public IP, and container status."""
+    """Show VPN, public IP, container, and watchdog status."""
     run_guard("status", file_logging=False)
+    logger.info("--- Watchdog ---")
+    for line in supervisor.status_lines():
+        logger.info(line)
     if _comet_enabled():
         logger.info("--- Comet ---")
         _comet_manager().status()
+
+
+def _latest_log() -> Path | None:
+    if not LOG_DIR.exists():
+        return None
+    logs = sorted(LOG_DIR.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return logs[0] if logs else None
 
 
 def logs(lines: int = typer.Option(120, "--lines", "-n", help="Initial lines to show.")) -> None:
@@ -283,16 +301,17 @@ def record_home_ip() -> None:
 
 def unlock() -> None:
     """Inspect and clear an active VPN lockout marker."""
-    lockout_file = ROOT_DIR / ".stremio" / "vpn-lockout.json"
+    # The same path the guard writes and checks, VPN_LOCKOUT_FILE included.
+    lockout_file = Config.from_env(ROOT_DIR).vpn_lockout_file
     if not lockout_file.exists():
         logger.info("No VPN lockout is active.")
         return
 
-    import json
-
     try:
         data = json.loads(lockout_file.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
         data = {}
 
     timestamp = data.get("timestamp", "unknown")

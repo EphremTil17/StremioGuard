@@ -11,6 +11,9 @@ into the same Docker product instead of being treated as a separate stack.
 
 - `src/stremioguard/cli/` is the user-facing wrapper (Typer app plus command
   modules under `cli/commands/`).
+- `src/stremioguard/cli/supervisor.py` installs and drives the systemd user
+  units that supervise the watchdog (backoff restarts, heartbeat, fail-safe
+  lockout); `src/stremioguard/sdnotify.py` is the watchdog's side of that.
 - `src/stremioguard/orchestrator.py` runs the guard daemon commands and
   triggers the throttled advisory update checks.
 - `src/stremioguard/guard.py` contains Docker, gluetun, and IP-safety logic.

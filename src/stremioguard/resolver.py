@@ -11,6 +11,8 @@ from typing import Any
 
 from loguru import logger
 
+from stremioguard.env import env_file_value
+
 RECOMMENDATIONS_API_URL = "https://api.nordvpn.com/v1/servers/recommendations"
 DEFAULT_CACHE_TTL_SECONDS = 3600.0  # 1 hour
 DEFAULT_TIMEOUT_SECONDS = 8.0
@@ -205,3 +207,30 @@ def resolve_nordvpn_endpoint(
             pass
 
     return None
+
+
+def nordvpn_endpoint_env(
+    env_path: Path, cache_path: Path, *, force_refresh: bool = False
+) -> dict[str, str]:
+    """Compose interpolation values pinning gluetun to a resolved NordVPN server.
+
+    Empty unless the provider is NordVPN and no explicit SERVER_HOSTNAMES pin
+    exists. The values matter beyond gluetun's own `up`: Compose recreates any
+    service whose interpolated config differs from its running container.
+    """
+    if not env_path.exists():
+        return {}
+    if env_file_value(env_path, "VPN_SERVICE_PROVIDER") != "nordvpn":
+        return {}
+    if env_file_value(env_path, "SERVER_HOSTNAMES"):
+        return {}
+    endpoint = resolve_nordvpn_endpoint(
+        country=env_file_value(env_path, "SERVER_COUNTRIES"),
+        city=env_file_value(env_path, "SERVER_CITIES"),
+        cache_path=cache_path,
+        force_refresh=force_refresh,
+    )
+    if not endpoint:
+        return {}
+    _, ip = endpoint
+    return {"OPENVPN_ENDPOINT_IP": ip, "WIREGUARD_ENDPOINT_IP": ip}

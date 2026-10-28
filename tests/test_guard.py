@@ -844,10 +844,15 @@ class DaemonIdentityTests(unittest.TestCase):
                 )
                 mock_success.assert_not_called()
 
-    def test_stop_active_services_warns_on_failure(self) -> None:
+    def _running_query(self, tmp_path: Path, *services: str) -> tuple[str, ...]:
+        return (*compose_args_prefix(tmp_path), "ps", "--status", "running", "-q", *services)
+
+    def test_stop_active_services_warns_when_container_still_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
+            runner = FakeRunner(
+                {self._running_query(tmp_path, "stremio"): completed([], stdout="abc123\n")}
+            )
             guard = GluetunGuard(make_config(tmp_path), runner)
 
             with (
@@ -855,10 +860,35 @@ class DaemonIdentityTests(unittest.TestCase):
                 mock.patch.object(guard, "warn") as mock_warn,
                 mock.patch.object(guard, "success") as mock_success,
             ):
-                guard.stop_active_services(["stremio"])
+                self.assertFalse(guard.stop_active_services(["stremio"]))
                 mock_warn.assert_called_once()
                 self.assertIn("Failed to confirm shutdown", mock_warn.call_args[0][0])
                 mock_success.assert_not_called()
+
+    def test_stop_active_services_treats_unanswered_query_as_not_stopped(self) -> None:
+        # `container_running` reads a failed query as "not running"; the
+        # shutdown proof must not, or an unreachable daemon looks stopped.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                {self._running_query(tmp_path, "stremio"): completed([], returncode=1)}
+            )
+            guard = GluetunGuard(make_config(tmp_path), runner)
+
+            with mock.patch.object(guard, "container_running", return_value=False):
+                self.assertFalse(guard.stop_active_services(["stremio"]))
+
+    def test_stop_active_services_confirms_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+
+            with (
+                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "success") as mock_success,
+            ):
+                self.assertTrue(guard.stop_active_services(["stremio"]))
+            mock_success.assert_called_once()
 
     def test_check_vpn_lockout_fails_closed_on_corrupt_or_empty_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

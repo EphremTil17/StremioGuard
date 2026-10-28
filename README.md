@@ -35,6 +35,7 @@ Before the first run on Linux, make sure these are in place:
 - Docker with the Compose plugin installed and working.
 - Your Linux user able to talk to Docker without sudo (for example via the `docker` group or rootless Docker). `docker ps` should work before you run `./stremio`.
 - `/dev/net/tun` available on the Linux host or WSL2 guest.
+- systemd 254 or newer with a user service manager and lingering enabled for your user (`loginctl enable-linger $USER`). The watchdog runs as a systemd user service; `./stremio start` refuses to start anything without one.
 - A VPN provider account and the credentials needed for your chosen setup.
 
 On Debian/Ubuntu/WSL, that usually means:
@@ -85,7 +86,7 @@ From this directory:
 ./stremio
 ```
 
-The wrapper runs the Python orchestrator through `uv`, creates the project environment from `uv.lock`, ensures `gluetun` is healthy, verifies the egress IP, starts Stremio, and launches the background watchdog.
+The wrapper runs the Python orchestrator through `uv`, creates the project environment from `uv.lock`, ensures `gluetun` is healthy, verifies the egress IP, starts Stremio, and starts the watchdog as a systemd user service.
 
 Minimum host requirements:
 
@@ -278,7 +279,10 @@ With no arguments, `./stremio` behaves like `./stremio start`.
 6. Starts Stremio inside gluetun's network namespace.
 7. If `COMET_ENABLED=1`, prepares the vendored Comet runtime and starts Comet
    plus its PostgreSQL dependency inside the same gluetun network namespace.
-8. Launches the background watchdog and returns to the shell.
+8. Starts the watchdog as the `stremioguard-watchdog.service` systemd user unit,
+   waits until it reports ready, and returns to the shell. The check that a
+   user service manager is reachable runs before step 3, so protected
+   services never start without a supervised watchdog.
 
 ### Container restart policy
 
@@ -304,16 +308,19 @@ Command guide:
   Guided setup and safe re-init. Creates `.env` from `.env.example` when needed; later runs offer a redacted `.env` summary and can restart unchanged configuration without re-entering secrets. Declining reuse opens the guided editor with existing non-secret values as defaults. Generated `.stremio` files are runtime state, never a second configuration source.
 
 - `./stremio start`
-  Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then launches the watchdog in the background and returns to the shell. When `COMET_ENABLED=1`, it also prepares and starts Comet automatically.
+  Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then starts the supervised watchdog and returns to the shell. A watchdog that is already running is left alone unless its unit or forwarded settings changed. When `COMET_ENABLED=1`, it also prepares and starts Comet automatically.
 
 - `./stremio restart`
   Reset/build/start flow. Runs `docker compose down --remove-orphans`, brings gluetun back up, rebuilds the local Stremio image, and starts Stremio again. When `COMET_ENABLED=1`, it also refreshes Comet runtime files and restarts Comet. It does not delete `stremio-data/`, `gluetun-data/`, or `.stremio/comet/`.
 
 - `./stremio stop`
-  Stops the watchdog first, then stops Stremio and Comet when enabled, so the background guard does not immediately start them back up again.
+  Stops the watchdog unit first, then stops Stremio and Comet when enabled, so the watchdog does not immediately start them back up again. If the unit cannot be confirmed stopped, the services are still stopped and the command exits nonzero.
 
 - `./stremio status`
-  Shows gluetun health, the current public IP as seen from inside gluetun, and the Stremio container status. When `COMET_ENABLED=1`, it also shows Comet status and its observed network mode.
+  Shows gluetun health, the current public IP as seen from inside gluetun, any active lockout, the Stremio container status, and the watchdog unit's state and restart count. When `COMET_ENABLED=1`, it also shows Comet status and its observed network mode.
+
+- `./stremio unlock`
+  Shows an active lockout marker and, after confirmation, clears it without starting anything.
 
 - `./stremio logs`
   Tails the latest host-side run log.
@@ -325,22 +332,53 @@ Command guide:
 
 Each `./stremio start` creates a host-side run log under `logs/`, named like `logs/stremio-20260424-221500.log`. The startup command and background watchdog share that file, so one run captures gluetun health checks, public IP observations, container lifecycle events, drops, and periodic watchdog summaries.
 
-Use `./stremio logs` to tail the latest run log. The background watchdog writes its PID to `.stremio/watchdog.pid`. `./stremio stop` stops the watchdog before stopping Stremio so it will not immediately restart the container.
+Use `./stremio logs` to tail the latest run log. Crashes that happen before logging is set up land in the journal instead: `journalctl --user -u stremioguard-watchdog.service`.
 
-The watchdog polls gluetun health and the egress IP every 10 seconds by default. Tune with `WATCH_INTERVAL_SECONDS=5 ./stremio start` for faster checks, or a larger value for less polling.
+The watchdog polls gluetun health and the egress IP every 10 seconds by default. Set `WATCH_INTERVAL_SECONDS` in `.env` (or for one run, `WATCH_INTERVAL_SECONDS=5 ./stremio start`) for faster checks, or a larger value for less polling.
 
 Additional watchdog parameters:
 - `PUBLIC_IP_FAILURE_THRESHOLD`: The number of consecutive failed public IP checks (returning `UNKNOWN` status) before the watchdog shuts down the stack to fail closed (default: `3`).
 - `EGRESS_PROBE_INTERVAL_SECONDS`: How long a verified tunnel egress IP is trusted before the watchdog re-probes it live and re-compares it with this host's direct IP (default: `300`). This bounds leak-detection latency. Recovery after a VPN outage always re-probes immediately. Gluetun's control-server IP is only fetched once per gluetun start and goes stale after an in-tunnel reconnect, so a difference between it and the live egress is logged once and never stops services.
+- `VPN_RECOVERY_BUDGET_SECONDS` / `VPN_RESTART_CADENCE_SECONDS`: How long the watchdog keeps restarting an unhealthy gluetun (default: `300`, every `45` seconds) before it trips the circuit breaker.
 
-Log summaries are decoupled from the poll cadence and default to every 5 minutes. Tune them with `WATCHDOG_LOG_INTERVAL_SECONDS=300 ./stremio start`. After changing either interval, restart with `./stremio stop` and `./stremio start`.
+Log summaries are decoupled from the poll cadence and default to every 5 minutes. Tune them with `WATCHDOG_LOG_INTERVAL_SECONDS` (`0` logs every tick). All of these can live in `.env`. A value exported in your shell reaches the supervised watchdog only because `./stremio start` forwards a fixed list of known keys to `.stremio/watchdog.env`; anything else exported in the shell does not. Changing a forwarded value and rerunning `./stremio start` restarts the watchdog to apply it.
 
 On a bad signal, the watchdog fails closed:
 
-- gluetun unhealthy
-- public IP check unsafe
+- **gluetun unhealthy:** it stops the protected services, restarts gluetun every `VPN_RESTART_CADENCE_SECONDS` (widening a narrow server filter to the whole country halfway through the budget), and resumes services once gluetun is healthy and a fresh egress probe passes. If the provider rejects the credentials or the budget runs out, it trips the circuit breaker: it writes the lockout marker `.stremio/vpn-lockout`, stops the services and gluetun, and exits with status 78.
+- **public IP check unsafe:** it stops the protected services at once; after `PUBLIC_IP_FAILURE_THRESHOLD` consecutive unknown results, it does the same.
 
-In either case, it stops Stremio and waits for the next tick. There is no manual reconnect loop: gluetun's `restart: unless-stopped` policy reconnects the VPN tunnel on its own, and the watchdog starts Stremio again once gluetun reports healthy and the IP check passes.
+Restarting services never touches gluetun (`docker compose up --no-deps`), so the tunnel that was just verified is the one they join.
+
+### Watchdog supervision
+
+`./stremio start` writes three systemd user units to `~/.config/systemd/user/` and keeps them in sync on every start:
+
+| Unit | Role |
+| :-- | :-- |
+| `stremioguard-watchdog.service` | Runs the watchdog. It reports ready once it is actually watching, then sends a heartbeat every tick. |
+| `stremioguard-failsafe.service` | Runs only when the watchdog unit fails for good. It writes a `watchdog_unstable` lockout (keeping any existing marker), stops the protected services, and checks with Docker that they really stopped. |
+| `stremioguard.service` | Opt-in boot unit that runs `./stremio start` after Docker comes up. |
+
+Because the watchdog runs in your user's service manager, it no longer belongs to whatever started it. Closing an SSH session or terminal, or ending an automation job, does not kill it.
+
+What happens when the watchdog stops unexpectedly:
+
+1. **Crash, or no heartbeat for 10 minutes** (for example, a hung Docker call): systemd restarts it after 5s, then about 10s, 20s, 40s and so on, up to 5 minutes between attempts. The protected services keep running during these retries, and gluetun's kill switch still blocks traffic outside the tunnel.
+2. **Too many restarts** (the seventh start within an hour): systemd gives up, and the fail-safe unit locks out and stops the protected services. That bounds the time without a watchdog to roughly five minutes of retries.
+3. **Exit status 78** (circuit breaker or an existing lockout): no restart. The fail-safe runs and keeps the original lockout reason.
+
+While a lockout marker exists, `./stremio start`, the boot unit and the watchdog itself all refuse to run (exit 78). Recover deliberately with `./stremio restart`, which verifies the VPN before clearing the marker, or inspect and clear it with `./stremio unlock`.
+
+Start at boot:
+
+```bash
+systemctl --user enable stremioguard.service
+```
+
+If you used the older `@reboot ./stremio start` cron entry or a hand-installed `stremio-vpn-watch.service`, remove them. The CLI warns while the old unit file is present. A watchdog started by a pre-systemd version is stopped automatically on the next `./stremio start`, `restart` or `stop`.
+
+Without systemd (for example, WSL with systemd disabled), run `uv run python -m stremioguard.orchestrator start` and keep `uv run python -m stremioguard.orchestrator watchdog` running under a supervisor of your own.
 
 ### Stremio patch layer
 
@@ -390,59 +428,13 @@ EXPECTED_VPN_IP=1.2.3.4 ./stremio start
 
 ## Start automatically (Persistent Boot Setup)
 
-To ensure that your entire StremioGuard stack (including the VPN container, Comet gateway, Comet, and the watchdog) automatically boots up upon system restart, choose one of the two standard persistence methods below:
+Run `./stremio start` once (it installs the units), then enable the boot unit:
 
-### Option A: The Cron `@reboot` Method (Simplest & Recommended for general use)
-This is the most straightforward, zero-configuration method. It does not require root (`sudo`) access, has no complex unit files, and completely avoids D-Bus session errors.
+```bash
+systemctl --user enable stremioguard.service
+```
 
-1. Open your user's cron scheduler:
-   ```bash
-   crontab -e
-   ```
-2. Add the following line at the very bottom of the file (replacing `/path/to/StremioGuard` with the absolute path to your cloned repository):
-   ```text
-   @reboot /path/to/StremioGuard/stremio start
-   ```
-
----
-
-### Option B: System-Wide Systemd Service (Most Robust / Production-Grade)
-For advanced deployments where you want **automatic crash recovery** (restarts StremioGuard if it crashes) and native log management via `journalctl`. By registering it as a system-wide service that runs under your user account, we avoid any D-Bus/user-session complications.
-
-1. Create the service definition file `/etc/systemd/system/stremio-guard.service` (replacing `<username>` with your local Linux username and `/path/to/StremioGuard` with the absolute path to your cloned repository):
-   ```ini
-   [Unit]
-   Description=Guard Stremio behind the gluetun VPN container
-   After=docker.service
-   Requires=docker.service
-
-   [Service]
-   Type=forking
-   User=<username>
-   WorkingDirectory=/path/to/StremioGuard
-   ExecStart=/path/to/StremioGuard/stremio start
-   ExecStop=/path/to/StremioGuard/stremio stop
-   PIDFile=/path/to/StremioGuard/.stremio/watchdog.pid
-   Restart=always
-   RestartSec=10
-   RestartPreventExitStatus=78
-
-   [Install]
-   WantedBy=multi-user.target
-   ```
-2. Enable and start the service:
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now stremio-guard.service
-   ```
-3. Monitor your service:
-   ```bash
-   # Check status and process tree
-   sudo systemctl status stremio-guard.service
-
-   # View active logs in real-time
-   journalctl -u stremio-guard.service -f
-   ```
+It starts after your user's Docker service and runs the same `./stremio start`, so the lockout check, the VPN verification and the supervised watchdog all apply at boot. Lingering (`loginctl enable-linger $USER`) is what starts your user's service manager at boot without a login. See [Watchdog supervision](#watchdog-supervision) for how crashes are handled.
 
 ## Tests
 
@@ -455,6 +447,8 @@ uv run ruff format --check
 uv run pyright
 ./stremio check
 ```
+
+`tests/test_systemd_integration.py` loads the real watchdog units into your systemd user manager (under throwaway names, with short timings) to prove backoff, the start limit, the fail-safe and the heartbeat. It is opt-in: `STREMIOGUARD_SYSTEMD_TESTS=1 uv run pytest tests/test_systemd_integration.py`.
 
 ## Security notes
 

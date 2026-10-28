@@ -17,7 +17,8 @@ import typer
 from stremioguard import init as init_mod
 from stremioguard import nordvpn as nordvpn_mod
 from stremioguard.cli import context as context_mod
-from stremioguard.cli import watchdog as watchdog_mod
+from stremioguard.cli import supervisor as supervisor_mod
+from stremioguard.cli import toolchain as toolchain_mod
 from stremioguard.cli.commands import general as general_cmd_mod
 from stremioguard.config import MANAGED_STACK_ENV
 from stremioguard.env import env_file_value
@@ -436,101 +437,85 @@ class InitPromptTests(unittest.TestCase):
             self.assertEqual(init_mod._prompt_public_domain(), "stremio.example.com")
 
 
-class WatchdogCliTests(unittest.TestCase):
-    def test_pid_is_our_watchdog_matches_current_orchestrator_cmdline(self) -> None:
-        cmdline = (
-            b"uv\x00--cache-dir\x00/tmp/.uv-cache\x00run\x00python\x00-m\x00"
-            b"stremioguard.orchestrator\x00watchdog\x00"
-        )
-        with (
-            mock.patch.object(Path, "read_bytes", return_value=cmdline),
-            mock.patch.object(watchdog_mod.os, "readlink", return_value=str(watchdog_mod.ROOT_DIR)),
-        ):
-            self.assertTrue(watchdog_mod._pid_is_our_watchdog(123))
-
-    def test_pid_is_our_watchdog_rejects_process_outside_repo(self) -> None:
-        cmdline = (
-            b"uv\x00--cache-dir\x00/tmp/.uv-cache\x00run\x00python\x00-m\x00"
-            b"stremioguard.orchestrator\x00watchdog\x00"
-        )
-        with (
-            mock.patch.object(Path, "read_bytes", return_value=cmdline),
-            mock.patch.object(watchdog_mod.os, "readlink", return_value="/some/other/dir"),
-        ):
-            self.assertFalse(watchdog_mod._pid_is_our_watchdog(123))
-
-    def test_watchdog_pids_finds_orphaned_watchdog_without_pid_file(self) -> None:
-        proc_entries = [Path("/proc/111"), Path("/proc/222"), Path("/proc/sys")]
-        with (
-            mock.patch.object(watchdog_mod, "PID_FILE", Path("/tmp/nonexistent-watchdog.pid")),
-            mock.patch.object(Path("/proc").__class__, "iterdir", return_value=proc_entries),
-            mock.patch.object(
-                watchdog_mod, "_pid_is_our_watchdog", side_effect=lambda pid: pid == 222
-            ),
-        ):
-            self.assertEqual(watchdog_mod._watchdog_pids(), [222])
-
-    def test_start_watchdog_recovers_pid_file_for_orphaned_watchdog(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            pid_file = Path(directory) / "watchdog.pid"
-            log_file = Path(directory) / "watchdog.log"
-            context = context_mod.RunContext(run_id="test-run", log_file=log_file)
-            with (
-                mock.patch.object(watchdog_mod, "PID_FILE", pid_file),
-                mock.patch.object(watchdog_mod, "STATE_DIR", Path(directory)),
-                mock.patch.object(watchdog_mod, "LOG_DIR", Path(directory)),
-                mock.patch.object(watchdog_mod, "_require_uv"),
-                mock.patch.object(watchdog_mod, "_watchdog_pids", return_value=[4321]),
-                mock.patch.object(watchdog_mod.subprocess, "Popen") as popen,
-                mock.patch.object(watchdog_mod, "logger"),
-            ):
-                watchdog_mod._start_watchdog(context)
-            self.assertEqual(pid_file.read_text(encoding="utf-8").strip(), "4321")
-            popen.assert_not_called()
-
-    def test_stop_watchdog_terminates_orphaned_watchdog_without_pid_file(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            pid_file = Path(directory) / "watchdog.pid"
-            with (
-                mock.patch.object(watchdog_mod, "PID_FILE", pid_file),
-                mock.patch.object(watchdog_mod, "_watchdog_pids", return_value=[4321]),
-                mock.patch.object(watchdog_mod, "_wait_for_exit", return_value=True),
-                mock.patch.object(watchdog_mod.os, "kill") as kill,
-                mock.patch.object(watchdog_mod, "logger"),
-            ):
-                watchdog_mod._stop_watchdog()
-            kill.assert_called_once_with(4321, watchdog_mod.signal.SIGTERM)
-            self.assertFalse(pid_file.exists())
-
-
 class UnifiedCliTests(unittest.TestCase):
     def test_status_runs_guard_status_and_comet_status(self) -> None:
         with (
             mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
             mock.patch.object(general_cmd_mod, "_comet_enabled", return_value=False),
+            mock.patch.object(supervisor_mod, "status_lines", return_value=["ok"]),
         ):
             general_cmd_mod.status()
         run_guard.assert_called_once_with("status", file_logging=False)
 
-    def test_start_calls_run_guard_and_starts_watchdog(self) -> None:
+    def test_start_proves_supervision_before_starting_services(self) -> None:
+        calls: list[str] = []
         with (
             mock.patch.object(general_cmd_mod, "_warn_for_optional_stremio_settings"),
             mock.patch.object(general_cmd_mod, "RunContext") as context_cls,
-            mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
-            mock.patch.object(general_cmd_mod, "_start_watchdog") as start_watchdog,
+            mock.patch.object(
+                supervisor_mod,
+                "prepare_supervision",
+                side_effect=lambda: calls.append("prepare") or True,
+            ),
+            mock.patch.object(
+                general_cmd_mod, "run_guard", side_effect=lambda *a, **k: calls.append("guard")
+            ) as run_guard,
+            mock.patch.object(
+                supervisor_mod,
+                "start_watchdog",
+                side_effect=lambda *a, **k: calls.append("watchdog"),
+            ) as start_watchdog,
         ):
             context = context_cls.create.return_value
             general_cmd_mod.start()
+        self.assertEqual(calls, ["prepare", "guard", "watchdog"])
         run_guard.assert_called_once_with("start", context=context)
-        start_watchdog.assert_called_once_with(context)
+        start_watchdog.assert_called_once_with(context, units_changed=True)
 
-    def test_stop_calls_run_guard_and_stops_watchdog(self) -> None:
+    def test_start_leaves_services_down_when_supervision_is_unavailable(self) -> None:
         with (
-            mock.patch.object(general_cmd_mod, "_stop_watchdog") as stop_watchdog,
+            mock.patch.object(general_cmd_mod, "_warn_for_optional_stremio_settings"),
+            mock.patch.object(supervisor_mod, "prepare_supervision", side_effect=typer.Exit(1)),
             mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
+            self.assertRaises(typer.Exit),
+        ):
+            general_cmd_mod.start()
+        run_guard.assert_not_called()
+
+    def test_restart_refuses_to_reset_under_a_watchdog_it_could_not_stop(self) -> None:
+        with (
+            mock.patch.object(general_cmd_mod, "_warn_for_optional_stremio_settings"),
+            mock.patch.object(supervisor_mod, "prepare_supervision", return_value=False),
+            mock.patch.object(supervisor_mod, "stop_watchdog", return_value=False),
+            mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
+            self.assertRaises(typer.Exit),
+        ):
+            general_cmd_mod.restart()
+        run_guard.assert_not_called()
+
+    def test_stop_stops_watchdog_then_services(self) -> None:
+        calls: list[str] = []
+        with (
+            mock.patch.object(
+                supervisor_mod,
+                "stop_watchdog",
+                side_effect=lambda: calls.append("watchdog") or True,
+            ),
+            mock.patch.object(
+                general_cmd_mod, "run_guard", side_effect=lambda *a, **k: calls.append("guard")
+            ) as run_guard,
         ):
             general_cmd_mod.stop()
-        stop_watchdog.assert_called_once()
+        self.assertEqual(calls, ["watchdog", "guard"])
+        run_guard.assert_called_once_with("stop", file_logging=False)
+
+    def test_stop_still_stops_services_but_fails_when_watchdog_survives(self) -> None:
+        with (
+            mock.patch.object(supervisor_mod, "stop_watchdog", return_value=False),
+            mock.patch.object(general_cmd_mod, "run_guard") as run_guard,
+            self.assertRaises(typer.Exit),
+        ):
+            general_cmd_mod.stop()
         run_guard.assert_called_once_with("stop", file_logging=False)
 
     def test_prompt_public_domain_rejects_path_and_whitespace(self) -> None:
@@ -547,13 +532,13 @@ class CliCommandTests(unittest.TestCase):
     def test_run_guard_exits_cleanly_when_guard_subprocess_fails(self) -> None:
         with (
             mock.patch.object(
-                watchdog_mod.subprocess,
+                toolchain_mod.subprocess,
                 "run",
                 side_effect=subprocess.CalledProcessError(1, ["uv", "run"]),
             ),
             self.assertRaises(typer.Exit) as ctx,
         ):
-            watchdog_mod.run_guard("start", file_logging=False)
+            toolchain_mod.run_guard("start", file_logging=False)
         self.assertEqual(ctx.exception.exit_code, 1)
 
     def test_init_manual_nordvpn_path_collects_optional_settings_before_key_prompt(self) -> None:
@@ -883,7 +868,7 @@ class ComposeUpGateTests(unittest.TestCase):
         # The watchdog runs compose too, from a copied environment.
         with tempfile.TemporaryDirectory() as directory:
             context = context_mod.RunContext(run_id="test", log_file=Path(directory) / "log")
-            self.assertEqual(context.env(background=True).get(MANAGED_STACK_ENV), "1")
+            self.assertEqual(context.env().get(MANAGED_STACK_ENV), "1")
 
 
 class ToolchainPathTests(unittest.TestCase):
@@ -906,9 +891,9 @@ class ToolchainPathTests(unittest.TestCase):
         # Regression: this call site passed a hardcoded repo-relative cache,
         # so a sudo run left a root-owned .uv-cache in the checkout and broke
         # `uv run` for the repo owner.
-        command = watchdog_mod._uv_command("python", "-c", "pass")
+        command = toolchain_mod._uv_command("python", "-c", "pass")
         self.assertEqual(command[:2], ["uv", "--cache-dir"])
-        self.assertEqual(command[2], str(watchdog_mod.UV_CACHE))
+        self.assertEqual(command[2], str(toolchain_mod.UV_CACHE))
 
 
 class UnlockCommandTests(unittest.TestCase):
@@ -925,7 +910,7 @@ class UnlockCommandTests(unittest.TestCase):
     def test_cli_unlock_confirmed_clears_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            lockout_file = root / ".stremio" / "vpn-lockout.json"
+            lockout_file = root / ".stremio" / "vpn-lockout"
             lockout_file.parent.mkdir(parents=True, exist_ok=True)
             lockout_file.write_text(
                 json.dumps(
@@ -950,7 +935,7 @@ class UnlockCommandTests(unittest.TestCase):
     def test_cli_unlock_declined_retains_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            lockout_file = root / ".stremio" / "vpn-lockout.json"
+            lockout_file = root / ".stremio" / "vpn-lockout"
             lockout_file.parent.mkdir(parents=True, exist_ok=True)
             lockout_file.write_text('{"reason": "auth_rejected"}\n', encoding="utf-8")
             with (

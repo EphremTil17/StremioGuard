@@ -32,6 +32,40 @@ DEFAULT_VPN_RECOVERY_BUDGET_SECONDS = 300
 DEFAULT_VPN_RESTART_CADENCE_SECONDS = 45
 DEFAULT_VPN_FAILOVER_ESCALATION_RATIO = 0.5
 
+# Watchdog tunables: read by `_tunable_int` from the process environment
+# (bare or STREMIO_-prefixed) or from .env.
+TUNABLE_KEYS = (
+    "WATCH_INTERVAL_SECONDS",
+    "WATCHDOG_LOG_INTERVAL_SECONDS",
+    "EGRESS_PROBE_INTERVAL_SECONDS",
+    "PUBLIC_IP_FAILURE_THRESHOLD",
+    "VPN_RECOVERY_BUDGET_SECONDS",
+    "VPN_RESTART_CADENCE_SECONDS",
+)
+# Every process-environment key Config.from_env reads. The systemd-supervised
+# watchdog does not inherit the shell that ran `./stremio start`, so the CLI
+# forwards exactly these across that boundary; tests/test_config.py fails if a
+# new `os.environ` read is added without listing it here.
+CONFIG_ENV_KEYS = (
+    "STREMIO_RUN_ID",
+    "STREMIO_LOG_FILE",
+    "STREMIO_LOG_SESSION",
+    "COMPOSE_FILE",
+    "COMPOSE_OVERRIDE_FILE",
+    "SERVICE_NAME",
+    "CONTAINER_NAME",
+    "GLUETUN_CONTAINER_NAME",
+    "GLUETUN_HEALTHY_TIMEOUT_SECONDS",
+    "PUBLIC_IP_TIMEOUT_SECONDS",
+    "HOME_IP_FILE",
+    "EXPECTED_VPN_IP",
+    "INSTALL_MISSING_DEPS",
+    "IP_CHECK_URLS",
+    "VPN_LOCKOUT_FILE",
+    *TUNABLE_KEYS,
+    *(f"STREMIO_{key}" for key in TUNABLE_KEYS),
+)
+
 
 def parse_public_ip(text: str) -> str | None:
     candidate = text.strip()
@@ -181,9 +215,10 @@ class Config:
             gluetun_healthy_timeout_seconds=int(
                 os.environ.get("GLUETUN_HEALTHY_TIMEOUT_SECONDS", "60")
             ),
-            watch_interval_seconds=int(os.environ.get("WATCH_INTERVAL_SECONDS", "10")),
-            watchdog_log_interval_seconds=int(
-                os.environ.get("WATCHDOG_LOG_INTERVAL_SECONDS", "300")
+            watch_interval_seconds=_tunable_int(env_file, "WATCH_INTERVAL_SECONDS", 10),
+            # 0 logs a summary on every tick.
+            watchdog_log_interval_seconds=_tunable_int(
+                env_file, "WATCHDOG_LOG_INTERVAL_SECONDS", 300, minimum=0
             ),
             public_ip_timeout_seconds=int(os.environ.get("PUBLIC_IP_TIMEOUT_SECONDS", "8")),
             home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".stremio" / "home-ip")),

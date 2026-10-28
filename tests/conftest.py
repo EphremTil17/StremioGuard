@@ -19,8 +19,6 @@ _SANDBOXED_PATHS = {
     "STATE_DIR": lambda root: root / ".stremio",
     "LOG_DIR": lambda root: root / "logs",
     "UV_CACHE": lambda root: root / ".uv-cache",
-    "PID_FILE": lambda root: root / ".stremio" / "watchdog.pid",
-    "LOCK_FILE": lambda root: root / ".stremio" / "watchdog.lock",
 }
 
 
@@ -46,6 +44,24 @@ def sandbox_deployment_paths(
             if isinstance(getattr(module, attribute, None), Path):
                 monkeypatch.setattr(module, attribute, build(root))
     return root
+
+
+@pytest.fixture(autouse=True)
+def isolate_user_systemd(sandbox_deployment_paths: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep tests away from the real user service manager and unit directory.
+
+    A test that forgets to stub systemctl fails loudly instead of rewriting or
+    stopping the live watchdog unit.
+    """
+    from stremioguard.cli import supervisor
+
+    def refuse(*args: str) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"unstubbed systemctl --user {' '.join(args)}")
+
+    units = sandbox_deployment_paths / "systemd-user"
+    monkeypatch.setattr(supervisor, "_systemctl", refuse)
+    monkeypatch.setattr(supervisor, "unit_dir", lambda: units)
+    return units
 
 
 class FakeRunner:

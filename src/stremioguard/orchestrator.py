@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable
+from types import FrameType
 
 import typer
 from loguru import logger
@@ -19,13 +22,17 @@ from stremioguard.config import (
     docker_daemon_help,
     docker_permission_help,
 )
-from stremioguard.guard import GluetunGuard, PublicIPAssessment
+from stremioguard.guard import GluetunGuard, LockoutActiveError, PublicIPAssessment
+from stremioguard.sdnotify import notify
 
 app = typer.Typer(
     help="Guard Stremio behind the gluetun VPN container.",
     no_args_is_help=True,
     context_settings={"color": True},
 )
+
+# Upper bound on one sleep between heartbeats; far below the unit's WatchdogSec.
+HEARTBEAT_SLEEP_CHUNK_SECONDS = 30.0
 
 logger.remove()
 if os.environ.get("STREMIO_BACKGROUND") != "1":
@@ -93,12 +100,19 @@ class Orchestrator:
                 capture=False,
             )
             time.sleep(2)
-        if g.preflight(allow_recovery=True, defer_vpn_recovery=True) is False:
+        # Only a reset (`./stremio restart`) is an operator's recovery request;
+        # first-time setup reached from `start` must still honour a lockout.
+        if g.preflight(allow_recovery=reset, defer_vpn_recovery=True) is False:
+            if reset:
+                # The watchdog refuses to run under a marker, so hand recovery
+                # over now. Its budget writes a fresh marker if the tunnel
+                # never comes back.
+                g.clear_vpn_lockout()
             return
         g.log(f"Building services: {', '.join(services)}.")
         g.compose_fresh("build", *services, capture=False)
         g.log(f"Starting services: {', '.join(services)}.")
-        g.compose_fresh("up", "-d", *services, capture=False)
+        g.start_services(services)
         g.success("Active services are running behind gluetun.")
         self._comet_post_start_advisories()
 
@@ -115,7 +129,7 @@ class Orchestrator:
             return
         services = g.enabled_runtime_services()
         g.log(f"Starting services: {', '.join(services)}.")
-        g.compose_fresh("up", "-d", *services, capture=False)
+        g.start_services(services)
         g.success("Active services are running behind gluetun.")
         self._comet_post_start_advisories()
 
@@ -144,12 +158,43 @@ class Orchestrator:
             logger.opt(exception=True).debug("Comet post-start advisories skipped due to an error.")
 
     def watch_stremio(self) -> None:
-        self.guard.require_commands()
-        self.guard.log(
+        g = self.guard
+        g.require_commands()
+        # Only `./stremio restart` (or `unlock`) may lift a lockout. Without
+        # this, a systemd restart or a manual `systemctl start` would resume
+        # services that the circuit breaker or the fail-safe shut down.
+        g.check_vpn_lockout()
+        instance_lock = self._acquire_instance_lock()
+        g.log(
             "Watching gluetun and active services: "
-            f"{', '.join(self.guard.enabled_public_services())} "
-            f"every {self.guard.config.watch_interval_seconds}s."
+            f"{', '.join(g.enabled_public_services())} "
+            f"every {g.config.watch_interval_seconds}s."
         )
+        notify("READY=1")
+        try:
+            self._watch_loop()
+        finally:
+            instance_lock.close()
+
+    def _acquire_instance_lock(self):
+        """Hold an exclusive lock for this watchdog's lifetime.
+
+        Two watchdogs would fight over the same containers; the kernel drops
+        the lock when the process dies, however it dies.
+        """
+        lock_path = self.guard.config.root_dir / ".stremio" / "watchdog.instance.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_path.open("a+")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.close()
+            raise RuntimeError(
+                f"Another watchdog already holds {lock_path}; refusing to run a second one."
+            ) from None
+        return lock_file
+
+    def _watch_loop(self) -> None:
         while True:
             try:
                 self.watch_once()
@@ -172,7 +217,18 @@ class Orchestrator:
                         logger.exception(
                             "Failed to stop active services during loop error fallback."
                         )
-            time.sleep(self.guard.config.watch_interval_seconds)
+            # A heartbeat per completed tick: systemd's WatchdogSec= bounds
+            # how long one tick (e.g. a hung Docker call) may take.
+            notify("WATCHDOG=1")
+            self._sleep_with_heartbeat(self.guard.config.watch_interval_seconds)
+
+    @staticmethod
+    def _sleep_with_heartbeat(seconds: float) -> None:
+        """Sleep, still pinging systemd when the interval exceeds the deadline."""
+        deadline = time.monotonic() + seconds
+        while (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(min(remaining, HEARTBEAT_SLEEP_CHUNK_SECONDS))
+            notify("WATCHDOG=1")
 
     def _trip_circuit_breaker(self, reason: str) -> None:
         elapsed = (
@@ -311,7 +367,6 @@ class Orchestrator:
                 self._handle_unhealthy_ip_assessment(assessment, services)
                 return
 
-            g.clear_vpn_lockout()
             if self.escalation_triggered:
                 g.log("Gluetun recovered under broad country fallback. Resuming active services.")
             else:
@@ -325,7 +380,7 @@ class Orchestrator:
 
             if not g.container_running(services=services):
                 self.auto_starts_since_summary += 1
-                g.compose_fresh("up", "-d", "--build", *services, check=False, capture=False)
+                g.start_services(services, build=True, check=False)
 
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
             self._maybe_log_summary()
@@ -343,7 +398,7 @@ class Orchestrator:
         if not g.container_running(services=services):
             g.log("Gluetun healthy; starting active services.")
             self.auto_starts_since_summary += 1
-            g.compose_fresh("up", "-d", "--build", *services, check=False, capture=False)
+            g.start_services(services, build=True, check=False)
 
         self._maybe_log_summary()
 
@@ -388,6 +443,15 @@ class Orchestrator:
             logger.info("not recorded (run `./stremio record-home-ip`)")
         else:
             logger.info(f"{int(age // 86400)} days old")
+        logger.info("--- Lockout ---")
+        if g.config.vpn_lockout_file.exists():
+            lockout = g.read_vpn_lockout() or {}
+            logger.warning(
+                f"ACTIVE: reason={lockout.get('reason', 'unreadable marker')} "
+                f"since={lockout.get('timestamp', 'unknown')} (inspect with `./stremio unlock`)"
+            )
+        else:
+            logger.info("none")
         logger.info("--- Containers ---")
         for service in g.enabled_runtime_services():
             result = g.compose("ps", service, check=False)
@@ -422,6 +486,30 @@ class Orchestrator:
         g.config.home_ip_file.write_text(f"{ip}\n", encoding="utf-8")
         g.log(f"Saved {ip} to {g.config.home_ip_file}.")
 
+    def fail_safe(self) -> None:
+        """Lock out and stop protected services once watchdog supervision has failed.
+
+        Run by systemd (OnFailure=) when the watchdog unit enters the failed
+        state: restarts exhausted, or the watchdog exited 78 itself. An
+        existing marker is kept, so the original reason survives. The marker
+        write is isolated so a disk failure cannot skip the shutdown.
+        """
+        g = self.guard
+        g.warn("Watchdog supervision failed; stopping protected services to fail closed.")
+        try:
+            if g.config.vpn_lockout_file.exists():
+                g.log("Keeping the existing lockout marker.")
+            else:
+                g.write_vpn_lockout(reason="watchdog_unstable")
+        except Exception:
+            logger.exception("Failed to write the lockout marker during fail-safe shutdown.")
+        finally:
+            # Refuse to verify against the wrong or an unreachable daemon:
+            # an unanswered query is not a stopped container.
+            g.require_commands()
+            if not g.stop_active_services():
+                raise RuntimeError("Protected services could not be confirmed stopped.")
+
 
 def configure_file_logging(config: Config) -> None:
     if not config.log_file:
@@ -447,6 +535,9 @@ def _run_command(action: Callable[[Orchestrator], None]) -> None:
         action(orch)
     except (typer.Exit, SystemExit):
         raise
+    except LockoutActiveError as error:
+        logger.error(str(error))
+        raise typer.Exit(CIRCUIT_BREAKER_EXIT_CODE) from None
     except KeyboardInterrupt:
         logger.info("Interrupted.")
         raise typer.Exit(130) from None
@@ -494,10 +585,24 @@ def start() -> None:
     _run_command(lambda o: o.start_active_services())
 
 
+def _exit_on_sigterm(signum: int, _frame: FrameType | None) -> None:
+    # Unwinds through `finally` blocks and leaves a line in the run log, so a
+    # deliberate `systemctl stop` is distinguishable from a crash.
+    logger.info(f"Watchdog received signal {signum}; exiting.")
+    raise SystemExit(0)
+
+
 @app.command(hidden=True)
 def watchdog() -> None:
     """Run the watchdog loop and auto-start active services when gluetun is healthy."""
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     _run_command(lambda o: o.watch_stremio())
+
+
+@app.command(hidden=True)
+def failsafe() -> None:
+    """Lock out and stop protected services after watchdog supervision failed."""
+    _run_command(lambda o: o.fail_safe())
 
 
 @app.command()

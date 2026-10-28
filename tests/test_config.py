@@ -134,3 +134,36 @@ class TestTunableInt(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "expected >= 1"),
             ):
                 _tunable_int(env_file, "PUBLIC_IP_FAILURE_THRESHOLD", 3)
+
+
+class TestProcessEnvRegistry(unittest.TestCase):
+    """The supervised watchdog only sees forwarded keys; reads must be listed."""
+
+    def test_every_process_env_read_in_config_is_registered(self) -> None:
+        import re
+
+        from stremioguard import config as config_mod
+
+        source = Path(config_mod.__file__).read_text(encoding="utf-8")
+        direct = set(re.findall(r'os\.environ\.get\("([A-Z_]+)"', source))
+        tunables = set(re.findall(r'_tunable_int\(\s*env_file,\s*"([A-Z_]+)"', source))
+        registered = set(config_mod.CONFIG_ENV_KEYS)
+        self.assertLessEqual(direct, registered)
+        self.assertLessEqual(tunables, set(config_mod.TUNABLE_KEYS))
+        self.assertTrue(tunables)
+
+    def test_watch_intervals_can_live_in_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text(
+                "WATCH_INTERVAL_SECONDS=7\nWATCHDOG_LOG_INTERVAL_SECONDS=0\n", encoding="utf-8"
+            )
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if "WATCH_INTERVAL" not in k and "WATCHDOG_LOG" not in k
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env(root)
+        self.assertEqual(config.watch_interval_seconds, 7)
+        self.assertEqual(config.watchdog_log_interval_seconds, 0)

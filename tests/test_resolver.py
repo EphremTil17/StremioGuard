@@ -151,3 +151,40 @@ class ResolverTests(unittest.TestCase):
                 )
 
             self.assertIsNone(result)
+
+
+class EndpointEnvTests(unittest.TestCase):
+    def _env(self, directory: str, text: str) -> Path:
+        path = Path(directory) / ".env"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_endpoint_env_pins_both_protocols_for_nordvpn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = self._env(directory, "VPN_SERVICE_PROVIDER=nordvpn\nSERVER_COUNTRIES=Canada\n")
+            with mock.patch.object(
+                resolver,
+                "resolve_nordvpn_endpoint",
+                return_value=("ca1.nordvpn.com", "198.51.100.4"),
+            ) as resolve:
+                result = resolver.nordvpn_endpoint_env(env, Path(directory) / "cache.json")
+        self.assertEqual(
+            result, {"OPENVPN_ENDPOINT_IP": "198.51.100.4", "WIREGUARD_ENDPOINT_IP": "198.51.100.4"}
+        )
+        self.assertEqual(resolve.call_args.kwargs["country"], "Canada")
+
+    def test_endpoint_env_is_empty_for_other_providers_or_pinned_hostnames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "cache.json"
+            with mock.patch.object(resolver, "resolve_nordvpn_endpoint") as resolve:
+                for text in (
+                    "VPN_SERVICE_PROVIDER=mullvad\n",
+                    "VPN_SERVICE_PROVIDER=nordvpn\nSERVER_HOSTNAMES=us1.nordvpn.com\n",
+                ):
+                    self.assertEqual(
+                        resolver.nordvpn_endpoint_env(self._env(directory, text), cache), {}
+                    )
+                self.assertEqual(
+                    resolver.nordvpn_endpoint_env(Path(directory) / "missing.env", cache), {}
+                )
+            resolve.assert_not_called()
