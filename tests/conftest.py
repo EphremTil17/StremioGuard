@@ -306,6 +306,7 @@ def preview(token_value):
 REQUIRED_PATCH_OUTPUTS = {
     "app.py": "/app/comet/api/app.py",
     "logger.py": "/app/comet/core/logger.py",
+    "stream.py": "/app/comet/api/endpoints/stream.py",
 }
 
 

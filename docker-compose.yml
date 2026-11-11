@@ -179,9 +179,12 @@ services:
       STREMTHRU_LISTEN_ADDR: 127.0.0.1:8080
       # Upstream peers with the public instance by default; "-" turns it off.
       STREMTHRU_PEER_URI: "-"
-      # Comet uses only the store API. Everything else (dataset syncs, Usenet,
+      # Comet uses only the store API. `torz` must stay on: it registers the
+      # magnet-check, magnet and link-generation routes Comet plays through
+      # (it also parses seen torrent names and crawls the caller's own debrid
+      # library, both locally). Everything else (dataset syncs, Usenet,
       # StremThru's own addons) stays off.
-      STREMTHRU_FEATURE: "-meta,-newz,-torz,-sync,-vault,-dmm_hashlist,-imdb_title,-stremio_list,-stremio_newz,-stremio_sidekick,-stremio_store,-stremio_torz,-stremio_wrap,-probe_media_info"
+      STREMTHRU_FEATURE: "-meta,-newz,-sync,-vault,-dmm_hashlist,-imdb_title,-stremio_list,-stremio_newz,-stremio_sidekick,-stremio_store,-stremio_torz,-stremio_wrap,-probe_media_info"
       STREMTHRU_LOG_FORMAT: text
     volumes:
       - ./.stremio/stremthru/data:/app/data

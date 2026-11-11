@@ -83,10 +83,19 @@ def extract_image_source(runner: Runner, image_ref: str) -> Iterator[Path]:
 
 
 # Run by the container's own Python, so a probe sees exactly what Comet sees.
-FETCH_FROM_COMET_SCRIPT = (
-    "import sys, urllib.request; "
-    "print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())"
-)
+# Prints the status line, then the body, for error responses too.
+FETCH_FROM_COMET_SCRIPT = """\
+import sys, urllib.error, urllib.request
+try:
+    response = urllib.request.urlopen(sys.argv[1], timeout=5)
+except urllib.error.HTTPError as error:
+    response = error
+print(response.status)
+print(response.read().decode())
+"""
+# A store route Comet cannot play without. StremThru registers it only with
+# its `torz` feature; without it the route is a plain-text 404.
+STREMTHRU_REQUIRED_ROUTE = "/v0/store/magnets/check"
 
 
 class CometManager:
@@ -933,18 +942,21 @@ class CometManager:
             f"HTTP health: {'ok' if health else 'unreachable'} "
             "(checked from inside the Comet container)"
         )
-        stremthru = self.stremthru_healthcheck()
-        log = self.log if stremthru else self.warn
+        problem = self.stremthru_healthcheck()
+        log = self.warn if problem else self.log
         log(
-            f"StremThru: {'ok' if stremthru else 'unreachable; debrid lookups will fail'} "
+            f"StremThru: {f'{problem}; debrid lookups will fail' if problem else 'ok'} "
             f"({STREMTHRU_INTERNAL_URL}, checked from inside the Comet container)"
         )
 
     def service_container_id(self, service_name: str) -> str | None:
         return service_container_id(self.runner, self.config.root_dir, service_name)
 
-    def _fetch_from_comet(self, url: str) -> str | None:
-        """GET ``url`` from inside the Comet container, as Comet itself would."""
+    def _fetch_from_comet(self, url: str) -> tuple[int, str] | None:
+        """GET ``url`` from inside the Comet container, as Comet itself would.
+
+        Returns the status and body, or None when the request could not be made.
+        """
         container_id = self.service_container_id(self.config.service_name)
         if not container_id or not self.container_health_status(container_id):
             return None
@@ -961,16 +973,28 @@ class CometManager:
             check=False,
             timeout=10,
         )
-        if result.returncode != 0:
+        status, _, body = (result.stdout or "").partition("\n")
+        if result.returncode != 0 or not status.strip().isdigit():
             return None
-        return (result.stdout or "").replace(" ", "")
+        return int(status), body.replace(" ", "")
 
     def healthcheck(self) -> bool:
-        return '{"status":"ok"}' in (self._fetch_from_comet("http://127.0.0.1:8000/health") or "")
+        response = self._fetch_from_comet("http://127.0.0.1:8000/health")
+        return response is not None and response[0] == 200 and '{"status":"ok"}' in response[1]
 
-    def stremthru_healthcheck(self) -> bool:
-        body = self._fetch_from_comet(f"{STREMTHRU_INTERNAL_URL}/v0/health") or ""
-        return '"status":"ok"' in body
+    def stremthru_healthcheck(self) -> str | None:
+        """None when Comet can use StremThru, else what is wrong.
+
+        Health alone is not enough: StremThru answers /v0/health while the
+        store routes Comet plays through are missing.
+        """
+        health = self._fetch_from_comet(f"{STREMTHRU_INTERNAL_URL}/v0/health")
+        if health is None or health[0] != 200 or '"status":"ok"' not in health[1]:
+            return "unreachable"
+        route = self._fetch_from_comet(f"{STREMTHRU_INTERNAL_URL}{STREMTHRU_REQUIRED_ROUTE}")
+        if route is None or route[0] == 404:
+            return f"missing {STREMTHRU_REQUIRED_ROUTE} (is its `torz` feature disabled?)"
+        return None
 
     def container_health_status(self, container_id: str | None = None) -> str | None:
         container_id = container_id or self.service_container_id(self.config.service_name)

@@ -156,6 +156,7 @@ def _write_upstream_patch_sources(cfg) -> None:
         "        if settings.PUBLIC_BASE_URL\n"
         '        else f"{request.url.scheme}://{request.url.netloc}"\n'
         "    )\n"
+        '    enable_torrent = config["_enableTorrent"]\n'
         "    torrents = search_result.torrents\n"
         "    for info_hash in []:\n"
         "        formatted_components = format_components(\n"
@@ -166,7 +167,13 @@ def _write_upstream_patch_sources(cfg) -> None:
         '            torrent["tracker"],\n'
         '            config["resultFormat"],\n'
         "        )\n"
-        "        formatted_title = format_title_fn(formatted_components)\n",
+        "        formatted_title = format_title_fn(formatted_components)\n"
+        "        for service in []:\n"
+        "            the_stream = {\n"
+        '                "name": stream_name,\n'
+        '                "description": formatted_title,\n'
+        '                "behaviorHints": behavior_hints,\n'
+        "            }\n",
         encoding="utf-8",
     )
     config_file.write_text(
@@ -804,7 +811,7 @@ class CometManagerTests(unittest.TestCase):
                         "-c",
                         manager_mod.FETCH_FROM_COMET_SCRIPT,
                         "http://127.0.0.1:8000/health",
-                    ): completed(["docker", "exec"], '{"status":"ok"}'),
+                    ): completed(["docker", "exec"], '200\n{"status":"ok"}\n'),
                 }
             )
             manager = CometManager(cfg, runner)
@@ -843,7 +850,7 @@ class CometManagerTests(unittest.TestCase):
                         "-c",
                         manager_mod.FETCH_FROM_COMET_SCRIPT,
                         "http://127.0.0.1:8000/health",
-                    ): completed(["docker", "exec"], '{"status":"ok"}'),
+                    ): completed(["docker", "exec"], '200\n{"status":"ok"}\n'),
                     (
                         "docker",
                         "compose",
@@ -930,7 +937,7 @@ class CometManagerTests(unittest.TestCase):
                         "-c",
                         manager_mod.FETCH_FROM_COMET_SCRIPT,
                         "http://127.0.0.1:8000/health",
-                    ): completed(["docker", "exec"], '{"status":"ok"}'),
+                    ): completed(["docker", "exec"], '200\n{"status":"ok"}\n'),
                     (
                         "docker",
                         "compose",
@@ -1537,3 +1544,48 @@ class StremThruComposeTests(unittest.TestCase):
 
     def test_comet_waits_for_a_healthy_stremthru(self) -> None:
         self.assertIn("      stremthru:\n        condition: service_healthy", self.comet)
+
+
+class StremThruRouteCheckTests(unittest.TestCase):
+    """Health alone hid a StremThru without the routes Comet plays through."""
+
+    def _manager(self, responses: dict[str, str]) -> CometManager:
+        cfg = make_comet_config(Path(tempfile.mkdtemp()))
+        manager = CometManager(cfg, FakeRunner({}))
+
+        def fetch(url: str):
+            for suffix, stdout in responses.items():
+                if url.endswith(suffix):
+                    status, _, body = stdout.partition("\n")
+                    return int(status), body
+            return None
+
+        manager._fetch_from_comet = fetch  # type: ignore[method-assign]
+        return manager
+
+    def test_healthy_but_missing_store_routes_is_reported(self) -> None:
+        manager = self._manager(
+            {
+                "/v0/health": '200\n{"data":{"status":"ok"}}',
+                "/magnets/check": "404\n404pagenotfound",
+            }
+        )
+        problem = manager.stremthru_healthcheck()
+        self.assertIsNotNone(problem)
+        self.assertIn("torz", problem or "")
+
+    def test_routes_that_demand_auth_count_as_present(self) -> None:
+        manager = self._manager(
+            {"/v0/health": '200\n{"data":{"status":"ok"}}', "/magnets/check": '401\n{"error":{}}'}
+        )
+        self.assertIsNone(manager.stremthru_healthcheck())
+
+    def test_unreachable_stremthru_is_reported(self) -> None:
+        self.assertEqual(self._manager({}).stremthru_healthcheck(), "unreachable")
+
+
+def test_compose_keeps_the_stremthru_feature_comet_plays_through() -> None:
+    compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text()
+    features = re.search(r'STREMTHRU_FEATURE: "([^"]+)"', compose)
+    assert features is not None
+    assert "-torz" not in features.group(1).split(",")

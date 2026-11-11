@@ -78,10 +78,12 @@ SPECS = [
     ),
     OverrideSpec(
         name="stream",
-        feature="TV-readable stream naming and gateway playback URLs",
+        # Required in every deployment: it carries the P2P block, a VPN
+        # guarantee that does not depend on the gateway.
+        feature="P2P stream block, uncached marker, TV-readable naming, gateway playback URLs",
         container_path="/app/comet/api/endpoints/stream.py",
         output_name="stream.py",
-        requirement=Requirement.REQUIRED_WHEN_GATEWAY,
+        requirement=Requirement.REQUIRED,
         render=lambda repo_dir, ctx: render_stream_override(repo_dir),
     ),
     OverrideSpec(

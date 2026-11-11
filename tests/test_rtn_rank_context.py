@@ -63,6 +63,7 @@ async def stream(request):
         if settings.PUBLIC_BASE_URL
         else f"{request.url.scheme}://{request.url.netloc}"
     )
+    enable_torrent = config["_enableTorrent"]
     torrents = search_result.torrents
     for info_hash in ranked_info_hashes:
         torrent = torrents[info_hash]
@@ -78,6 +79,12 @@ async def stream(request):
             config["resultFormat"],
         )
         formatted_title = format_title_fn(formatted_components)
+        for service in debrid_services:
+            the_stream = {
+                "name": stream_name,
+                "description": formatted_title,
+                "behaviorHints": behavior_hints,
+            }
 """
 
 
@@ -221,3 +228,47 @@ class RankContextOverrideTests(unittest.TestCase):
             self.assertEqual(rendered.count("media_type=media_type"), 2)
             self.assertEqual(rendered.count('pack_backed=torrent.get("packBacked", False)'), 2)
             compile(rendered, "stream.py", "exec")
+
+
+class StreamSafetyAndMarkerTests(unittest.TestCase):
+    """The stream patch blocks P2P and marks uncached entries amber."""
+
+    def _render(self, source: str = STREAM_SOURCE) -> str:
+        root = Path(tempfile.mkdtemp())
+        stream_file = root / "comet" / "api" / "endpoints" / "stream.py"
+        stream_file.parent.mkdir(parents=True)
+        stream_file.write_text(source, encoding="utf-8")
+        return render_stream_override(root)
+
+    def test_p2p_streams_are_switched_off_whatever_the_config_says(self) -> None:
+        # Stremio would torrent a P2P stream from the TV itself, outside the VPN.
+        rendered = self._render()
+        self.assertIn("    enable_torrent = False\n", rendered)
+        self.assertNotIn('config["_enableTorrent"]', rendered)
+
+    def test_a_moved_torrent_switch_fails_instead_of_allowing_p2p(self) -> None:
+        moved = STREAM_SOURCE.replace(
+            '    enable_torrent = config["_enableTorrent"]\n',
+            '    enable_torrent = config.get("_enableTorrent")\n',
+        )
+        with self.assertRaisesRegex(RuntimeError, "P2P"):
+            self._render(moved)
+
+    def test_only_uncached_entries_get_the_amber_media_type_marker(self) -> None:
+        rendered = self._render()
+        compile(rendered, "stream.py", "exec")
+        self.assertIn("if is_cached\n", rendered)
+        namespace: dict[str, object] = {}
+        helper = rendered.split("def _build_stream_name(", 1)[0]
+        exec(helper, namespace)  # noqa: S102 - our rendered helper
+        mark = namespace["_mark_uncached"]
+        assert callable(mark)
+        description = "☰ Title\n– WEB-DL\n– 1.2 GB"
+        components = {"quality": "– WEB-DL", "size": "– 1.2 GB"}
+        self.assertEqual(mark(description, components), "☰ Title\n🔸 WEB-DL\n– 1.2 GB")
+        # No media type: the next line that is always there carries it.
+        self.assertEqual(mark("☰ Title\n– 1.2 GB", {"size": "– 1.2 GB"}), "☰ Title\n🔸 1.2 GB")
+
+    def test_render_is_idempotent(self) -> None:
+        once = self._render()
+        self.assertEqual(self._render(once), once)

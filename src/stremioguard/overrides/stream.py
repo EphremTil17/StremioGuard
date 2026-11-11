@@ -221,10 +221,77 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
         if _sg_title is not None:
             formatted_title = f"{formatted_title}\\n{_sg_title}"
 """
-    return replace_first_matching(
+    content = replace_first_matching(
         content,
         ((size_rank_block, size_rank_replacement),),
         error=(
             "Unable to apply required RTN rank display patch; Comet stream formatting has changed."
         ),
+    )
+    return _mark_uncached_streams(_block_p2p_streams(content))
+
+
+# Stremio cannot colour text, so an amber glyph is the nearest thing to an
+# amber row. It replaces the media-type line's bullet, which every entry has,
+# so cached entries stay exactly as they were and uncached ones cost no width.
+UNCACHED_MARKER = "🔸"
+_MARK_UNCACHED_HELPER = f"""\
+def _mark_uncached(description: str, formatted_components: dict) -> str:
+    for key in ("quality", "video", "size"):
+        line = str(formatted_components.get(key) or "")
+        if line and line in description:
+            bare = line.removeprefix("– ").removeprefix("✦ ")
+            return description.replace(line, f"{UNCACHED_MARKER} {{bare}}", 1)
+    return f"{UNCACHED_MARKER} {{description}}"
+
+
+"""
+
+
+def _block_p2p_streams(content: str) -> str:
+    """Never offer direct-torrent streams, whatever the addon config asks for.
+
+    Stremio plays a P2P stream with the client device's own torrent engine,
+    on its own connection, outside the VPN this stack exists to enforce.
+    Required: a Comet update that moves this switch must not quietly
+    reintroduce P2P.
+    """
+    return replace_first_matching(
+        content,
+        (
+            (
+                '    enable_torrent = config["_enableTorrent"]\n',
+                "    # StremioGuard: P2P streams would torrent from the client, outside the VPN.\n"
+                "    enable_torrent = False\n",
+            ),
+        ),
+        error="Unable to block P2P streams; Comet's torrent stream switch has changed.",
+    )
+
+
+def _mark_uncached_streams(content: str) -> str:
+    helper_marker = "def _build_stream_name(\n"
+    if "def _mark_uncached(" not in content:
+        if helper_marker not in content:
+            raise RuntimeError("Unable to mark uncached streams; upstream stream helper has moved.")
+        content = content.replace(helper_marker, _MARK_UNCACHED_HELPER + helper_marker, 1)
+    # The debrid stream entry, the one place where `is_cached` is known for a
+    # service. The P2P entry also carries an infoHash line, so this is unique.
+    return replace_first_matching(
+        content,
+        (
+            (
+                '                "description": formatted_title,\n'
+                '                "behaviorHints": behavior_hints,\n'
+                "            }\n",
+                '                "description": (\n'
+                "                    formatted_title\n"
+                "                    if is_cached\n"
+                "                    else _mark_uncached(formatted_title, formatted_components)\n"
+                "                ),\n"
+                '                "behaviorHints": behavior_hints,\n'
+                "            }\n",
+            ),
+        ),
+        error="Unable to mark uncached streams; Comet's stream entry shape has changed.",
     )

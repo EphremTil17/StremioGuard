@@ -49,7 +49,7 @@ Each patch is managed as a declarative spec with an explicit requirement class:
 
 | Patch Name | Feature / Purpose | Requirement Class | Degraded Mode (If Failed) |
 |------------|-------------------|-------------------|---------------------------|
-| `stream` | TV-readable stream naming, gateway playback URLs, and RTN rank display | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway is enabled. It is also a required half of the current RTN display contract, so a bundle that cannot render it is rejected. |
+| `stream` | P2P stream block, amber uncached marker, TV-readable stream naming, gateway playback URLs, and RTN rank display | `REQUIRED` | Hard failure in every deployment: it carries the P2P block, a VPN guarantee, and is a required half of the current RTN display contract. |
 | `media_search` | Carries RTN scores to stream rendering | `REQUIRED` | Hard failure; score display cannot silently disappear. |
 | `config` | Protected gateway `/configure` credentials integration | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; the gateway deployment is not published. |
 | `template` | Configure page installer link customization | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; the gateway deployment is not published. |
@@ -152,6 +152,16 @@ Purpose:
 
 - reduce left-side duplication like `TB`, `Comet`, and raw resolution spam
 - degrade more gracefully when a torrent lacks explicit resolution metadata
+- keep cached status visible: the compact names drop Comet's `⚡`/`⬇️`
+  icons, so an uncached entry's media-type line (`WEB-DL`, `BluRay`, …)
+  starts with an amber `🔸` instead of the usual `–`. Stremio cannot colour
+  text on any client, so this glyph is the nearest thing to an amber row;
+  cached entries are unchanged
+- never offer direct-torrent (P2P) streams: Stremio plays those with the
+  client device's own torrent engine, outside the VPN. The patch forces
+  Comet's torrent switch off whatever the addon configuration asks for, and
+  the stream patch is `REQUIRED` in every deployment so a Comet update that
+  moves that switch is rejected
 
 Approach:
 

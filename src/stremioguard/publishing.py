@@ -306,7 +306,8 @@ class StackPublisher:
         if missing:
             raise RuntimeError(
                 "Comet override bundle is missing patches required by this deployment "
-                f"shape: {', '.join(sorted(missing))}. Starting anyway would break "
-                "gateway playback URLs. Fix the patch compatibility (see "
-                "`./stremio comet install` output) before starting."
+                f"shape: {', '.join(sorted(missing))}. Starting anyway would drop a "
+                "safety or privacy guarantee (P2P block, secret redaction, gateway "
+                "URLs). Fix the patch compatibility (see `./stremio comet install` "
+                "output) before starting."
             )
