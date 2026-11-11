@@ -6,12 +6,13 @@ import typer
 from loguru import logger
 
 from stremioguard.cli.context import (
+    ROOT_DIR,
     _comet_enabled,
     _comet_gateway_manager,
     _comet_manager,
 )
 from stremioguard.comet_gateway import CometGatewayManager
-from stremioguard.config import Config
+from stremioguard.config import compose_command
 from stremioguard.env import fail
 
 
@@ -126,21 +127,8 @@ def comet_gateway_logs(
 ) -> None:
     """Tail the Comet gateway logs."""
     manager = _comet_gateway_manager()
-    root_config = Config.from_env()
     subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-f",
-            str(root_config.compose_file),
-            "-f",
-            str(root_config.compose_override_file),
-            "logs",
-            "-f",
-            "--tail",
-            str(lines),
-            manager.config.service_name,
-        ],
+        compose_command(ROOT_DIR, "logs", "-f", "--tail", str(lines), manager.config.service_name),
         check=False,
     )
 

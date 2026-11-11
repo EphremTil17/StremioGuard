@@ -52,11 +52,11 @@ class NordVpnTests(unittest.TestCase):
         self.assertIn("Authorization", req.headers)
         self.assertTrue(req.headers["Authorization"].startswith("Basic "))
 
-    def test_fetch_nordvpn_wireguard_key_from_token_empty_token_fails(self) -> None:
+    def test_fetch_nordvpn_credentials_from_token_empty_token_fails(self) -> None:
         with self.assertRaises(typer.Exit):
-            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("   ")
+            nordvpn_mod.fetch_nordvpn_credentials_from_token("   ")
 
-    def test_fetch_nordvpn_wireguard_key_from_token_http_401_fails(self) -> None:
+    def test_fetch_nordvpn_credentials_from_token_http_401_fails(self) -> None:
         http_error = urllib.error.HTTPError(
             url="https://api.nordvpn.com",
             code=401,
@@ -68,17 +68,17 @@ class NordVpnTests(unittest.TestCase):
             mock.patch("urllib.request.urlopen", side_effect=http_error),
             self.assertRaises(typer.Exit),
         ):
-            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("invalid-token")
+            nordvpn_mod.fetch_nordvpn_credentials_from_token("invalid-token")
 
-    def test_fetch_nordvpn_wireguard_key_from_token_url_error_fails(self) -> None:
+    def test_fetch_nordvpn_credentials_from_token_url_error_fails(self) -> None:
         url_error = urllib.error.URLError("Connection refused")
         with (
             mock.patch("urllib.request.urlopen", side_effect=url_error),
             self.assertRaises(typer.Exit),
         ):
-            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("token")
+            nordvpn_mod.fetch_nordvpn_credentials_from_token("token")
 
-    def test_fetch_nordvpn_wireguard_key_from_token_missing_key_fails(self) -> None:
+    def test_fetch_nordvpn_credentials_from_token_missing_key_fails(self) -> None:
         payload = json.dumps({"user_id": 123}).encode("utf-8")
         mock_response = mock.MagicMock()
         mock_response.read.return_value = payload
@@ -88,9 +88,9 @@ class NordVpnTests(unittest.TestCase):
             mock.patch("urllib.request.urlopen", return_value=mock_response),
             self.assertRaises(typer.Exit),
         ):
-            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("token")
+            nordvpn_mod.fetch_nordvpn_credentials_from_token("token")
 
-    def test_fetch_nordvpn_wireguard_key_from_token_invalid_key_format_fails(self) -> None:
+    def test_fetch_nordvpn_credentials_from_token_invalid_key_format_fails(self) -> None:
         payload = json.dumps({"nordlynx_private_key": "not-a-valid-wireguard-key"}).encode("utf-8")
         mock_response = mock.MagicMock()
         mock_response.read.return_value = payload
@@ -100,7 +100,7 @@ class NordVpnTests(unittest.TestCase):
             mock.patch("urllib.request.urlopen", return_value=mock_response),
             self.assertRaises(typer.Exit),
         ):
-            nordvpn_mod.fetch_nordvpn_wireguard_key_from_token("token")
+            nordvpn_mod.fetch_nordvpn_credentials_from_token("token")
 
     def test_prompt_manual_wireguard_key_success(self) -> None:
         key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -492,6 +492,28 @@ class UnifiedCliTests(unittest.TestCase):
         ):
             general_cmd_mod.restart()
         run_guard.assert_not_called()
+
+    def test_start_still_watches_whatever_a_failed_start_left_running(self) -> None:
+        with (
+            mock.patch.object(general_cmd_mod, "_warn_for_optional_stremio_settings"),
+            mock.patch.object(supervisor_mod, "prepare_supervision", return_value=False),
+            mock.patch.object(general_cmd_mod, "run_guard", side_effect=typer.Exit(1)),
+            mock.patch.object(supervisor_mod, "start_watchdog") as start_watchdog,
+            self.assertRaises(typer.Exit),
+        ):
+            general_cmd_mod.start()
+        start_watchdog.assert_called_once()
+
+    def test_start_skips_the_watchdog_under_a_lockout(self) -> None:
+        with (
+            mock.patch.object(general_cmd_mod, "_warn_for_optional_stremio_settings"),
+            mock.patch.object(supervisor_mod, "prepare_supervision", return_value=False),
+            mock.patch.object(general_cmd_mod, "run_guard", side_effect=typer.Exit(78)),
+            mock.patch.object(supervisor_mod, "start_watchdog") as start_watchdog,
+            self.assertRaises(typer.Exit),
+        ):
+            general_cmd_mod.start()
+        start_watchdog.assert_not_called()
 
     def test_stop_stops_watchdog_then_services(self) -> None:
         calls: list[str] = []
@@ -950,3 +972,16 @@ class UnlockCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_every_third_party_image_is_digest_pinned() -> None:
+    import re
+
+    compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text()
+    images = re.findall(r"^    image: (\S+)$", compose, re.MULTILINE)
+    # gluetun follows its v3 channel on purpose; Comet is pinned by the
+    # generated override; stremio is built locally.
+    deliberate = {"qmcgaw/gluetun:v3", "${COMET_IMAGE:-g0ldyy/comet}", "stremioguard-stremio:local"}
+    for image in images:
+        if image not in deliberate:
+            assert re.search(r"@sha256:[0-9a-f]{64}$", image), image

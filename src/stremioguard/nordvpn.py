@@ -74,12 +74,6 @@ def fetch_nordvpn_credentials_from_token(token: str) -> tuple[str, str, str]:
     return valid_key, username, password
 
 
-def fetch_nordvpn_wireguard_key_from_token(token: str) -> str:
-    """Fetch the permanent WireGuard private key from NordVPN API using an access token."""
-    key, _, _ = fetch_nordvpn_credentials_from_token(token)
-    return key
-
-
 def _prompt_nordvpn_protocol() -> str:
     typer.echo("")
     typer.echo("NordVPN protocol:")
@@ -102,21 +96,18 @@ def _prompt_nordvpn_key_setup_mode() -> str:
     return "token"
 
 
-def _prompt_nordvpn_access_token() -> str:
-    logger.info("Access Token setup selected: generating permanent WireGuard key.")
+def _prompt_nordvpn_access_token(purpose: str) -> str:
+    logger.info(f"Access Token setup selected: {purpose}.")
     typer.echo("")
     typer.echo("To get your NordVPN Access Token:")
     typer.echo("  1. Log in to https://my.nordaccount.com/dashboard/nordvpn/access-tokens/")
-    typer.echo("  2. Click 'Generate new token' (select any expiration or non-expiring).")
+    typer.echo("  2. Click 'Generate new token'.")
     typer.echo("  3. Copy the token and paste it below.")
     typer.echo("")
     token = typer.prompt("NordVPN Access Token", hide_input=True).strip()
     if not token:
         fail("No access token entered; aborting.")
-    logger.info("Contacting NordVPN API to retrieve your permanent WireGuard private key...")
-    key = fetch_nordvpn_wireguard_key_from_token(token)
-    logger.success("Successfully retrieved permanent WireGuard private key from NordVPN.")
-    return key
+    return token
 
 
 def _prompt_manual_wireguard_key() -> str:
@@ -164,16 +155,7 @@ def configure_nordvpn(env_path: Path) -> None:
     if protocol == "openvpn":
         mode = _prompt_nordvpn_openvpn_setup_mode()
         if mode == "token":
-            logger.info("Access Token setup selected: retrieving OpenVPN service credentials.")
-            typer.echo("")
-            typer.echo("To get your NordVPN Access Token:")
-            typer.echo("  1. Log in to https://my.nordaccount.com/dashboard/nordvpn/access-tokens/")
-            typer.echo("  2. Click 'Generate new token'.")
-            typer.echo("  3. Copy the token and paste it below.")
-            typer.echo("")
-            token = typer.prompt("NordVPN Access Token", hide_input=True).strip()
-            if not token:
-                fail("No access token entered; aborting.")
+            token = _prompt_nordvpn_access_token("retrieving OpenVPN service credentials")
             key, username, password = fetch_nordvpn_credentials_from_token(token)
             if not username or not password:
                 fail("NordVPN API did not return service username/password for this account.")
@@ -196,16 +178,7 @@ def configure_nordvpn(env_path: Path) -> None:
 
     mode = _prompt_nordvpn_key_setup_mode()
     if mode == "token":
-        logger.info("Access Token setup selected: generating permanent WireGuard key.")
-        typer.echo("")
-        typer.echo("To get your NordVPN Access Token:")
-        typer.echo("  1. Log in to https://my.nordaccount.com/dashboard/nordvpn/access-tokens/")
-        typer.echo("  2. Click 'Generate new token'.")
-        typer.echo("  3. Copy the token and paste it below.")
-        typer.echo("")
-        token = typer.prompt("NordVPN Access Token", hide_input=True).strip()
-        if not token:
-            fail("No access token entered; aborting.")
+        token = _prompt_nordvpn_access_token("generating permanent WireGuard key")
         key, username, password = fetch_nordvpn_credentials_from_token(token)
     else:
         key = _prompt_manual_wireguard_key()

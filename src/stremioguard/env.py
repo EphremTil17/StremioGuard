@@ -46,10 +46,14 @@ def write_env_settings(env_path: Path, settings: Mapping[str, str]) -> None:
     """Atomically replace a related set of dotenv fields in one transaction."""
     content = env_path.read_text(encoding="utf-8")
     for key, value in settings.items():
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"{key} cannot contain a line break")
         pattern = re.compile(ENV_LINE_TEMPLATE.format(key=re.escape(key)), re.MULTILINE)
         new_line = f"{key}={value}"
         if pattern.search(content):
-            content = pattern.sub(new_line, content, count=1)
+            # A function, not a template: backslashes in values (passwords)
+            # must be written literally, not read as group references.
+            content = pattern.sub(lambda _, line=new_line: line, content, count=1)
         else:
             content = content.rstrip("\n") + f"\n{new_line}\n"
     atomic_write_text(env_path, content, mode=0o600)
@@ -77,14 +81,6 @@ def atomic_write_text(path: Path, content: str, *, mode: int = 0o644) -> None:
             os.close(fd)
         temporary_path.unlink(missing_ok=True)
         raise
-
-
-def write_wireguard_key(env_path: Path, key: str) -> None:
-    write_env_setting(env_path, "WIREGUARD_PRIVATE_KEY", key)
-
-
-def write_openvpn_credentials(env_path: Path, username: str, password: str) -> None:
-    write_env_settings(env_path, {"OPENVPN_USER": username, "OPENVPN_PASSWORD": password})
 
 
 def validate_wireguard_private_key(value: str) -> str:

@@ -51,14 +51,22 @@ class CometState:
 
     @classmethod
     def load(cls, path: Path) -> CometState:
+        """Missing means "never bootstrapped"; unreadable is an error.
+
+        Treating a corrupt file as empty would drop the digest pin, and the
+        next start would quietly run (and promote) whatever `:latest` is.
+        """
         if not path.exists():
             return cls()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return cls()
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"Comet state at {path} is unreadable ({error}); restore it or remove it "
+                "to re-bootstrap from the validated image."
+            ) from error
         if not isinstance(data, dict):
-            return cls()
+            raise RuntimeError(f"Comet state at {path} is not a JSON object.")
         return cls(
             active_digest=data.get("active_digest"),
             previous_digest=data.get("previous_digest"),

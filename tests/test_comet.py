@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,7 +26,8 @@ from .conftest import (
     completed,
     make_comet_config,
     make_config,
-    write_comet_api_app,
+    record_test_digest,
+    write_required_comet_sources,
 )
 
 
@@ -51,7 +53,7 @@ def _write_lock(
 
 
 def _write_upstream_patch_sources(cfg) -> None:
-    write_comet_api_app(cfg.repo_dir)
+    write_required_comet_sources(cfg.repo_dir)
     formatting_file = cfg.repo_dir / "comet" / "utils" / "formatting.py"
     stream_file = cfg.repo_dir / "comet" / "api" / "endpoints" / "stream.py"
     media_search_file = cfg.repo_dir / "comet" / "services" / "media_search.py"
@@ -614,6 +616,7 @@ class CometManagerTests(unittest.TestCase):
                 image_digest="sha256:test",
                 patch_fingerprint="fp-test",
             )
+            record_test_digest(cfg.state_dir)
             manager.write_stack_override_file()
             root_override = tmp_path / ".stremio" / "docker-compose.bindings.yml"
             content = root_override.read_text(encoding="utf-8")
@@ -759,6 +762,7 @@ class CometManagerTests(unittest.TestCase):
                 image_digest="sha256:test",
                 patch_fingerprint="fp-test",
             )
+            record_test_digest(cfg.state_dir)
             manager.write_stack_override_file()
             root_override = tmp_path / ".stremio" / "docker-compose.bindings.yml"
             content = root_override.read_text(encoding="utf-8")
@@ -798,11 +802,8 @@ class CometManagerTests(unittest.TestCase):
                         cfg.container_name,
                         "/app/.venv/bin/python",
                         "-c",
-                        (
-                            "import urllib.request; "
-                            "resp = urllib.request.urlopen('http://127.0.0.1:8000/health'); "
-                            "print(resp.read().decode())"
-                        ),
+                        manager_mod.FETCH_FROM_COMET_SCRIPT,
+                        "http://127.0.0.1:8000/health",
                     ): completed(["docker", "exec"], '{"status":"ok"}'),
                 }
             )
@@ -840,11 +841,8 @@ class CometManagerTests(unittest.TestCase):
                         cfg.container_name,
                         "/app/.venv/bin/python",
                         "-c",
-                        (
-                            "import urllib.request; "
-                            "resp = urllib.request.urlopen('http://127.0.0.1:8000/health'); "
-                            "print(resp.read().decode())"
-                        ),
+                        manager_mod.FETCH_FROM_COMET_SCRIPT,
+                        "http://127.0.0.1:8000/health",
                     ): completed(["docker", "exec"], '{"status":"ok"}'),
                     (
                         "docker",
@@ -930,11 +928,8 @@ class CometManagerTests(unittest.TestCase):
                         cfg.container_name,
                         "/app/.venv/bin/python",
                         "-c",
-                        (
-                            "import urllib.request; "
-                            "resp = urllib.request.urlopen('http://127.0.0.1:8000/health'); "
-                            "print(resp.read().decode())"
-                        ),
+                        manager_mod.FETCH_FROM_COMET_SCRIPT,
+                        "http://127.0.0.1:8000/health",
                     ): completed(["docker", "exec"], '{"status":"ok"}'),
                     (
                         "docker",
@@ -1438,3 +1433,107 @@ class CometCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StremThruAndScraperTests(unittest.TestCase):
+    """Self-hosted StremThru plus the TorBox and DMM scrapers."""
+
+    def _config(self, env: str) -> config_mod.CometConfig:
+        directory = tempfile.mkdtemp()
+        root = Path(directory)
+        (root / ".env").write_text(env, encoding="utf-8")
+        return config_mod.CometConfig.from_env(root)
+
+    def test_scrape_modes_reject_typos_instead_of_silently_disabling(self) -> None:
+        # Comet treats any unknown value as "off"; a typo must fail loudly here.
+        with self.assertRaises(RuntimeError):
+            self._config("COMET_SCRAPE_ZILEAN=lvie\n")
+        self.assertEqual(self._config("COMET_SCRAPE_ZILEAN=OFF\n").scrape_zilean, "false")
+        self.assertEqual(self._config("COMET_SCRAPE_ZILEAN=Both\n").scrape_zilean, "both")
+
+    def test_torbox_search_follows_the_key(self) -> None:
+        self.assertEqual(self._config("").scrape_torbox, "false")
+        self.assertEqual(self._config("COMET_TORBOX_API_KEY=tb\n").scrape_torbox, "live")
+        with self.assertRaises(RuntimeError):
+            self._config("COMET_SCRAPE_TORBOX=live\n")
+
+    def test_dmm_interval_has_a_floor(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self._config("COMET_DMM_INGEST_INTERVAL_SECONDS=60\n")
+
+    def test_runtime_services_put_dependencies_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = make_comet_config(Path(directory))
+            self.assertEqual(cfg.runtime_services, ["comet-postgres", "stremthru", "comet"])
+            gateway = make_comet_config(Path(directory), gateway_enabled=True)
+            self.assertEqual(gateway.runtime_services[-1], "comet-gateway")
+
+    def test_runtime_env_points_comet_at_the_local_stremthru(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = make_comet_config(
+                Path(directory), scrape_torbox="live", torbox_api_key="tb", scrape_dmm="live"
+            )
+            manager = CometManager(cfg, FakeRunner({}))
+            with mock.patch.object(manager, "_resolve_postgres_password", return_value="pw"):
+                env = manager.render_runtime_env()
+        self.assertIn(f"STREMTHRU_URL={config_mod.STREMTHRU_INTERNAL_URL}\n", env)
+        self.assertIn("SCRAPE_TORBOX=live\nTORBOX_API_KEY=tb\n", env)
+        self.assertIn("SCRAPE_DMM=live\nDMM_INGEST_ENABLED=True\n", env)
+
+    def test_dmm_ingest_is_off_when_dmm_search_is_off(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            with mock.patch.object(manager, "_resolve_postgres_password", return_value="pw"):
+                self.assertIn("DMM_INGEST_ENABLED=False\n", manager.render_runtime_env())
+
+    def test_stremthru_credential_is_private_and_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CometManager(make_comet_config(Path(directory)), FakeRunner({}))
+            manager._write_stremthru_env()
+            path = manager.stremthru_env_file()
+            first = env_file_value(path, "STREMTHRU_AUTH")
+            manager._write_stremthru_env()
+            self.assertEqual(env_file_value(path, "STREMTHRU_AUTH"), first)
+            self.assertTrue(first and first.startswith("stremioguard:"))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual((path.parent / "data").stat().st_mode & 0o777, 0o700)
+
+    def test_comet_restarts_never_touch_gluetun(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = FakeRunner({})
+            manager = CometManager(make_comet_config(Path(directory)), runner)
+            with mock.patch.object(manager, "write_stack_override_file"):
+                manager._up()
+            self.assertEqual(
+                runner.calls[-1][-6:],
+                ["up", "-d", "--no-deps", "comet-postgres", "stremthru", "comet"],
+            )
+
+
+class StremThruComposeTests(unittest.TestCase):
+    """docker-compose.yml is the runtime owner of StremThru's isolation."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        text = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        cls.stremthru = text.split("\n  stremthru:\n", 1)[1].split("\n  comet:\n", 1)[0]
+        cls.comet = text.split("\n  comet:\n", 1)[1]
+
+    def test_listens_where_comet_is_told_to_look(self) -> None:
+        listen = re.search(r"STREMTHRU_LISTEN_ADDR: (\S+)", self.stremthru)
+        assert listen is not None
+        self.assertEqual(f"http://{listen.group(1)}", config_mod.STREMTHRU_INTERNAL_URL)
+        self.assertTrue(listen.group(1).startswith("127.0.0.1:"))
+
+    def test_runs_inside_the_tunnel_unpublished_and_pinned(self) -> None:
+        self.assertIn('network_mode: "service:gluetun"', self.stremthru)
+        self.assertNotIn("ports:", self.stremthru)
+        self.assertRegex(self.stremthru, r"image: \S+@sha256:[0-9a-f]{64}\n")
+
+    def test_never_peers_with_the_public_instance(self) -> None:
+        self.assertIn('STREMTHRU_PEER_URI: "-"', self.stremthru)
+
+    def test_comet_waits_for_a_healthy_stremthru(self) -> None:
+        self.assertIn("      stremthru:\n        condition: service_healthy", self.comet)

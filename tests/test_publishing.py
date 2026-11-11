@@ -15,11 +15,12 @@ from stremioguard.publishing import (
 )
 
 from .conftest import (
-    API_APP_OUTPUT,
+    REQUIRED_PATCH_OUTPUTS,
     FakeRunner,
     make_comet_config,
     make_comet_gateway_config,
     make_config,
+    record_test_digest,
 )
 
 
@@ -199,14 +200,21 @@ class TestStackPublisher(unittest.TestCase):
 
             # Generate the first compose override
             guard.write_compose_override()
-            mtime_before = guard.config.compose_override_file.stat().st_mtime
+            mtime_before = (
+                (guard.config.root_dir / ".stremio" / "docker-compose.bindings.yml").stat().st_mtime
+            )
 
             # 1. Calling read-only compose does NOT rewrite the override file
             # (publish is not called)
             with mock.patch("stremioguard.publishing.StackPublisher.publish") as publish_mock:
                 guard.compose("ps", check=False)
                 publish_mock.assert_not_called()
-            self.assertEqual(guard.config.compose_override_file.stat().st_mtime, mtime_before)
+            self.assertEqual(
+                (guard.config.root_dir / ".stremio" / "docker-compose.bindings.yml")
+                .stat()
+                .st_mtime,
+                mtime_before,
+            )
 
             # 2. Calling compose_fresh DOES call StackPublisher.publish
             with mock.patch("stremioguard.publishing.StackPublisher.publish") as publish_mock:
@@ -249,7 +257,7 @@ class TestPublisherFailClosed(unittest.TestCase):
             state_dir = root / ".stremio" / "comet"
             state_dir.mkdir(parents=True)
             outputs = {
-                "app.py": "/app/comet/api/app.py",
+                **REQUIRED_PATCH_OUTPUTS,
                 "stream.py": "/app/comet/api/endpoints/stream.py",
                 "config.py": "/app/comet/api/endpoints/config.py",
                 "media_search.py": "/app/comet/services/media_search.py",
@@ -258,6 +266,7 @@ class TestPublisherFailClosed(unittest.TestCase):
             (state_dir / "bundle-manifest.json").write_text(
                 json.dumps({"outputs": outputs}), encoding="utf-8"
             )
+            record_test_digest(state_dir)
             StackPublisher(root).publish()
             content = (root / ".stremio" / "docker-compose.bindings.yml").read_text(
                 encoding="utf-8"
@@ -287,7 +296,7 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
                     {
                         "outputs": {
                             "media_search.py": "/app/comet/services/media_search.py",
-                            **API_APP_OUTPUT,
+                            **REQUIRED_PATCH_OUTPUTS,
                         }
                     },
                 ),
@@ -304,7 +313,7 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
             )
             self.assertIn(f"image: g0ldyy/comet@{digest}", content)
 
-    def test_publish_renders_floating_tag_when_no_state_exists(self) -> None:
+    def test_publish_refuses_a_floating_tag_when_no_digest_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".env").write_text(
@@ -317,18 +326,17 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
                     {
                         "outputs": {
                             "media_search.py": "/app/comet/services/media_search.py",
-                            **API_APP_OUTPUT,
+                            **REQUIRED_PATCH_OUTPUTS,
                         }
                     },
                 ),
                 encoding="utf-8",
             )
-            StackPublisher(root).publish()
-            content = (root / ".stremio" / "docker-compose.bindings.yml").read_text(
-                encoding="utf-8"
-            )
-            self.assertIn("image: g0ldyy/comet\n", content)
-            self.assertNotIn("g0ldyy/comet@", content)
+            # Never run an unvalidated `:latest`; prepare_runtime bootstraps
+            # a validated digest before anything publishes.
+            with self.assertRaises(RuntimeError):
+                StackPublisher(root).publish()
+            self.assertFalse((root / ".stremio" / "docker-compose.bindings.yml").exists())
 
     def test_explicit_image_override_wins_over_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -343,7 +351,7 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
                     {
                         "outputs": {
                             "media_search.py": "/app/comet/services/media_search.py",
-                            **API_APP_OUTPUT,
+                            **REQUIRED_PATCH_OUTPUTS,
                         }
                     },
                 ),
@@ -359,3 +367,45 @@ class TestStackPublisherDigestPinning(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn(f"image: g0ldyy/comet@{override_digest}", content)
+
+
+def test_gluetun_gets_only_its_own_settings_verbatim() -> None:
+    from stremioguard.publishing import render_gluetun_env
+
+    env = "\n".join(
+        [
+            "# comment",
+            "",
+            "VPN_SERVICE_PROVIDER=nordvpn",
+            'OPENVPN_PASSWORD="p@ss word"',
+            "WIREGUARD_PRIVATE_KEY=abc=",
+            "TZ=America/Los_Angeles",
+            "FIREWALL_OUTBOUND_SUBNETS=192.168.1.0/24",
+            "COMET_TORBOX_API_KEY=secret",
+            "COMET_CONFIGURE_PAGE_PASSWORD=secret",
+            "STREMIO_BIND_ADDRS=127.0.0.1",
+            "WATCH_INTERVAL_SECONDS=5",
+            "EXTERNAL_BASE_URL=https://x",
+        ]
+    )
+    lines = render_gluetun_env(env).splitlines()[1:]
+    assert lines == [
+        "VPN_SERVICE_PROVIDER=nordvpn",
+        'OPENVPN_PASSWORD="p@ss word"',
+        "WIREGUARD_PRIVATE_KEY=abc=",
+        "TZ=America/Los_Angeles",
+        "FIREWALL_OUTBOUND_SUBNETS=192.168.1.0/24",
+    ]
+
+
+def test_gluetun_env_is_private_and_compose_uses_it(tmp_path: Path) -> None:
+    from stremioguard.publishing import write_gluetun_env
+
+    (tmp_path / ".env").write_text("VPN_TYPE=wireguard\nCOMET_TORBOX_API_KEY=k\n")
+    path = write_gluetun_env(tmp_path)
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert "COMET_" not in path.read_text()
+    compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text()
+    gluetun = compose.split("\n  gluetun:\n", 1)[1].split("\n  stremio:\n", 1)[0]
+    assert "./.stremio/gluetun.env" in gluetun
+    assert "env_file: .env" not in compose

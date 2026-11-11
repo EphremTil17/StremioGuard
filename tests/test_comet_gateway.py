@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
+from stremioguard import comet_gateway as gateway_mod
 from stremioguard.comet_gateway import (
     COMET_GATEWAY_CONTAINER_PORT,
     CometGatewayConfig,
     CometGatewayManager,
 )
 from stremioguard.publishing import render_stack_compose_override
-from tests.conftest import make_comet_config, make_comet_gateway_config
+from tests.conftest import FakeRunner, completed, make_comet_config, make_comet_gateway_config
 
 
 class TestCometGatewayConfig:
@@ -237,7 +240,10 @@ class TestCometGatewayPublishing:
         assert '"100.64.0.1:18001:8090"' in content
         assert '"10.0.0.1:18000:8000"' not in content
         assert "comet-gateway:" in content
-        assert str(gateway.nginx_conf_file) in content
+        # The directory, never single files: see test_reload_proves_the_new_map_landed.
+        assert f"{gateway.state_dir}:{gateway_mod.GATEWAY_CONFIG_DIR}:ro" in content
+        assert "nginx.conf:" not in content
+        assert "tokens.map:" not in content
 
     def test_gateway_disabled_keeps_direct_comet_publish(self, tmp_path: Path) -> None:
         comet = make_comet_config(tmp_path, bind_addresses=("10.0.0.1",))
@@ -254,3 +260,66 @@ class TestCometGatewayPublishing:
 
         assert '"10.0.0.1:18000:8000"' in content
         assert "comet-gateway:" not in content
+
+
+class GatewayReloadTests:
+    def _manager(
+        self, tmp_path: Path, container_hash: str
+    ) -> tuple[CometGatewayManager, FakeRunner]:
+        config = make_comet_gateway_config(tmp_path)
+        manager = CometGatewayManager(config, runner := FakeRunner({}))
+        manager.write_nginx_configs()
+        expected = config.tokens_map_file.read_bytes()
+        digest = hashlib.sha256(expected).hexdigest() if container_hash == "match" else "0" * 64
+        map_path = f"{gateway_mod.GATEWAY_CONFIG_DIR}/tokens.map"
+        runner.responses[("docker", "exec", "cid", "sha256sum", map_path)] = completed(
+            [], stdout=f"{digest}  {map_path}\n"
+        )
+        return manager, runner
+
+    def test_reload_proves_the_new_map_landed(self, tmp_path: Path) -> None:
+        manager, runner = self._manager(tmp_path, "match")
+        with mock.patch.object(manager, "service_container_id", return_value="cid"):
+            manager.reload_nginx()
+        assert runner.calls[-1][-2:] == ["-s", "reload"]
+        assert "-t" in runner.calls[0]
+
+    def test_reload_refuses_when_the_container_sees_a_stale_map(self, tmp_path: Path) -> None:
+        # A file bind mount keeps the old inode: nginx would reload the old
+        # tokens and a revoked token would keep working.
+        manager, runner = self._manager(tmp_path, "stale")
+        with (
+            mock.patch.object(manager, "service_container_id", return_value="cid"),
+            pytest.raises(RuntimeError),
+        ):
+            manager.reload_nginx()
+        assert not any(call[-2:] == ["-s", "reload"] for call in runner.calls)
+
+
+def test_access_log_masks_every_path_but_the_gateway_admin_ones(tmp_path: Path) -> None:
+    # Emulates nginx's map: regexes in order, first match wins.
+    conf = CometGatewayManager(make_comet_gateway_config(tmp_path)).render_nginx_conf()
+    body = conf.split("map $request $request_masked {", 1)[1].split("\n    }", 1)[0]
+    rules = []
+    for line in body.strip().splitlines():
+        pattern, value = line.strip().rstrip(";").rsplit(" ", 1)
+        if pattern == "default":
+            continue
+        rules.append((re.compile(pattern.strip('"').lstrip("~").replace("(?<", "(?P<")), value))
+
+    def masked(request: str) -> str:
+        for regex, value in rules:
+            if match := regex.match(request):
+                if value == "$request":
+                    return request
+                return (
+                    value.strip('"').replace("${mrh}", match["mrh"]).replace("${mrt}", match["mrt"])
+                )
+        return request
+
+    assert masked("GET /comet/AbCdEfGh/eyJrZXkiOiJzZWNyZXQifQ==/manifest.json HTTP/1.1") == (
+        "GET /comet/*** HTTP/1.1"
+    )
+    assert masked("GET /eyJrZXkiOiJzZWNyZXQifQ==/manifest.json HTTP/1.1") == "GET /*** HTTP/1.1"
+    assert masked("GET /configure HTTP/1.1") == "GET /configure HTTP/1.1"
+    assert masked("GET / HTTP/1.1") == "GET / HTTP/1.1"

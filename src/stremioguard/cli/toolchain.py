@@ -6,7 +6,7 @@ import subprocess
 import typer
 
 from stremioguard.cli.context import LOG_DIR, UV_CACHE, RunContext
-from stremioguard.env import fail
+from stremioguard.env import ensure_directory, fail
 
 
 def _require_uv() -> None:
@@ -30,7 +30,7 @@ def run_guard(*args: str, context: RunContext | None = None, file_logging: bool 
     _require_uv()
     context = context or RunContext.create()
     if file_logging:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_directory(LOG_DIR)
     try:
         subprocess.run(
             _guard_command(*args), check=True, env=context.env(file_logging=file_logging)

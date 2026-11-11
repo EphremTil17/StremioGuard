@@ -124,7 +124,7 @@ class EnvUtilTests(unittest.TestCase):
                 "TZ=America/Chicago\n",
                 encoding="utf-8",
             )
-            env.write_wireguard_key(path, "secret-key")
+            env.write_env_setting(path, "WIREGUARD_PRIVATE_KEY", "secret-key")
             content = path.read_text(encoding="utf-8")
             self.assertIn("WIREGUARD_PRIVATE_KEY=secret-key", content)
             self.assertNotIn("<paste-key-here>", content)
@@ -135,7 +135,7 @@ class EnvUtilTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
             path.write_text("VPN_SERVICE_PROVIDER=nordvpn\n", encoding="utf-8")
-            env.write_wireguard_key(path, "fallback-key")
+            env.write_env_setting(path, "WIREGUARD_PRIVATE_KEY", "fallback-key")
             content = path.read_text(encoding="utf-8")
             self.assertIn("VPN_SERVICE_PROVIDER=nordvpn", content)
             self.assertIn("WIREGUARD_PRIVATE_KEY=fallback-key", content)
@@ -148,7 +148,9 @@ class EnvUtilTests(unittest.TestCase):
                 "OPENVPN_PASSWORD=<paste-service-password-here>\n",
                 encoding="utf-8",
             )
-            env.write_openvpn_credentials(path, "svc-user", "svc-pass")
+            env.write_env_settings(
+                path, {"OPENVPN_USER": "svc-user", "OPENVPN_PASSWORD": "svc-pass"}
+            )
             content = path.read_text(encoding="utf-8")
             self.assertIn("OPENVPN_USER=svc-user", content)
             self.assertIn("OPENVPN_PASSWORD=svc-pass", content)
@@ -156,3 +158,25 @@ class EnvUtilTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_env_values_are_written_literally(tmp_path) -> None:
+    from stremioguard.env import env_file_value, write_env_setting
+
+    env = tmp_path / ".env"
+    env.write_text("OPENVPN_PASSWORD=old\n", encoding="utf-8")
+    for value in (r"a\1b", r"x\ny", "back\\\\slash"):
+        write_env_setting(env, "OPENVPN_PASSWORD", value)
+        assert env_file_value(env, "OPENVPN_PASSWORD") == value
+    assert env.read_text(encoding="utf-8").count("\n") == 1
+
+
+def test_env_values_reject_line_breaks(tmp_path) -> None:
+    import pytest
+
+    from stremioguard.env import write_env_setting
+
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError):
+        write_env_setting(env, "OPENVPN_PASSWORD", "x\nINJECTED=1")

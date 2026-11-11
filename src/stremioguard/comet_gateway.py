@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
-import subprocess
 import urllib.parse
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,12 +12,16 @@ from pathlib import Path
 
 from loguru import logger
 
-from stremioguard.config import GENERATED_COMPOSE_FILE, Runner, SubprocessRunner
+from stremioguard.config import Runner, SubprocessRunner, service_container_id
 from stremioguard.env import atomic_write_text, ensure_directory
 
 # NOTE: the gateway runs in gluetun's network namespace, where Stremio's own
 # nginx already owns 8080 (web UI) and Comet owns 8000. 8090 is free there.
 COMET_GATEWAY_CONTAINER_PORT = 8090
+# The gateway's state directory, mounted read-only. A directory, not single
+# files: a file bind mount pins the inode it started with, so an atomically
+# replaced tokens.map would never reach nginx and revoked tokens kept working.
+GATEWAY_CONFIG_DIR = "/etc/nginx/stremioguard"
 
 
 @dataclass(frozen=True)
@@ -254,7 +258,7 @@ events {{
 }}
 
 http {{
-    include /etc/nginx/tokens.map;
+    include {GATEWAY_CONFIG_DIR}/tokens.map;
 
     # Rate-limit only invalid-token requests. A plain `return 403` inside the
     # token locations would run in the rewrite phase, BEFORE limit_req's
@@ -267,13 +271,17 @@ http {{
     limit_req_zone $binary_remote_addr zone=gateway_admin:1m rate=10r/s;
     limit_req_zone $binary_remote_addr zone=gateway_fail:1m rate=5r/s;
 
-    # Mask the whole path after /comet/ before it reaches the access log: the
-    # raw request line carries the gateway token AND the base64 Comet config
-    # blob after it, which can embed debrid API keys. Masking only the token
-    # segment would still log the blob, so everything up to the protocol
-    # field is replaced.
+    # Mask request paths before they reach the access log. After /comet/ the
+    # line carries the gateway token AND the base64 Comet config blob, which
+    # can embed debrid API keys, so everything up to the protocol field is
+    # replaced. Any other path is masked too (a raw Comet addon URL sent here
+    # is refused but would otherwise be logged whole); only the gateway's own
+    # admin paths stay readable. First matching regex wins.
     map $request $request_masked {{
         ~^(?<mrh>\\S+\\s/comet/)\\S+(?<mrt>.*)$ "${{mrh}}***${{mrt}}";
+        "~^\\S+\\s/(?:configure|static/|health|admin)" $request;
+        "~^\\S+\\s/\\s" $request;
+        ~^(?<mrh>\\S+\\s/)\\S+(?<mrt>.*)$ "${{mrh}}***${{mrt}}";
         default $request;
     }}
 
@@ -374,51 +382,12 @@ http {{
 
     # ── Compose lifecycle ──────────────────────────────────────────
 
-    def root_compose_file(self) -> Path:
-        return self.config.root_dir / "docker-compose.yml"
-
-    def root_override_file(self) -> Path:
-        return self.config.root_dir / GENERATED_COMPOSE_FILE
-
-    def _compose_command(self, *args: str) -> list[str]:
-        return [
-            "docker",
-            "compose",
-            "-f",
-            str(self.root_compose_file()),
-            "-f",
-            str(self.root_override_file()),
-            *args,
-        ]
-
-    def compose(
-        self,
-        *args: str,
-        check: bool = True,
-        capture: bool = True,
-    ) -> subprocess.CompletedProcess[str]:
-        return self.runner.run(self._compose_command(*args), check=check, capture=capture)
-
     def prepare_runtime(self) -> None:
         ensure_directory(self.config.state_dir)
         self.write_nginx_configs()
 
-    def start(self) -> None:
-        self.prepare_runtime()
-        self.compose("up", "-d", self.config.service_name)
-        logger.success(f"Comet gateway started on port {self.config.host_port}.")
-
-    def stop(self) -> None:
-        self.compose("stop", self.config.service_name, check=False)
-        logger.info("Comet gateway stopped.")
-
     def service_container_id(self) -> str | None:
-        result = self.compose("ps", "-q", self.config.service_name, check=False)
-        if result.returncode != 0:
-            return None
-        return next(
-            (line.strip() for line in (result.stdout or "").splitlines() if line.strip()), None
-        )
+        return service_container_id(self.runner, self.config.root_dir, self.config.service_name)
 
     def status(self) -> None:
         container_id = self.service_container_id()
@@ -437,11 +406,27 @@ http {{
         logger.info(f"Public base URL: {self.public_base_url()}")
 
     def reload_nginx(self) -> None:
+        """Apply the token map to the running gateway and prove it landed.
+
+        A reload only helps if nginx reads the new file; the state directory is
+        mounted (not single files, which keep the inode they started with), and
+        the in-container hash is compared before claiming success.
+        """
         self.write_nginx_configs()
-        self.runner.run(
-            ["docker", "exec", self.service_container_id() or "", "nginx", "-s", "reload"],
+        container_id = self.service_container_id() or ""
+        nginx = ["docker", "exec", container_id, "nginx", "-c", f"{GATEWAY_CONFIG_DIR}/nginx.conf"]
+        self.runner.run([*nginx, "-t"], check=True)
+        expected = hashlib.sha256(self.config.tokens_map_file.read_bytes()).hexdigest()
+        seen = self.runner.run(
+            ["docker", "exec", container_id, "sha256sum", f"{GATEWAY_CONFIG_DIR}/tokens.map"],
             check=True,
         )
+        if (seen.stdout or "").split(" ", 1)[0] != expected:
+            raise RuntimeError(
+                "The gateway container does not see the updated token map; "
+                "run `./stremio restart` so revoked tokens stop working."
+            )
+        self.runner.run([*nginx, "-s", "reload"], check=True)
 
     def container_running(self) -> bool:
         container_id = self.service_container_id()

@@ -167,3 +167,37 @@ class TestProcessEnvRegistry(unittest.TestCase):
                 config = Config.from_env(root)
         self.assertEqual(config.watch_interval_seconds, 7)
         self.assertEqual(config.watchdog_log_interval_seconds, 0)
+
+
+def test_compose_command_ignores_an_exported_compose_file(tmp_path, monkeypatch) -> None:
+    from stremioguard.config import compose_command
+
+    monkeypatch.setenv("COMPOSE_FILE", "/elsewhere/docker-compose.yml")
+    assert compose_command(tmp_path, "ps") == [
+        "docker",
+        "compose",
+        "-f",
+        str(tmp_path / "docker-compose.yml"),
+        "ps",
+    ]
+    (tmp_path / ".stremio").mkdir()
+    (tmp_path / ".stremio" / "docker-compose.bindings.yml").touch()
+    assert "-f" in compose_command(tmp_path, "ps")[4:]
+
+
+def test_bind_addresses_have_one_parser_with_every_rule(tmp_path) -> None:
+    import pytest
+
+    from stremioguard.config import parse_bind_addresses
+
+    env = tmp_path / ".env"
+    env.write_text("")
+    assert parse_bind_addresses(env) == ["127.0.0.1"]
+    env.write_text("STREMIO_BIND_ADDRS=\n")
+    assert parse_bind_addresses(env) == []
+    env.write_text("STREMIO_BIND_ADDRS=10.0.0.1, 10.0.0.1 ,100.64.0.1\n")
+    assert parse_bind_addresses(env) == ["10.0.0.1", "100.64.0.1"]
+    for bad in ("0.0.0.0,10.0.0.1", "::1", "nope"):
+        env.write_text(f"STREMIO_BIND_ADDRS={bad}\n")
+        with pytest.raises(RuntimeError):
+            parse_bind_addresses(env)

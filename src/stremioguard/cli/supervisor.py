@@ -23,7 +23,7 @@ from pathlib import Path
 from loguru import logger
 
 from stremioguard.cli.context import ROOT_DIR, STATE_DIR, RunContext
-from stremioguard.config import CONFIG_ENV_KEYS
+from stremioguard.config import CONFIG_ENV_KEYS, LOCKOUT_FILE_NAME
 from stremioguard.env import atomic_write_text, fail
 
 WATCHDOG_UNIT = "stremioguard-watchdog.service"
@@ -33,8 +33,9 @@ BOOT_UNIT = "stremioguard.service"
 LEGACY_UNIT = "stremio-vpn-watch.service"
 
 # Restart policy: 5s, ~10s, ~20s ... capped at 5 min. The 7th start inside an
-# hour is refused, the unit fails, and OnFailure= runs the fail-safe. That
-# bounds the unwatched window to roughly five minutes of retries.
+# hour is refused, the unit fails, and OnFailure= runs the fail-safe. A crash
+# loop reaches it in about five minutes; a hang loop (each attempt waits out
+# WatchdogSec=) in about 35, which still lands inside the one-hour window.
 # RestartMode=direct is what keeps the fail-safe out of the retries: without
 # it systemd passes through "failed" on every crash and fires OnFailure= at
 # the first one (observed on systemd 255). It and RestartSteps= need 254.
@@ -45,8 +46,10 @@ RESTART_MAX_DELAY_SEC = 300
 START_LIMIT_INTERVAL_SEC = 3600
 START_LIMIT_BURST = 6
 # Upper bound on one watchdog tick (a Docker call, a cached image build)
-# before systemd treats the process as hung and restarts it.
-WATCHDOG_SEC = 600
+# before systemd treats the process as hung and restarts it. Six of these plus
+# the backoff must fit in START_LIMIT_INTERVAL_SEC, or a hang loop would never
+# hit the start limit and the fail-safe would never run.
+WATCHDOG_SEC = 300
 
 _DOCKER_CLIENT_KEYS = (
     "DOCKER_HOST",
@@ -434,6 +437,26 @@ def start_watchdog(context: RunContext, *, units_changed: bool) -> None:
             f"journalctl --user -u {WATCHDOG_UNIT} -n 50"
         )
     logger.success(f"Watchdog running under systemd as {WATCHDOG_UNIT} (PID {after.main_pid}).")
+
+
+def require_supervised_stack() -> None:
+    """Refuse a Comet-only lifecycle command outside a watched, unlocked stack.
+
+    `./stremio comet start|update apply|update rollback` start containers
+    directly. They are safe only while the watchdog is verifying the tunnel
+    and no lockout is in force; otherwise they would bypass both.
+    """
+    if (STATE_DIR / LOCKOUT_FILE_NAME).exists():
+        fail("A lockout is active; recover with `./stremio restart` or `./stremio unlock` first.")
+    try:
+        running = shutil.which("systemctl") is not None and unit_state(WATCHDOG_UNIT).running
+    except RuntimeError:
+        running = False
+    if not running:
+        fail(
+            f"The watchdog ({WATCHDOG_UNIT}) is not running. Use `./stremio start`, which "
+            "verifies the VPN and starts it, instead of changing Comet on its own."
+        )
 
 
 def stop_watchdog() -> bool:

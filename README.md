@@ -11,7 +11,7 @@ WSL2 host
      │    └── network namespace shared by:
      └── stremio  (tsaridas/stremio-docker)
 
-Python verifier (bin/stremio-vpn)
+Python verifier (./stremio → stremioguard.orchestrator)
 ├── polls gluetun health (docker inspect)
 ├── probes egress IP via docker exec gluetun wget
 └── stops stremio if either fails
@@ -115,8 +115,28 @@ automatically.
 - Local Comet runtime state lives under `.stremio/comet/`.
 - StremioGuard generates the Comet runtime `.env` plus mounted runtime overrides;
   it does not edit the upstream Comet checkout itself.
-- The managed override files are rendered by `scripts/generate_comet_overrides.py`,
-  which is also what the setup flow uses internally.
+- Comet reaches debrid services through a self-hosted
+  [StremThru](https://github.com/MunifTanjim/stremthru) container (`stremthru`),
+  pinned by digest. Comet's default is a public instance run by a third party,
+  which sees the debrid key in every request and has gone offline before. Ours
+  listens on `127.0.0.1:8080` inside gluetun's namespace, is never published,
+  has peering with the public instance and every optional feature turned off,
+  and gets a generated user (`.stremio/stremthru/stremthru.env`) so it never
+  prints an auto-generated admin password. `./stremio status` reports whether
+  Comet can reach it.
+- Extra sources beyond Torrentio and Zilean:
+  - `COMET_TORBOX_API_KEY` turns on TorBox's own search API
+    (`COMET_SCRAPE_TORBOX`, default `live` once a key is set). It finds what
+    TorBox already knows about, which is what turns "0 cached" into playable
+    results. The key is used server-side for searching only.
+  - `COMET_SCRAPE_DMM=live` searches a local copy of Debrid Media Manager's
+    hashlists and turns on Comet's ingester. Each ingest downloads the whole
+    archive (about 1.5 GB, through the VPN) on every Comet start and then every
+    `COMET_DMM_INGEST_INTERVAL_SECONDS` (default one week), and stores the
+    entries in Comet's Postgres database. The first import is slow by design.
+  - Scrape modes accept `live`, `background`, `both`, `true` or `false` (`off`
+    is accepted as `false`). Anything else is rejected, because Comet would
+    silently treat a typo as "disabled".
 - The default `COMET_TORRENTIO_URL` stays generic (`https://torrentio.strem.fun`)
   so setup does not require pasting a secret-bearing native Torrentio addon URL
   into the root `.env`.
@@ -288,6 +308,7 @@ With no arguments, `./stremio` behaves like `./stremio start`.
 
 - `stremio`, `comet`, `comet-postgres`, and `comet-gateway` use `restart: "no"` so Docker does not revive them before the verifier and validation checks have run.
 - `gluetun` uses `restart: unless-stopped` so it can recover across host reboots and transient handshake failures.
+- Every other third-party image (`stremthru`, `comet-gateway`'s nginx, `comet-postgres`, and the `docker compose up` gate's busybox) is pinned by digest; Dependabot proposes bumps, and Postgres majors stay manual because they need a data-directory upgrade. Comet is pinned by the generated override to the digest `./stremio comet update` promoted.
 - `gluetun` tracks the `qmcgaw/gluetun:v3` release channel (not `latest` master builds). Every `./stremio start`/`restart` best-effort pulls the newest v3 release before bringing gluetun up; a failed or slow pull only logs a warning and gluetun boots from the existing local image. A bad release fails closed: the watchdog holds all services down until gluetun is healthy and the IP check passes, and rolling back is re-pinning one line in `docker-compose.yml`.
 
 ### Useful commands
@@ -459,6 +480,10 @@ Defense-in-depth notes:
 - LAN discovery for Stremio (e.g., Chromecast, DLNA) is blocked by default. Set `FIREWALL_OUTBOUND_SUBNETS=192.168.x.0/24` in `.env` to allow your specific LAN range.
 - The host-level WSL connection itself is no longer routed through any VPN by default. Anything outside this Docker setup uses your home connection. Choose split tunneling at the WSL/Windows layer if you want broader coverage.
 - `WIREGUARD_PRIVATE_KEY` in `.env` is sensitive. The repo's `.gitignore` excludes `.env`; double-check before sharing dotfiles or backups.
+- gluetun does not read `.env` directly. `./stremio` writes its share to `.stremio/gluetun.env` (mode 0600) on every start: every line except StremioGuard's own settings (`COMET_*`, `STREMIO_*`, the watchdog tunables, and the Stremio container's `CASTING_DISABLED`, `EXTERNAL_BASE_URL` and `INTERNAL_MEDIA_BASE_URL`). StremioGuard keeps all its secrets under `COMET_`, so none of them sit in the VPN container's environment; any gluetun option you add to `.env` still reaches it.
+- Run logs in `logs/` record your home and tunnel IPs, so the directory is owner-only (0700) and each run log is 0600.
+- Comet's own startup log printed half of every secret it masked (the TorBox key, passwords, the public API token). A required patch makes it print `********` instead; see [docs/comet-patches.md](docs/comet-patches.md).
+- The gateway's access log keeps only its own admin paths (`/`, `/configure`, `/static/`, `/health`, `/admin`) readable and masks every other request path, so a raw Comet addon URL sent to it is not recorded.
 - Restarting gluetun mid-session (e.g., `docker compose restart gluetun`) leaves Stremio running but network-isolated until the watchdog's next tick stops it. Expected behavior of the netns-share model.
 
 ## Inbound access threat model

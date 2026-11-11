@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -92,9 +93,6 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(guard, "preflight", return_value=None),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
-                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
-                ),
-                mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
                     return_value=gateway_cfg,
                 ),
@@ -128,9 +126,6 @@ class OrchestratorTests(unittest.TestCase):
                     mock.patch.object(guard, "preflight", return_value=None),
                     mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                     mock.patch(
-                        "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
-                    ),
-                    mock.patch(
                         "stremioguard.comet_gateway.CometGatewayConfig.from_env",
                         return_value=gateway_cfg,
                     ),
@@ -162,9 +157,6 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(guard, "require_commands", return_value=None),
                 mock.patch.object(guard, "preflight", return_value=None),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
-                mock.patch(
-                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
-                ),
                 mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
                     return_value=gateway_cfg,
@@ -233,7 +225,7 @@ class OrchestratorTests(unittest.TestCase):
             prefix = compose_args_prefix(tmp_path)
             self.assertIn([*prefix, "stop", "stremio"], runner.calls)
             self.assertNotIn([*prefix, "up", "-d", "--no-deps", "stremio"], runner.calls)
-            self.assertEqual(orch.vpn_drop_count, 1)
+            self.assertEqual(orch.vpn_drops_since_summary, 1)
 
     def test_watch_once_stops_stremio_when_ip_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -370,9 +362,8 @@ class OrchestratorTests(unittest.TestCase):
             # Create a Stremio-disabled config
             cfg = make_config(tmp_path, stremio_enabled=False)
             guard = GluetunGuard(cfg, runner)
-            orch = Orchestrator(guard)
 
-            comet_cfg = make_comet_config(tmp_path, enabled=True)
+            comet_cfg = make_comet_config(tmp_path, enabled=True, gateway_enabled=True)
             write_minimal_bundle_manifest(comet_cfg)
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
@@ -381,22 +372,31 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(guard, "preflight", return_value=None),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
-                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
-                ),
-                mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
                     return_value=gateway_cfg,
                 ),
             ):
+                # Created under the mocks: the guard reads Comet config once.
+                orch = Orchestrator(guard)
                 orch.setup_active_services(reset=True)
 
             prefix = compose_args_prefix(tmp_path)
             self.assertIn([*prefix, "down", "--remove-orphans", "--timeout", "10"], runner.calls)
             self.assertIn(
-                [*prefix, "build", "comet", "comet-postgres", "comet-gateway"], runner.calls
+                [*prefix, "build", "comet-postgres", "stremthru", "comet", "comet-gateway"],
+                runner.calls,
             )
             self.assertIn(
-                [*prefix, "up", "-d", "--no-deps", "comet", "comet-postgres", "comet-gateway"],
+                [
+                    *prefix,
+                    "up",
+                    "-d",
+                    "--no-deps",
+                    "comet-postgres",
+                    "stremthru",
+                    "comet",
+                    "comet-gateway",
+                ],
                 runner.calls,
             )
             self.assertNotIn([*prefix, "build", "stremio"], runner.calls)
@@ -407,9 +407,8 @@ class OrchestratorTests(unittest.TestCase):
             runner = FakeRunner({})
             cfg = make_config(tmp_path, stremio_enabled=False)
             guard = GluetunGuard(cfg, runner)
-            orch = Orchestrator(guard)
 
-            comet_cfg = make_comet_config(tmp_path, enabled=True)
+            comet_cfg = make_comet_config(tmp_path, enabled=True, gateway_enabled=True)
             write_minimal_bundle_manifest(comet_cfg)
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
@@ -417,21 +416,21 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(guard, "gluetun_healthy", return_value=False),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
-                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
-                ),
-                mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
                     return_value=gateway_cfg,
                 ),
             ):
+                # Created under the mocks: the guard reads Comet config once.
+                orch = Orchestrator(guard)
                 orch.watch_once()
 
             prefix = compose_args_prefix(tmp_path)
             self.assertIn(
-                [*prefix, "stop", "comet", "comet-postgres", "comet-gateway"], runner.calls
+                [*prefix, "stop", "comet-postgres", "stremthru", "comet", "comet-gateway"],
+                runner.calls,
             )
             self.assertNotIn([*prefix, "stop", "stremio"], runner.calls)
-            self.assertEqual(orch.vpn_drop_count, 1)
+            self.assertEqual(orch.vpn_drops_since_summary, 1)
 
     def test_watch_once_auto_starts_comet_only_services_when_healthy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -439,9 +438,8 @@ class OrchestratorTests(unittest.TestCase):
             runner = FakeRunner({})
             cfg = make_config(tmp_path, stremio_enabled=False)
             guard = GluetunGuard(cfg, runner)
-            orch = Orchestrator(guard)
 
-            comet_cfg = make_comet_config(tmp_path, enabled=True)
+            comet_cfg = make_comet_config(tmp_path, enabled=True, gateway_enabled=True)
             write_minimal_bundle_manifest(comet_cfg)
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
@@ -453,13 +451,12 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(guard, "container_running", return_value=False),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
-                    "stremioguard.guard.CometGatewayConfig.from_env", return_value=gateway_cfg
-                ),
-                mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
                     return_value=gateway_cfg,
                 ),
             ):
+                # Created under the mocks: the guard reads Comet config once.
+                orch = Orchestrator(guard)
                 orch.watch_once()
 
             prefix = compose_args_prefix(tmp_path)
@@ -470,8 +467,9 @@ class OrchestratorTests(unittest.TestCase):
                     "-d",
                     "--no-deps",
                     "--build",
-                    "comet",
                     "comet-postgres",
+                    "stremthru",
+                    "comet",
                     "comet-gateway",
                 ],
                 runner.calls,
@@ -559,13 +557,13 @@ class OrchestratorTests(unittest.TestCase):
             with (
                 mock.patch.object(orch, "watch_once", side_effect=mock_watch_once),
                 mock.patch("stremioguard.orchestrator.time.sleep", side_effect=lambda s: None),
-                mock.patch.object(guard, "stop_active_services") as stop_mock,
+                mock.patch.object(guard, "stop_active_services", return_value=True) as stop_mock,
                 self.assertRaises(KeyboardInterrupt),
             ):
                 orch.watch_stremio()
 
             self.assertEqual(orch.consecutive_loop_errors, 3)
-            self.assertEqual(orch.loop_error_count, 3)
+            self.assertEqual(orch.loop_errors_since_summary, 3)
             stop_mock.assert_called_once()
 
     def test_watch_stremio_loop_escapes_exit_78(self) -> None:
@@ -974,7 +972,7 @@ class SupervisedWatchdogTests(unittest.TestCase):
             mock.patch.object(orchestrator_mod.time, "sleep", side_effect=fake_sleep) as sleep,
             mock.patch.object(orchestrator_mod, "notify") as notify,
         ):
-            Orchestrator._sleep_with_heartbeat(100)
+            Orchestrator._sleep(100, heartbeat=True)
         chunk = orchestrator_mod.HEARTBEAT_SLEEP_CHUNK_SECONDS
         self.assertTrue(all(call.args[0] <= chunk for call in sleep.call_args_list))
         self.assertEqual(notify.call_count, sleep.call_count)
@@ -1027,6 +1025,97 @@ class SupervisedWatchdogTests(unittest.TestCase):
             ):
                 orch.fail_safe()
 
+    def test_failed_tick_sends_no_heartbeat_even_while_sleeping(self) -> None:
+        # A watchdog that cannot check must look stalled to systemd.
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            with (
+                mock.patch.object(orch, "watch_once", side_effect=RuntimeError("bad .env")),
+                mock.patch.object(orchestrator_mod, "notify") as notify,
+            ):
+                self.assertFalse(orch._tick())
+                clock = {"now": 0.0}
+                with (
+                    mock.patch.object(
+                        orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]
+                    ),
+                    mock.patch.object(
+                        orchestrator_mod.time,
+                        "sleep",
+                        side_effect=lambda seconds: clock.update(now=clock["now"] + seconds),
+                    ),
+                ):
+                    Orchestrator._sleep(100, heartbeat=False)
+            notify.assert_not_called()
+
+    def test_successful_tick_sends_a_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            with (
+                mock.patch.object(orch, "watch_once"),
+                mock.patch.object(orchestrator_mod, "notify") as notify,
+            ):
+                self.assertTrue(orch._tick())
+            notify.assert_called_once_with("WATCHDOG=1")
+
+    def test_exits_when_it_can_neither_check_nor_confirm_a_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            orch.consecutive_loop_errors = 2
+            with (
+                mock.patch.object(orch, "watch_once", side_effect=RuntimeError("bad .env")),
+                mock.patch.object(orch.guard, "stop_active_services", return_value=False),
+                self.assertRaises(RuntimeError),
+            ):
+                orch._tick()
+
+    def test_keeps_looping_once_services_are_confirmed_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            orch.consecutive_loop_errors = 2
+            with (
+                mock.patch.object(orch, "watch_once", side_effect=RuntimeError("bad .env")),
+                mock.patch.object(orch.guard, "stop_active_services", return_value=True),
+            ):
+                self.assertFalse(orch._tick())
+
+    def test_outage_ticks_retry_a_stop_that_did_not_take(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._orchestrator(Path(directory))
+            orch.outage_started_at = orch.outage_start_wall = time.monotonic()
+            g = orch.guard
+            with (
+                mock.patch.object(g, "gluetun_healthy", return_value=False),
+                mock.patch.object(g, "gluetun_auth_failed", return_value=False),
+                mock.patch.object(g, "services_confirmed_stopped", return_value=False),
+                mock.patch.object(g, "stop_active_services") as stop,
+            ):
+                orch.watch_once()
+            stop.assert_called_once_with(services=["stremio"])
+
+    def test_teardown_ignores_a_dotenv_that_no_longer_parses(self) -> None:
+        calls: list[object] = []
+        real = orchestrator_mod.Config.from_env
+
+        def from_env(root_dir: Path | None = None, *, env_file: Path | None = None):
+            if env_file is None:
+                raise RuntimeError("Invalid WATCH_INTERVAL_SECONDS value")
+            return real(root_dir, env_file=env_file)
+
+        with (
+            mock.patch.object(orchestrator_mod.Config, "from_env", side_effect=from_env),
+            mock.patch.object(orchestrator_mod, "configure_file_logging"),
+        ):
+            orchestrator_mod._run_command(calls.append, teardown=True)
+            with self.assertRaises(RuntimeError):
+                orchestrator_mod._run_command(calls.append)
+        self.assertEqual(len(calls), 1)
+
+    def test_protected_services_come_from_compose_not_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = GluetunGuard(make_config(Path(directory)), FakeRunner({}))
+            self.assertEqual(guard.protected_services(), ["stremio"])
+
     def test_deferred_recovery_hands_the_lockout_to_the_watchdog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             orch = self._orchestrator(Path(directory))
@@ -1045,3 +1134,12 @@ class SupervisedWatchdogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_run_logs_are_owner_only(tmp_path: Path) -> None:
+    from stremioguard.orchestrator import configure_file_logging
+
+    log_file = tmp_path / "logs" / "run.log"
+    configure_file_logging(make_config(tmp_path, log_file=log_file))
+    assert (tmp_path / "logs").stat().st_mode & 0o777 == 0o700
+    assert log_file.stat().st_mode & 0o777 == 0o600

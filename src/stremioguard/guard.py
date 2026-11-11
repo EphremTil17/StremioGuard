@@ -11,21 +11,25 @@ import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from enum import Enum
+from functools import cached_property
+from pathlib import Path
 
 from loguru import logger
 
-from stremioguard.comet_gateway import CometGatewayConfig
 from stremioguard.config import (
-    DEFAULT_STREMIO_CONTAINER_PORT,
-    DEFAULT_STREMIO_HOST_PORT,
+    COMET_GATEWAY_SERVICE,
+    GENERATED_COMPOSE_FILE,
     MANAGED_STACK_ENV,
     CometConfig,
     Config,
     Runner,
     SubprocessRunner,
+    compose_command,
+    parse_bind_addresses,
     parse_public_ip,
+    service_container_id,
 )
-from stremioguard.env import atomic_write_text, env_file_value, env_int_value
+from stremioguard.env import atomic_write_text, env_file_value
 from stremioguard.preflight import (
     require_docker,
     require_matching_daemon,
@@ -35,6 +39,8 @@ from stremioguard.publishing import StackPublisher
 from stremioguard.resolver import nordvpn_endpoint_env
 
 HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
+# docker-compose.yml's `docker compose up` guard; it is not a protected service.
+COMPOSE_GATE_SERVICE = "use-stremio-start-instead"
 GLUETUN_PULL_TIMEOUT_SECONDS = 180
 
 
@@ -64,6 +70,19 @@ LOCKOUT_REMEDIATION = {
 DEFAULT_LOCKOUT_REMEDIATION = (
     "Verify network connectivity/provider status, then run `./stremio restart`."
 )
+
+
+def read_lockout_marker(path: Path) -> dict[str, object] | None:
+    """The marker's details, or None when it is absent or unreadable.
+
+    Only for display: the marker's existence alone is what blocks starts, so
+    a corrupt marker still locks out.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class GluetunUnavailableError(RuntimeError):
@@ -104,15 +123,7 @@ class GluetunGuard:
             logger.info(line)
 
     def read_vpn_lockout(self) -> dict[str, object] | None:
-        if not self.config.vpn_lockout_file.exists():
-            return None
-        try:
-            data = json.loads(self.config.vpn_lockout_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-        except (json.JSONDecodeError, OSError):
-            pass
-        return None
+        return read_lockout_marker(self.config.vpn_lockout_file)
 
     def check_vpn_lockout(self, *, allow_recovery: bool = False) -> None:
         if not self.config.vpn_lockout_file.exists():
@@ -174,81 +185,38 @@ class GluetunGuard:
                     f"{error}. Refusing to resume services while a stale lockout marker remains."
                 ) from error
 
-    def bind_addresses(self) -> list[str]:
-        raw = env_file_value(self._env_path, "STREMIO_BIND_ADDRS")
-        if raw is None:
-            raw = "127.0.0.1"
-
-        addresses: list[str] = []
-        for item in raw.split(","):
-            candidate = item.strip()
-            if not candidate:
-                continue
-            try:
-                ip = ipaddress.ip_address(candidate)
-            except ValueError as error:
-                raise RuntimeError(f"Invalid STREMIO_BIND_ADDRS value: {candidate!r}") from error
-            if ip.version != 4:
-                raise RuntimeError(
-                    f"Only IPv4 bind addresses are supported for Stremio publishing: {candidate}"
-                )
-            normalized = str(ip)
-            if normalized not in addresses:
-                addresses.append(normalized)
-
-        return addresses
-
-    def stremio_host_port(self) -> int:
-        return env_int_value(
-            self._env_path, "STREMIO_HOST_PORT", DEFAULT_STREMIO_HOST_PORT, minimum=1, maximum=65535
-        )
-
-    def stremio_container_port(self) -> int:
-        return env_int_value(
-            self._env_path,
-            "STREMIO_CONTAINER_PORT",
-            DEFAULT_STREMIO_CONTAINER_PORT,
-            minimum=1,
-            maximum=65535,
-        )
-
     def write_compose_override(self) -> None:
-        publisher = StackPublisher(self.config.root_dir, self.config.compose_override_file)
+        publisher = StackPublisher(self.config.root_dir)
         publisher.publish()
 
+    @cached_property
+    def _comet_config(self) -> CometConfig:
+        # Read once per process: the watchdog applies .env changes on restart,
+        # like every other setting, instead of re-parsing it every tick.
+        return CometConfig.from_env(self.config.root_dir)
+
     def deployment_profile(self) -> str:
-        comet_config = CometConfig.from_env(self.config.root_dir)
-        if self.config.stremio_enabled and comet_config.enabled:
+        comet_enabled = self._comet_config.enabled
+        if self.config.stremio_enabled and comet_enabled:
             return "Unified"
-        elif comet_config.enabled:
+        elif comet_enabled:
             return "Comet-Only"
         elif self.config.stremio_enabled:
             return "Stremio-Only"
         return "Unknown"
 
     def enabled_runtime_services(self) -> list[str]:
-        services = []
-        if self.config.stremio_enabled:
-            services.append("stremio")
-        comet_config = CometConfig.from_env(self.config.root_dir)
-        if comet_config.enabled:
-            services.extend(["comet", "comet-postgres"])
-            gateway_config = CometGatewayConfig.from_env(self.config.root_dir)
-            if gateway_config.enabled:
-                services.append("comet-gateway")
+        services = ["stremio"] if self.config.stremio_enabled else []
+        if self._comet_config.enabled:
+            services.extend(self._comet_config.runtime_services)
         return services
 
     def enabled_public_services(self) -> list[str]:
-        services = []
-        if self.config.stremio_enabled:
-            services.append("stremio")
-        comet_config = CometConfig.from_env(self.config.root_dir)
-        if comet_config.enabled:
-            gateway_config = CometGatewayConfig.from_env(self.config.root_dir)
-            if gateway_config.enabled:
-                services.append("comet-gateway")
-            else:
-                services.append("comet")
+        services = ["stremio"] if self.config.stremio_enabled else []
+        if self._comet_config.enabled:
+            services.append(
+                COMET_GATEWAY_SERVICE if self._comet_config.gateway_enabled else "comet"
+            )
         return services
 
     def require_commands(self) -> None:
@@ -260,7 +228,7 @@ class GluetunGuard:
         )
         require_matching_daemon(
             self.runner,
-            self.config.compose_override_file.parent / "daemon-id",
+            self.config.root_dir / ".stremio" / "daemon-id",
             warn=self.warn,
         )
 
@@ -298,24 +266,10 @@ class GluetunGuard:
         )
 
     def _compose_command(self, *args: str) -> list[str]:
-        override = self.config.compose_override_file
-        override_args = ["-f", str(override)] if override.exists() else []
-        return [
-            "docker",
-            "compose",
-            "-f",
-            str(self.config.compose_file),
-            *override_args,
-            *args,
-        ]
+        return compose_command(self.config.root_dir, *args)
 
     def service_container_id(self, service: str) -> str | None:
-        result = self.runner.run(self._compose_command("ps", "-q", service), check=False)
-        if result.returncode != 0:
-            return None
-        return next(
-            (line.strip() for line in (result.stdout or "").splitlines() if line.strip()), None
-        )
+        return service_container_id(self.runner, self.config.root_dir, service)
 
     def gluetun_healthy(self) -> bool:
         container_id = self.service_container_id("gluetun")
@@ -584,7 +538,9 @@ class GluetunGuard:
         if os.environ.get("SKIP_BIND_PREFLIGHT") == "1":
             self.log("SKIP_BIND_PREFLIGHT=1 is set; skipping bind address validation.")
             return
-        verify_bind_addresses(self.runner, self.bind_addresses(), log=self.log, warn=self.warn)
+        verify_bind_addresses(
+            self.runner, parse_bind_addresses(self._env_path), log=self.log, warn=self.warn
+        )
 
     def refresh_gluetun_image(self) -> None:
         """Best-effort `compose pull gluetun` so every start/restart tracks
@@ -597,7 +553,7 @@ class GluetunGuard:
         """
         self.log("Checking the gluetun release channel for a newer image.")
         try:
-            if not self.config.compose_override_file.exists():
+            if not (self.config.root_dir / GENERATED_COMPOSE_FILE).exists():
                 self.write_compose_override()
             result = self.runner.run(
                 self._compose_command("pull", "gluetun"),
@@ -686,20 +642,25 @@ class GluetunGuard:
                 return True
         return False
 
+    def running_services(self, services: list[str]) -> set[str] | None:
+        """Which of ``services`` Docker reports running, in one query.
+
+        None when Docker cannot answer: callers decide whether that counts
+        as running (stop paths) or not (start paths).
+        """
+        result = self.runner.run(
+            self._compose_command("ps", "--status", "running", "--services", *services),
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return set((result.stdout or "").split()) & set(services)
+
     def container_running(self, services: list[str] | None = None) -> bool:
         if services is None:
             services = self.enabled_runtime_services()
-        for service in services:
-            container_id = self.service_container_id(service)
-            if not container_id:
-                return False
-            result = self.runner.run(
-                ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
-                check=False,
-            )
-            if result.returncode != 0 or (result.stdout or "").strip().lower() != "true":
-                return False
-        return True
+        running = self.running_services(services)
+        return running is not None and running >= set(services)
 
     def start_services(
         self, services: list[str], *, build: bool = False, check: bool = True
@@ -721,21 +682,32 @@ class GluetunGuard:
     def services_confirmed_stopped(self, services: list[str]) -> bool:
         """Whether Docker positively reports none of ``services`` running.
 
-        A failed query is not proof of a stopped container, so it counts as
-        still running here; ``container_running`` alone treats it as stopped.
+        A failed query is not proof of a stopped container.
         """
-        result = self.runner.run(
-            self._compose_command("ps", "--status", "running", "-q", *services), check=False
-        )
-        return result.returncode == 0 and not (result.stdout or "").strip()
+        return self.running_services(services) == set()
+
+    def protected_services(self) -> list[str]:
+        """Every service in the Compose project except gluetun and the gate.
+
+        Read from Compose, not .env: stopping must keep working when a .env
+        edit no longer parses, and stopping a disabled service is harmless.
+        """
+        result = self.runner.run(self._compose_command("config", "--services"), check=True)
+        return [
+            service
+            for service in (result.stdout or "").split()
+            if service not in {"gluetun", COMPOSE_GATE_SERVICE}
+        ]
 
     def stop_active_services(self, services: list[str] | None = None) -> bool:
-        """Stop ``services`` and return whether the shutdown was verified."""
+        """Stop ``services`` (default: all protected) and return whether that was verified."""
         if services is None:
-            services = self.enabled_runtime_services()
-        running_services = [s for s in services if self.container_running([s])]
-        if not running_services:
-            return self.services_confirmed_stopped(services)
+            services = self.protected_services()
+        running = self.running_services(services)
+        if running == set():
+            return True
+        # Unknown state: stop everything named rather than guess.
+        running_services = [s for s in services if running is None or s in running]
         self.log(f"Stopping active services: {', '.join(running_services)}.")
         result = self.compose("stop", *running_services, check=False)
         if result.returncode == 0 and self.services_confirmed_stopped(running_services):

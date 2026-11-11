@@ -303,7 +303,7 @@ class GluetunGuardTests(unittest.TestCase):
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
             with (
                 mock.patch.dict(guard_mod.os.environ, {"SKIP_BIND_PREFLIGHT": "1"}),
-                mock.patch.object(guard, "bind_addresses") as mock_bind,
+                mock.patch.object(guard_mod, "parse_bind_addresses") as mock_bind,
             ):
                 guard.check_bind_addresses()
                 mock_bind.assert_not_called()
@@ -313,7 +313,9 @@ class GluetunGuardTests(unittest.TestCase):
             tmp_path = Path(directory)
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
             with (
-                mock.patch.object(guard, "bind_addresses", return_value=["127.0.0.1", "0.0.0.0"]),
+                mock.patch.object(
+                    guard_mod, "parse_bind_addresses", return_value=["127.0.0.1", "0.0.0.0"]
+                ),
                 mock.patch.object(guard.runner, "run") as mock_run,
             ):
                 guard.check_bind_addresses()
@@ -324,7 +326,7 @@ class GluetunGuardTests(unittest.TestCase):
             tmp_path = Path(directory)
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
             with (
-                mock.patch.object(guard, "bind_addresses", return_value=["10.0.0.5"]),
+                mock.patch.object(guard_mod, "parse_bind_addresses", return_value=["10.0.0.5"]),
                 mock.patch.object(preflight_mod.time, "sleep"),
                 mock.patch.object(
                     guard.runner,
@@ -346,7 +348,7 @@ class GluetunGuardTests(unittest.TestCase):
             tmp_path = Path(directory)
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
             with (
-                mock.patch.object(guard, "bind_addresses", return_value=["100.0.0.5"]),
+                mock.patch.object(guard_mod, "parse_bind_addresses", return_value=["100.0.0.5"]),
                 mock.patch.object(preflight_mod.time, "sleep"),
                 mock.patch.object(
                     guard.runner,
@@ -589,7 +591,9 @@ class ComposeOverrideBootstrapTests(unittest.TestCase):
 
     def _guard(self, tmp_path: Path, runner: FakeRunner) -> GluetunGuard:
         config = make_config(tmp_path)
-        config.compose_override_file.unlink()  # never published yet
+        (
+            config.root_dir / ".stremio" / "docker-compose.bindings.yml"
+        ).unlink()  # never published yet
         return GluetunGuard(config, runner)
 
     def test_compose_omits_a_missing_override_file(self) -> None:
@@ -616,7 +620,9 @@ class ComposeOverrideBootstrapTests(unittest.TestCase):
             with mock.patch.object(guard, "write_compose_override") as publish:
                 guard.compose_instance_exists()
             publish.assert_not_called()
-            self.assertFalse(guard.config.compose_override_file.exists())
+            self.assertFalse(
+                (guard.config.root_dir / ".stremio" / "docker-compose.bindings.yml").exists()
+            )
 
 
 class DaemonIdentityTests(unittest.TestCase):
@@ -778,14 +784,20 @@ class DaemonIdentityTests(unittest.TestCase):
             guard = GluetunGuard(make_config(tmp_path), runner)
 
             # When containers are NOT running, compose stop is skipped
-            with mock.patch.object(guard, "container_running", return_value=False):
-                guard.stop_active_services(["stremio"])
+            with mock.patch.object(guard, "running_services", return_value=set()):
+                self.assertTrue(guard.stop_active_services(["stremio"]))
             prefix = compose_args_prefix(tmp_path)
             self.assertNotIn([*prefix, "stop", "stremio"], runner.calls)
 
             # When containers ARE running, compose stop is executed
-            with mock.patch.object(guard, "container_running", return_value=True):
-                guard.stop_active_services(["stremio"])
+            with mock.patch.object(guard, "running_services", side_effect=[{"stremio"}, set()]):
+                self.assertTrue(guard.stop_active_services(["stremio"]))
+            self.assertIn([*prefix, "stop", "stremio"], runner.calls)
+
+            # When Docker cannot say, stop everything named rather than guess
+            runner.calls.clear()
+            with mock.patch.object(guard, "running_services", return_value=None):
+                self.assertFalse(guard.stop_active_services(["stremio"]))
             self.assertIn([*prefix, "stop", "stremio"], runner.calls)
 
     def test_stop_and_restart_gluetun_methods(self) -> None:
@@ -884,7 +896,7 @@ class DaemonIdentityTests(unittest.TestCase):
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
 
             with (
-                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "running_services", side_effect=[{"stremio"}, set()]),
                 mock.patch.object(guard, "success") as mock_success,
             ):
                 self.assertTrue(guard.stop_active_services(["stremio"]))
@@ -1187,3 +1199,15 @@ class EgressAssessmentTests(unittest.TestCase):
             with mock.patch.object(guard_mod.urllib.request, "build_opener", return_value=Opener()):
                 self.assertEqual(guard.public_ip(version=4), "198.51.100.10")
                 self.assertEqual(guard.public_ip(), "2001:db8::1")
+
+
+def test_running_check_is_one_query_and_unknown_is_not_running(tmp_path: Path) -> None:
+    runner = FakeRunner({})
+    guard = GluetunGuard(make_config(tmp_path), runner)
+    assert guard.container_running(["comet", "stremthru"]) is True
+    assert len(runner.calls) == 1
+    query = (*compose_args_prefix(tmp_path), "ps", "--status", "running", "--services", "comet")
+    runner.responses[query] = completed([], returncode=1)
+    assert guard.running_services(["comet"]) is None
+    assert guard.container_running(["comet"]) is False
+    assert guard.services_confirmed_stopped(["comet"]) is False

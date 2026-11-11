@@ -20,7 +20,10 @@ from .conftest import (
     COMET_API_APP_SOURCE,
     make_comet_config,
     make_comet_gateway_config,
+    record_test_digest,
     write_comet_api_app,
+    write_comet_logger,
+    write_required_comet_sources,
 )
 
 
@@ -139,6 +142,7 @@ class TestOverridesBundle(unittest.TestCase):
                 "skipped": [],
                 "outputs": {
                     "app.py": "/app/comet/api/app.py",
+                    "logger.py": "/app/comet/core/logger.py",
                     "formatting.py": "/app/comet/utils/formatting.py",
                     "stream.py": "/app/comet/api/endpoints/stream.py",
                     "media_search.py": "/app/comet/services/media_search.py",
@@ -148,6 +152,7 @@ class TestOverridesBundle(unittest.TestCase):
                 json.dumps(manifest), encoding="utf-8"
             )
 
+            record_test_digest(comet_cfg.state_dir)
             # Run StackPublisher
             pub = StackPublisher(root)
             with (
@@ -608,7 +613,7 @@ class RenderApiAppOverrideTests(unittest.TestCase):
     def test_request_log_uses_route_template_not_raw_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_comet_api_app(root)
+            write_required_comet_sources(root)
             rendered = render_api_app_override(root)
 
         self.assertNotIn("request.url.path", rendered)
@@ -622,7 +627,7 @@ class RenderApiAppOverrideTests(unittest.TestCase):
         # Execute the patched logger against a real addon path shape.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_comet_api_app(root)
+            write_required_comet_sources(root)
             rendered = render_api_app_override(root)
 
         namespace: dict[str, object] = {}
@@ -644,6 +649,7 @@ class RenderApiAppOverrideTests(unittest.TestCase):
     def test_unknown_log_shape_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            write_comet_logger(root)
             write_comet_api_app(
                 root,
                 COMET_API_APP_SOURCE.replace("{request.url.path} - ", "{request.url} - "),
@@ -654,6 +660,8 @@ class RenderApiAppOverrideTests(unittest.TestCase):
     def test_missing_sanitizer_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            write_comet_logger(root)
+            write_comet_logger(root)
             write_comet_api_app(
                 root, COMET_API_APP_SOURCE.replace("def _metrics_route", "def _route_label")
             )

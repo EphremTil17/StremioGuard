@@ -5,10 +5,11 @@ import subprocess
 import typer
 from loguru import logger
 
+from stremioguard.cli import supervisor
 from stremioguard.cli.commands.general import is_interactive
 from stremioguard.cli.context import ROOT_DIR, _comet_manager
 from stremioguard.comet import CometManager, prompt_comet_setup
-from stremioguard.config import CometConfig, Config
+from stremioguard.config import CometConfig, compose_command
 from stremioguard.env import env_file_value, fail
 
 
@@ -50,6 +51,7 @@ def comet_install(
 
 def comet_start() -> None:
     """Start the Comet stack managed by StremioGuard."""
+    supervisor.require_supervised_stack()
     manager = _comet_manager()
     manager.start()
 
@@ -97,23 +99,10 @@ def comet_logs(
 ) -> None:
     """Tail the Comet service logs."""
     manager = _comet_manager()
-    manager.prepare_runtime()
-    root_config = Config.from_env()
     subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-f",
-            str(root_config.compose_file),
-            "-f",
-            str(root_config.compose_override_file),
-            "logs",
-            "-f",
-            "--tail",
-            str(lines),
-            manager.config.service_name,
-            manager.config.postgres_service_name,
-        ],
+        compose_command(
+            ROOT_DIR, "logs", "-f", "--tail", str(lines), *manager.config.runtime_services
+        ),
         check=False,
     )
 

@@ -9,6 +9,7 @@ import json
 import typer
 from loguru import logger
 
+from stremioguard.cli import supervisor
 from stremioguard.cli.commands.general import is_interactive
 from stremioguard.cli.context import _comet_manager
 from stremioguard.comet.manager import CometManager
@@ -96,6 +97,7 @@ def comet_update_check(
 
 def comet_update_apply() -> None:
     """Promote the last validated candidate to active and restart the Comet stack."""
+    supervisor.require_supervised_stack()
     manager = _comet_manager()
     state = manager.load_state()
     candidate = state.candidate
@@ -131,6 +133,7 @@ def comet_update_rollback(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ) -> None:
     """Roll Comet back to the previously active image, one step deep."""
+    supervisor.require_supervised_stack()
     manager = _comet_manager()
     state = manager.load_state()
     if not state.previous_digest:

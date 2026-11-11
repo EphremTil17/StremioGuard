@@ -19,12 +19,13 @@ class CometStateTests(unittest.TestCase):
             self.assertIsNone(state.candidate)
             self.assertIsNone(state.last_remote_check)
 
-    def test_load_corrupt_json_returns_defaults(self) -> None:
+    def test_load_corrupt_json_fails_instead_of_dropping_the_pin(self) -> None:
+        # An empty state would make the next start bootstrap `:latest`.
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             path.write_text("{not valid json", encoding="utf-8")
-            state = CometState.load(path)
-            self.assertIsNone(state.active_digest)
+            with self.assertRaises(RuntimeError):
+                CometState.load(path)
 
     def test_save_and_load_round_trips_without_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -25,12 +25,28 @@ from stremioguard.env import (
 # working. Setting it by hand is the documented override.
 MANAGED_STACK_ENV = "STREMIOGUARD_MANAGED"
 GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
+# gluetun's share of .env (see publishing.render_gluetun_env).
+GLUETUN_ENV_FILE = ".stremio/gluetun.env"
 DEFAULT_COMET_HOST_PORT = 18000
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
 CIRCUIT_BREAKER_EXIT_CODE = 78
 DEFAULT_VPN_RECOVERY_BUDGET_SECONDS = 300
 DEFAULT_VPN_RESTART_CADENCE_SECONDS = 45
 DEFAULT_VPN_FAILOVER_ESCALATION_RATIO = 0.5
+LOCKOUT_FILE_NAME = "vpn-lockout"
+
+# Comet reaches every debrid service through StremThru. Ours runs in gluetun's
+# namespace on loopback (docker-compose.yml sets the same listen address) and
+# is never published, so the debrid key in each request only leaves the host
+# towards the debrid service itself, through the tunnel.
+STREMTHRU_SERVICE = "stremthru"
+STREMTHRU_INTERNAL_URL = "http://127.0.0.1:8080"
+COMET_GATEWAY_SERVICE = "comet-gateway"
+# Comet's per-scraper context: `true` is Comet's alias for `both`; `off` is
+# accepted and stored as `false`. Comet silently disables a scraper on any
+# other value, so a typo is rejected here instead.
+SCRAPE_MODES = frozenset({"live", "background", "both", "true", "false"})
+DEFAULT_DMM_INGEST_INTERVAL_SECONDS = 7 * 24 * 3600
 
 # Watchdog tunables: read by `_tunable_int` from the process environment
 # (bare or STREMIO_-prefixed) or from .env.
@@ -50,18 +66,11 @@ CONFIG_ENV_KEYS = (
     "STREMIO_RUN_ID",
     "STREMIO_LOG_FILE",
     "STREMIO_LOG_SESSION",
-    "COMPOSE_FILE",
-    "COMPOSE_OVERRIDE_FILE",
-    "SERVICE_NAME",
-    "CONTAINER_NAME",
-    "GLUETUN_CONTAINER_NAME",
     "GLUETUN_HEALTHY_TIMEOUT_SECONDS",
     "PUBLIC_IP_TIMEOUT_SECONDS",
-    "HOME_IP_FILE",
     "EXPECTED_VPN_IP",
     "INSTALL_MISSING_DEPS",
     "IP_CHECK_URLS",
-    "VPN_LOCKOUT_FILE",
     *TUNABLE_KEYS,
     *(f"STREMIO_{key}" for key in TUNABLE_KEYS),
 )
@@ -77,6 +86,18 @@ def parse_public_ip(text: str) -> str | None:
         return None
 
 
+def compose_command(root_dir: Path, *args: str) -> list[str]:
+    """`docker compose` for this stack, the one way every caller builds it.
+
+    The base file plus the generated override once it exists. Paths come
+    from the checkout, never the environment: an exported COMPOSE_FILE from
+    another project must not point the watchdog at a different stack.
+    """
+    override = root_dir / GENERATED_COMPOSE_FILE
+    override_args = ["-f", str(override)] if override.exists() else []
+    return ["docker", "compose", "-f", str(root_dir / "docker-compose.yml"), *override_args, *args]
+
+
 class Runner(Protocol):
     def run(
         self,
@@ -87,6 +108,13 @@ class Runner(Protocol):
         timeout: float | None = None,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
+
+
+def service_container_id(runner: Runner, root_dir: Path, service: str) -> str | None:
+    result = runner.run(compose_command(root_dir, "ps", "-q", service), check=False)
+    if result.returncode != 0:
+        return None
+    return next((line.strip() for line in (result.stdout or "").splitlines() if line.strip()), None)
 
 
 class SubprocessRunner:
@@ -158,11 +186,6 @@ def _tunable_int(env_file: Path, key: str, default: int, *, minimum: int = 1) ->
 @dataclass(frozen=True)
 class Config:
     root_dir: Path
-    compose_file: Path
-    compose_override_file: Path
-    service_name: str
-    container_name: str
-    gluetun_container_name: str
     gluetun_healthy_timeout_seconds: int
     watch_interval_seconds: int
     watchdog_log_interval_seconds: int
@@ -187,11 +210,12 @@ class Config:
     server_categories: str | None
 
     @classmethod
-    def from_env(cls, root_dir: Path | None = None) -> Config:
+    def from_env(cls, root_dir: Path | None = None, *, env_file: Path | None = None) -> Config:
         # Optional root mirrors CometConfig.from_env, so callers (and tests)
         # can point at a directory other than the installed checkout.
+        # `env_file` lets teardown ignore a .env that no longer parses.
         root_dir = root_dir or Path(__file__).resolve().parent.parent.parent
-        env_file = root_dir / ".env"
+        env_file = env_file or root_dir / ".env"
         stremio_enabled = env_flag_enabled("STREMIO_ENABLED", True, env_path=env_file)
         comet_enabled = env_flag_enabled("COMET_ENABLED", False, env_path=env_file)
         if not stremio_enabled and not comet_enabled:
@@ -205,13 +229,6 @@ class Config:
 
         return cls(
             root_dir=root_dir,
-            compose_file=Path(os.environ.get("COMPOSE_FILE", root_dir / "docker-compose.yml")),
-            compose_override_file=Path(
-                os.environ.get("COMPOSE_OVERRIDE_FILE", root_dir / GENERATED_COMPOSE_FILE)
-            ),
-            service_name=os.environ.get("SERVICE_NAME", "stremio"),
-            container_name=os.environ.get("CONTAINER_NAME", "stremio-server"),
-            gluetun_container_name=os.environ.get("GLUETUN_CONTAINER_NAME", "gluetun"),
             gluetun_healthy_timeout_seconds=int(
                 os.environ.get("GLUETUN_HEALTHY_TIMEOUT_SECONDS", "60")
             ),
@@ -221,7 +238,7 @@ class Config:
                 env_file, "WATCHDOG_LOG_INTERVAL_SECONDS", 300, minimum=0
             ),
             public_ip_timeout_seconds=int(os.environ.get("PUBLIC_IP_TIMEOUT_SECONDS", "8")),
-            home_ip_file=Path(os.environ.get("HOME_IP_FILE", root_dir / ".stremio" / "home-ip")),
+            home_ip_file=root_dir / ".stremio" / "home-ip",
             expected_vpn_ip=os.environ.get("EXPECTED_VPN_IP") or None,
             install_missing=os.environ.get("INSTALL_MISSING_DEPS", "0") in {"1", "true", "yes"},
             run_id=run_id,
@@ -246,15 +263,26 @@ class Config:
             vpn_restart_cadence_seconds=_tunable_int(
                 env_file, "VPN_RESTART_CADENCE_SECONDS", DEFAULT_VPN_RESTART_CADENCE_SECONDS
             ),
-            vpn_lockout_file=Path(
-                os.environ.get("VPN_LOCKOUT_FILE", root_dir / ".stremio" / "vpn-lockout")
-            ),
+            # Fixed, not overridable: every process (CLI, watchdog, fail-safe,
+            # systemd) must agree on where the lockout lives.
+            vpn_lockout_file=root_dir / ".stremio" / LOCKOUT_FILE_NAME,
             server_countries=env_file_value(env_file, "SERVER_COUNTRIES"),
             server_regions=env_file_value(env_file, "SERVER_REGIONS"),
             server_cities=env_file_value(env_file, "SERVER_CITIES"),
             server_hostnames=env_file_value(env_file, "SERVER_HOSTNAMES"),
             server_categories=env_file_value(env_file, "SERVER_CATEGORIES"),
         )
+
+
+def _scrape_mode(env_file: Path, key: str, default: str) -> str:
+    mode = (env_file_value(env_file, key) or default).strip().lower()
+    if mode == "off":
+        mode = "false"
+    if mode not in SCRAPE_MODES:
+        raise RuntimeError(
+            f"Invalid {key} value: {mode!r}; expected one of {', '.join(sorted(SCRAPE_MODES))}"
+        )
+    return mode
 
 
 def _validate_public_url(value: str | None, *, key: str) -> None:
@@ -278,10 +306,16 @@ def _validate_image_repository(value: str, *, key: str) -> str:
     return value
 
 
-def parse_ipv4_csv(raw: str | None, *, default: list[str]) -> list[str]:
+def parse_bind_addresses(env_file: Path) -> list[str]:
+    """STREMIO_BIND_ADDRS: the host addresses published ports bind to.
+
+    The single parser for publishing, Comet config and the bind preflight.
+    Unset means loopback only; an empty value publishes nothing.
+    """
+    raw = env_file_value(env_file, "STREMIO_BIND_ADDRS")
     if raw is None:
-        return default
-    values: list[str] = []
+        return ["127.0.0.1"]
+    addresses: list[str] = []
     for item in raw.split(","):
         candidate = item.strip()
         if not candidate:
@@ -289,13 +323,16 @@ def parse_ipv4_csv(raw: str | None, *, default: list[str]) -> list[str]:
         try:
             ip = ipaddress.ip_address(candidate)
         except ValueError as error:
-            raise RuntimeError(f"Invalid IP address value: {candidate!r}") from error
+            raise RuntimeError(f"Invalid STREMIO_BIND_ADDRS value: {candidate!r}") from error
         if ip.version != 4:
-            raise RuntimeError(f"Only IPv4 addresses are supported here: {candidate}")
-        normalized = str(ip)
-        if normalized not in values:
-            values.append(normalized)
-    return values
+            raise RuntimeError(
+                f"Only IPv4 bind addresses are supported for Stremio publishing: {candidate}"
+            )
+        if str(ip) not in addresses:
+            addresses.append(str(ip))
+    if "0.0.0.0" in addresses and len(addresses) > 1:
+        raise RuntimeError("STREMIO_BIND_ADDRS cannot combine 0.0.0.0 with specific bind addresses")
+    return addresses
 
 
 @dataclass(frozen=True)
@@ -305,7 +342,6 @@ class CometConfig:
     vendor_dir: Path
     lock_file: Path
     repo_dir: Path
-    compose_source_file: Path
     state_dir: Path
     runtime_env_file: Path
     data_dir: Path
@@ -313,7 +349,6 @@ class CometConfig:
     service_name: str
     postgres_service_name: str
     container_name: str
-    postgres_container_name: str
     host_port: int
     bind_addresses: tuple[str, ...]
     public_base_url: str | None
@@ -340,6 +375,26 @@ class CometConfig:
     # Log files outside StremioGuard (e.g. a reverse proxy's) that the log
     # canary must also verify.
     log_canary_globs: tuple[str, ...] = ()
+    scrape_torbox: str = "false"
+    torbox_api_key: str | None = None
+    # Searching DMM needs the ingester's local copy, so one setting drives both.
+    scrape_dmm: str = "false"
+    dmm_ingest_interval_seconds: int = DEFAULT_DMM_INGEST_INTERVAL_SECONDS
+
+    @property
+    def stremthru_state_dir(self) -> Path:
+        return self.state_dir.parent / STREMTHRU_SERVICE
+
+    @property
+    def runtime_services(self) -> list[str]:
+        """Every Compose service the Comet stack runs, dependencies first.
+
+        The one list that starting, stopping, status and the watchdog share.
+        """
+        services = [self.postgres_service_name, STREMTHRU_SERVICE, self.service_name]
+        if self.gateway_enabled:
+            services.append(COMET_GATEWAY_SERVICE)
+        return services
 
     @classmethod
     def from_env(cls, root_dir: Path | None = None) -> CometConfig:
@@ -385,16 +440,7 @@ class CometConfig:
             key="COMET_GATEWAY_PUBLIC_BASE_URL",
         )
 
-        bind_addresses = tuple(
-            parse_ipv4_csv(
-                env_file_value(env_file, "STREMIO_BIND_ADDRS"),
-                default=["127.0.0.1"],
-            )
-        )
-        if "0.0.0.0" in bind_addresses and len(bind_addresses) > 1:
-            raise RuntimeError(
-                "STREMIO_BIND_ADDRS cannot combine 0.0.0.0 with specific bind addresses"
-            )
+        bind_addresses = tuple(parse_bind_addresses(env_file))
         configured_ports = [
             (stremio_host_port, "STREMIO_HOST_PORT"),
             (host_port, "COMET_HOST_PORT"),
@@ -414,11 +460,26 @@ class CometConfig:
             env_file, "COMET_HEALTHCHECK_INTERVAL_SECONDS", 300, minimum=1
         )
         configure_page_password = env_file_value(env_file, "COMET_CONFIGURE_PAGE_PASSWORD") or None
-        scrape_torrentio = (env_file_value(env_file, "COMET_SCRAPE_TORRENTIO") or "live").strip()
+        scrape_torrentio = _scrape_mode(env_file, "COMET_SCRAPE_TORRENTIO", "live")
         torrentio_url = (
             env_file_value(env_file, "COMET_TORRENTIO_URL") or "https://torrentio.strem.fun"
         ).strip()
-        scrape_zilean = (env_file_value(env_file, "COMET_SCRAPE_ZILEAN") or "live").strip()
+        scrape_zilean = _scrape_mode(env_file, "COMET_SCRAPE_ZILEAN", "live")
+        torbox_api_key = env_file_value(env_file, "COMET_TORBOX_API_KEY") or None
+        # TorBox's search API needs an account key; searching is the default
+        # once one is configured.
+        scrape_torbox = _scrape_mode(
+            env_file, "COMET_SCRAPE_TORBOX", "live" if torbox_api_key else "false"
+        )
+        if scrape_torbox != "false" and not torbox_api_key:
+            raise RuntimeError("COMET_SCRAPE_TORBOX needs COMET_TORBOX_API_KEY to be set")
+        scrape_dmm = _scrape_mode(env_file, "COMET_SCRAPE_DMM", "false")
+        dmm_ingest_interval_seconds = env_int_value(
+            env_file,
+            "COMET_DMM_INGEST_INTERVAL_SECONDS",
+            DEFAULT_DMM_INGEST_INTERVAL_SECONDS,
+            minimum=3600,
+        )
         zilean_url = (
             env_file_value(env_file, "COMET_ZILEAN_URL")
             or "https://zileanfortheweebs.midnightignite.me"
@@ -440,7 +501,6 @@ class CometConfig:
             vendor_dir=root_dir / "vendor",
             lock_file=root_dir / "vendor" / "comet.lock.json",
             repo_dir=root_dir / "vendor" / "comet",
-            compose_source_file=root_dir / "vendor" / "comet" / "deployment" / "docker-compose.yml",
             state_dir=root_dir / ".stremio" / "comet",
             runtime_env_file=root_dir / ".stremio" / "comet" / ".env",
             data_dir=root_dir / ".stremio" / "comet" / "data",
@@ -448,7 +508,6 @@ class CometConfig:
             service_name="comet",
             postgres_service_name="comet-postgres",
             container_name="comet",
-            postgres_container_name="comet-postgres",
             host_port=host_port,
             bind_addresses=bind_addresses,
             public_base_url=public_base_url,
@@ -478,4 +537,8 @@ class CometConfig:
             gateway_token_length=gateway_token_length,
             gateway_enabled=gateway_enabled,
             log_canary_globs=log_canary_globs,
+            scrape_torbox=scrape_torbox,
+            torbox_api_key=torbox_api_key,
+            scrape_dmm=scrape_dmm,
+            dmm_ingest_interval_seconds=dmm_ingest_interval_seconds,
         )

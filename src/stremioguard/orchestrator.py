@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from types import FrameType
 
 import typer
@@ -22,6 +23,7 @@ from stremioguard.config import (
     docker_daemon_help,
     docker_permission_help,
 )
+from stremioguard.env import ensure_directory
 from stremioguard.guard import GluetunGuard, LockoutActiveError, PublicIPAssessment
 from stremioguard.sdnotify import notify
 
@@ -33,6 +35,7 @@ app = typer.Typer(
 
 # Upper bound on one sleep between heartbeats; far below the unit's WatchdogSec.
 HEARTBEAT_SLEEP_CHUNK_SECONDS = 30.0
+LOOP_ERRORS_BEFORE_STOP = 3
 
 logger.remove()
 if os.environ.get("STREMIO_BACKGROUND") != "1":
@@ -51,16 +54,12 @@ class Orchestrator:
         self.started_at = time.monotonic()
         self.summary_started_at = self.started_at
         self.last_public_ip: str | None = None
-        self.vpn_drop_count = 0
-        self.public_ip_failure_count = 0
         self.checks_since_summary = 0
         self.auto_starts_since_summary = 0
-        self.container_missing_since_summary = 0
         self.vpn_drops_since_summary = 0
         self.public_ip_failures_since_summary = 0
         self.consecutive_loop_errors = 0
         self.consecutive_ip_unknowns = 0
-        self.loop_error_count = 0
         self.loop_errors_since_summary = 0
         self.outage_started_at: float | None = None
         self.outage_start_wall: float | None = None
@@ -79,7 +78,6 @@ class Orchestrator:
             "Session metadata "
             f"run_id={cfg.run_id} "
             f"deployment_profile={self.guard.deployment_profile()} "
-            f"gluetun_service={cfg.gluetun_container_name} "
             f"watch_interval_seconds={cfg.watch_interval_seconds} "
             f"watchdog_log_interval_seconds={cfg.watchdog_log_interval_seconds}"
         )
@@ -196,39 +194,56 @@ class Orchestrator:
 
     def _watch_loop(self) -> None:
         while True:
-            try:
-                self.watch_once()
-                self.consecutive_loop_errors = 0
-            except (typer.Exit, SystemExit, KeyboardInterrupt):
-                raise
-            except Exception:
-                logger.exception("Watchdog loop iteration encountered an error.")
-                self.consecutive_loop_errors += 1
-                self.loop_error_count += 1
-                self.loop_errors_since_summary += 1
-                if self.consecutive_loop_errors >= 3:
-                    self.guard.warn(
-                        f"Watchdog has encountered {self.consecutive_loop_errors} consecutive "
-                        "loop errors. Attempting to stop active services to fail closed."
-                    )
-                    try:
-                        self.guard.stop_active_services()
-                    except Exception:
-                        logger.exception(
-                            "Failed to stop active services during loop error fallback."
-                        )
-            # A heartbeat per completed tick: systemd's WatchdogSec= bounds
-            # how long one tick (e.g. a hung Docker call) may take.
-            notify("WATCHDOG=1")
-            self._sleep_with_heartbeat(self.guard.config.watch_interval_seconds)
+            healthy = self._tick()
+            self._sleep(self.guard.config.watch_interval_seconds, heartbeat=healthy)
+
+    def _tick(self) -> bool:
+        """Run one check; return whether it completed.
+
+        Heartbeats follow completed checks only. A watchdog that keeps failing
+        is not watching, so systemd must see it stall (WatchdogSec=), restart
+        it, and hand over to the fail-safe if that keeps happening.
+        """
+        try:
+            self.watch_once()
+        except (typer.Exit, SystemExit, KeyboardInterrupt):
+            raise
+        except Exception:
+            logger.exception("Watchdog loop iteration encountered an error.")
+            self.consecutive_loop_errors += 1
+            self.loop_errors_since_summary += 1
+            if self.consecutive_loop_errors >= LOOP_ERRORS_BEFORE_STOP:
+                self._stop_after_loop_errors()
+            return False
+        self.consecutive_loop_errors = 0
+        notify("WATCHDOG=1")
+        return True
+
+    def _stop_after_loop_errors(self) -> None:
+        self.guard.warn(
+            f"Watchdog has encountered {self.consecutive_loop_errors} consecutive "
+            "loop errors. Attempting to stop active services to fail closed."
+        )
+        try:
+            stopped = self.guard.stop_active_services()
+        except Exception:
+            logger.exception("Failed to stop active services during loop error fallback.")
+            stopped = False
+        if not stopped:
+            # Neither checking nor stopping works: exit so systemd restarts us
+            # now, rather than idling until the heartbeat deadline.
+            raise RuntimeError(
+                "Watchdog can neither run its checks nor confirm the services stopped."
+            )
 
     @staticmethod
-    def _sleep_with_heartbeat(seconds: float) -> None:
+    def _sleep(seconds: float, *, heartbeat: bool) -> None:
         """Sleep, still pinging systemd when the interval exceeds the deadline."""
         deadline = time.monotonic() + seconds
         while (remaining := deadline - time.monotonic()) > 0:
             time.sleep(min(remaining, HEARTBEAT_SLEEP_CHUNK_SECONDS))
-            notify("WATCHDOG=1")
+            if heartbeat:
+                notify("WATCHDOG=1")
 
     def _trip_circuit_breaker(self, reason: str) -> None:
         elapsed = (
@@ -260,7 +275,6 @@ class Orchestrator:
         if assessment == PublicIPAssessment.UNSAFE_DEFINITIVE:
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
             g.warn("Definitive leak / unsafe IP detected. Stopping active services immediately.")
-            self.public_ip_failure_count += 1
             self.public_ip_failures_since_summary += 1
             self.consecutive_ip_unknowns = 0
             g.stop_active_services(services=services)
@@ -278,7 +292,6 @@ class Orchestrator:
                     f"Public IP check has failed {self.consecutive_ip_unknowns} consecutive times. "
                     "Stopping active services to fail closed."
                 )
-                self.public_ip_failure_count += 1
                 self.public_ip_failures_since_summary += 1
                 g.stop_active_services(services=services)
             self._maybe_log_summary()
@@ -298,7 +311,6 @@ class Orchestrator:
                 self.outage_start_wall = now_wall
                 self.last_auth_check_wall = now_wall
                 self.last_restart_at = now_mono
-                self.vpn_drop_count += 1
                 self.vpn_drops_since_summary += 1
                 g.warn(
                     "Gluetun is not healthy. Outage detected; entering recovery window "
@@ -313,6 +325,11 @@ class Orchestrator:
                 g.restart_gluetun()
                 self._maybe_log_summary()
                 return
+
+            # The first tick's stop may have failed; never sit out an outage
+            # with services up.
+            if not g.services_confirmed_stopped(services):
+                g.stop_active_services(services=services)
 
             # Incremental bounded log check since previous probe
             check_since = self.last_auth_check_wall or self.outage_start_wall
@@ -415,7 +432,6 @@ class Orchestrator:
             f"checks={self.checks_since_summary} "
             f"last_public_ip={self.last_public_ip or 'unavailable'} "
             f"auto_starts={self.auto_starts_since_summary} "
-            f"container_missing={self.container_missing_since_summary} "
             f"vpn_drops={self.vpn_drops_since_summary} "
             f"public_ip_failures={self.public_ip_failures_since_summary} "
             f"loop_errors={self.loop_errors_since_summary} "
@@ -424,7 +440,6 @@ class Orchestrator:
         self.summary_started_at = now
         self.checks_since_summary = 0
         self.auto_starts_since_summary = 0
-        self.container_missing_since_summary = 0
         self.vpn_drops_since_summary = 0
         self.public_ip_failures_since_summary = 0
         self.loop_errors_since_summary = 0
@@ -514,7 +529,10 @@ class Orchestrator:
 def configure_file_logging(config: Config) -> None:
     if not config.log_file:
         return
-    config.log_file.parent.mkdir(parents=True, exist_ok=True)
+    # Run logs record the home and tunnel IPs: owner-only. The directory mode
+    # also covers files the sink creates later on rotation.
+    ensure_directory(config.log_file.parent)
+    config.log_file.touch(mode=0o600, exist_ok=True)
     logger.add(
         config.log_file,
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | stremio-vpn | {message}",
@@ -526,8 +544,17 @@ def configure_file_logging(config: Config) -> None:
     logger.info(f"Writing run log to {config.log_file}")
 
 
-def _run_command(action: Callable[[Orchestrator], None]) -> None:
-    config = Config.from_env()
+def _run_command(action: Callable[[Orchestrator], None], *, teardown: bool = False) -> None:
+    try:
+        config = Config.from_env()
+    except (RuntimeError, ValueError) as error:
+        if not teardown:
+            raise
+        # Stopping is never less safe; a .env that no longer parses must not
+        # block it. Paths do not come from .env, so the defaults reach the
+        # same stack.
+        logger.warning(f"Ignoring .env for teardown: {error}")
+        config = Config.from_env(env_file=Path(os.devnull))
     configure_file_logging(config)
     guard = GluetunGuard(config)
     orch = Orchestrator(guard)
@@ -602,7 +629,7 @@ def watchdog() -> None:
 @app.command(hidden=True)
 def failsafe() -> None:
     """Lock out and stop protected services after watchdog supervision failed."""
-    _run_command(lambda o: o.fail_safe())
+    _run_command(lambda o: o.fail_safe(), teardown=True)
 
 
 @app.command()
@@ -611,9 +638,10 @@ def stop() -> None:
 
     def _stop(o: Orchestrator) -> None:
         o.guard.require_commands()
-        o.guard.stop_active_services()
+        if not o.guard.stop_active_services():
+            raise RuntimeError("Protected services could not be confirmed stopped.")
 
-    _run_command(_stop)
+    _run_command(_stop, teardown=True)
 
 
 @app.command()

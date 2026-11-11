@@ -158,6 +158,12 @@ class UpdateCheckTests(unittest.TestCase):
 
 
 class UpdateApplyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # A watched, unlocked stack; SupervisedStackGateTests covers the refusals.
+        gate = mock.patch.object(comet_update_mod.supervisor, "require_supervised_stack")
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_refuses_without_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = _manager(Path(directory))
@@ -254,6 +260,12 @@ class UpdateApplyTests(unittest.TestCase):
 
 
 class UpdateRollbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # A watched, unlocked stack; SupervisedStackGateTests covers the refusals.
+        gate = mock.patch.object(comet_update_mod.supervisor, "require_supervised_stack")
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_refuses_without_previous_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = _manager(Path(directory))
@@ -304,3 +316,59 @@ class UpdateRollbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SupervisedStackGateTests(unittest.TestCase):
+    """Comet-only lifecycle commands start containers directly; they must not
+    bypass the lockout or run without the watchdog."""
+
+    def _running_watchdog(self, running: bool):
+        from stremioguard.cli import supervisor
+
+        state = supervisor.UnitState(
+            "loaded",
+            "active",
+            "running" if running else "dead",
+            42 if running else 0,
+            "0",
+            "success",
+            "static",
+        )
+        return mock.patch.object(supervisor, "unit_state", return_value=state)
+
+    def test_refuses_while_a_lockout_is_active(self) -> None:
+        from stremioguard.cli import supervisor
+
+        (supervisor.STATE_DIR / "vpn-lockout").write_text("{}", encoding="utf-8")
+        with self._running_watchdog(True), self.assertRaises(typer.Exit):
+            supervisor.require_supervised_stack()
+
+    def test_refuses_without_a_running_watchdog(self) -> None:
+        from stremioguard.cli import supervisor
+
+        with (
+            self._running_watchdog(False),
+            mock.patch.object(supervisor.shutil, "which", return_value="/usr/bin/systemctl"),
+            self.assertRaises(typer.Exit),
+        ):
+            supervisor.require_supervised_stack()
+
+    def test_allows_a_watched_unlocked_stack(self) -> None:
+        from stremioguard.cli import supervisor
+
+        with (
+            self._running_watchdog(True),
+            mock.patch.object(supervisor.shutil, "which", return_value="/usr/bin/systemctl"),
+        ):
+            supervisor.require_supervised_stack()
+
+    def test_apply_checks_the_gate_before_touching_anything(self) -> None:
+        with (
+            mock.patch.object(
+                comet_update_mod.supervisor, "require_supervised_stack", side_effect=typer.Exit(1)
+            ),
+            mock.patch.object(comet_update_mod, "_comet_manager") as manager,
+            self.assertRaises(typer.Exit),
+        ):
+            comet_update_mod.comet_update_apply()
+        manager.assert_not_called()

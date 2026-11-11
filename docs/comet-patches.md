@@ -57,6 +57,7 @@ Each patch is managed as a declarative spec with an explicit requirement class:
 | `filtering` | Permissively filters branded/multilingual titles | `OPTIONAL` | Falls back to stock strict title matching. |
 | `formatter` | Curated TV-safe emoji/text layout | `OPTIONAL` | Stream labels default to upstream format layout. |
 | `orchestration` | Preserves episode-pack season priority and badges | `OPTIONAL` | Season pack items are dropped or ranked below single files. |
+| `logger` | Secret redaction in the startup log: upstream's `censor()` printed the first half of every secret (the TorBox key, admin and configure-page passwords, database credentials) and the protected API prefix showed ten characters of the public API token. Both now print a fixed `********` | `REQUIRED` | Hard failure; a candidate whose masking code moved is rejected rather than allowed to leak. |
 | `api_app` | Hardened API key management: logs each request's route template (`/s/{token}/{b64config}/…`, via upstream's `_metrics_route`) instead of the raw path containing user credentials | `REQUIRED` | Hard failure; a drifted candidate is rejected to enforce hardened API key management. |
 
 ### Canary & PR Flow for Maintainers
@@ -97,6 +98,7 @@ The generated files currently include:
 - `config.py`
 - `index.html`
 - `app.py`
+- `logger.py`
 
 ## Current Patch Logic
 

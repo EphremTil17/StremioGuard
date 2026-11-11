@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 import sys
@@ -22,7 +21,7 @@ from stremioguard.cli.context import (
 )
 from stremioguard.cli.toolchain import _require_uv, _uv_command, run_guard
 from stremioguard.comet import prompt_comet_setup
-from stremioguard.config import Config
+from stremioguard.config import CIRCUIT_BREAKER_EXIT_CODE, Config
 from stremioguard.env import (
     env_flag_enabled,
     env_needs_init,
@@ -30,6 +29,7 @@ from stremioguard.env import (
     read_env_provider,
     write_env_setting,
 )
+from stremioguard.guard import read_lockout_marker
 from stremioguard.init import (
     configure_external_access,
     configure_optional_stremio_settings,
@@ -240,8 +240,7 @@ def start() -> None:
     # watchdog that systemd can keep alive.
     units_changed = supervisor.prepare_supervision()
     context = RunContext.create()
-    run_guard("start", context=context)
-    supervisor.start_watchdog(context, units_changed=units_changed)
+    _run_guard_then_watch("start", context, units_changed=units_changed)
 
 
 def restart() -> None:
@@ -251,7 +250,22 @@ def restart() -> None:
     if not supervisor.stop_watchdog():
         fail("The watchdog could not be confirmed stopped; refusing to reset the stack under it.")
     context = RunContext.create()
-    run_guard("reset", context=context)
+    _run_guard_then_watch("reset", context, units_changed=units_changed)
+
+
+def _run_guard_then_watch(action: str, context: RunContext, *, units_changed: bool) -> None:
+    """Run a lifecycle action, then start the watchdog even if the action failed.
+
+    A start that fails halfway can leave some containers running; they must not
+    run unwatched. Only an active lockout (exit 78) skips the watchdog, which
+    would refuse to run under it anyway.
+    """
+    try:
+        run_guard(action, context=context)
+    except typer.Exit as error:
+        if error.exit_code != CIRCUIT_BREAKER_EXIT_CODE:
+            supervisor.start_watchdog(context, units_changed=units_changed)
+        raise
     supervisor.start_watchdog(context, units_changed=units_changed)
 
 
@@ -301,18 +315,13 @@ def record_home_ip() -> None:
 
 def unlock() -> None:
     """Inspect and clear an active VPN lockout marker."""
-    # The same path the guard writes and checks, VPN_LOCKOUT_FILE included.
+    # The same path the guard writes and checks.
     lockout_file = Config.from_env(ROOT_DIR).vpn_lockout_file
     if not lockout_file.exists():
         logger.info("No VPN lockout is active.")
         return
 
-    try:
-        data = json.loads(lockout_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    data = read_lockout_marker(lockout_file) or {}
 
     timestamp = data.get("timestamp", "unknown")
     reason = data.get("reason", "unknown")

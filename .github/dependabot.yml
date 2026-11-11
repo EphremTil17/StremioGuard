@@ -37,6 +37,31 @@ updates:
         patterns:
           - "*"
 
+  # Digest-pinned compose images. gluetun follows its v3 release channel on
+  # purpose, and Comet's digest is promoted by `./stremio comet update`.
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:15"
+      timezone: "America/Los_Angeles"
+    labels:
+      - "dependencies"
+      - "docker"
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: "build"
+    allow:
+      - dependency-name: "muniftanjim/stremthru"
+      - dependency-name: "nginx"
+      - dependency-name: "postgres"
+      - dependency-name: "busybox"
+    ignore:
+      # A Postgres major needs pg_upgrade on the data directory, not a new image.
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+
   - package-ecosystem: "pip"
     directory: "/"
     schedule:

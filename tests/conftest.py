@@ -94,7 +94,15 @@ class FakeRunner:
         elif response is not None:
             result = response
         else:
-            if len(args) >= 3 and args[-3:] == ["ps", "-q", args[-1]]:
+            if "--status" in args and "--services" in args:
+                # Everything asked about is running, like the inspect default.
+                services = args[args.index("--services") + 1 :]
+                result = subprocess.CompletedProcess(args, 0, "\n".join(services) + "\n", "")
+            elif args[-2:] == ["config", "--services"]:
+                # A Stremio-only project: what `protected_services` reads.
+                services = "use-stremio-start-instead\ngluetun\nstremio\n"
+                result = subprocess.CompletedProcess(args, 0, services, "")
+            elif len(args) >= 3 and args[-3:] == ["ps", "-q", args[-1]]:
                 result = subprocess.CompletedProcess(args, 0, f"{args[-1]}\n", "")
             elif len(args) >= 4 and args[:4] == ["docker", "inspect", "-f", "{{.State.Running}}"]:
                 result = subprocess.CompletedProcess(args, 0, "true\n", "")
@@ -126,11 +134,6 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
     (state_dir / "docker-compose.bindings.yml").touch()
     values: dict[str, object] = {
         "root_dir": tmp_path,
-        "compose_file": tmp_path / "docker-compose.yml",
-        "compose_override_file": tmp_path / ".stremio" / "docker-compose.bindings.yml",
-        "service_name": "stremio",
-        "container_name": "stremio-server",
-        "gluetun_container_name": "gluetun",
         "gluetun_healthy_timeout_seconds": 1,
         "watch_interval_seconds": 1,
         "watchdog_log_interval_seconds": 300,
@@ -178,7 +181,6 @@ def make_comet_config(tmp_path: Path, **overrides: object) -> CometConfig:
         "vendor_dir": tmp_path / "vendor",
         "lock_file": tmp_path / "vendor" / "comet.lock.json",
         "repo_dir": tmp_path / "vendor" / "comet",
-        "compose_source_file": tmp_path / "vendor" / "comet" / "deployment" / "docker-compose.yml",
         "state_dir": state_dir,
         "runtime_env_file": state_dir / ".env",
         "data_dir": state_dir / "data",
@@ -186,7 +188,6 @@ def make_comet_config(tmp_path: Path, **overrides: object) -> CometConfig:
         "service_name": "comet",
         "postgres_service_name": "comet-postgres",
         "container_name": "comet",
-        "postgres_container_name": "comet-postgres",
         "host_port": 18000,
         "bind_addresses": ("127.0.0.1",),
         "public_base_url": None,
@@ -230,16 +231,28 @@ def make_comet_gateway_config(tmp_path: Path, **overrides: object) -> CometGatew
     return CometGatewayConfig(**values)  # type: ignore[arg-type]
 
 
+TEST_COMET_DIGEST = "sha256:" + "a" * 64
+
+
+def record_test_digest(state_dir: Path) -> None:
+    """A bootstrapped deployment: the publisher refuses to render without one."""
+    from stremioguard.comet.state import STATE_FILE_NAME, CometState
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    CometState(active_digest=TEST_COMET_DIGEST).save(state_dir / STATE_FILE_NAME)
+
+
 def write_minimal_bundle_manifest(comet_config: CometConfig) -> None:
-    """Satisfy StackPublisher's fail-closed manifest check in orchestration tests."""
+    """Satisfy StackPublisher's fail-closed manifest and digest-pin checks."""
     import json
 
-    comet_config.state_dir.mkdir(parents=True, exist_ok=True)
+    record_test_digest(comet_config.state_dir)
     (comet_config.state_dir / "bundle-manifest.json").write_text(
         json.dumps(
             {
                 "outputs": {
                     "app.py": "/app/comet/api/app.py",
+                    "logger.py": "/app/comet/core/logger.py",
                     "stream.py": "/app/comet/api/endpoints/stream.py",
                     "media_search.py": "/app/comet/services/media_search.py",
                     "config.py": "/app/comet/api/endpoints/config.py",
@@ -276,10 +289,39 @@ async def dispatch(request, method, status_code, process_time):
 """
 
 
-API_APP_OUTPUT = {"app.py": "/app/comet/api/app.py"}
+# The upstream shape of the masking sites the logger override patches.
+COMET_LOGGER_SOURCE = """\
+def censor(text: str):
+    if not text:
+        return ""
+    half = len(text) // 2
+    return text[:half] + "*" * (len(text) - half)
+
+
+def preview(token_value):
+    return f"{token_value[:6]}...{token_value[-4:]}"
+"""
+
+# Manifest outputs every bundle must carry, whatever the deployment shape.
+REQUIRED_PATCH_OUTPUTS = {
+    "app.py": "/app/comet/api/app.py",
+    "logger.py": "/app/comet/core/logger.py",
+}
 
 
 def write_comet_api_app(repo_root: Path, source: str = COMET_API_APP_SOURCE) -> None:
     app_file = repo_root / "comet" / "api" / "app.py"
     app_file.parent.mkdir(parents=True, exist_ok=True)
     app_file.write_text(source, encoding="utf-8")
+
+
+def write_comet_logger(repo_root: Path, source: str = COMET_LOGGER_SOURCE) -> None:
+    logger_file = repo_root / "comet" / "core" / "logger.py"
+    logger_file.parent.mkdir(parents=True, exist_ok=True)
+    logger_file.write_text(source, encoding="utf-8")
+
+
+def write_required_comet_sources(repo_root: Path) -> None:
+    """Upstream files every required override patches."""
+    write_comet_api_app(repo_root)
+    write_comet_logger(repo_root)

@@ -13,6 +13,7 @@ from stremioguard.overrides.api_app import render_api_app_override
 from stremioguard.overrides.config import render_config_override
 from stremioguard.overrides.filtering import render_filtering_override
 from stremioguard.overrides.formatter import render_formatter_override
+from stremioguard.overrides.logger import render_logger_override
 from stremioguard.overrides.media_search import render_media_search_override
 from stremioguard.overrides.orchestration import render_orchestration_override
 from stremioguard.overrides.stream import render_stream_override
@@ -50,12 +51,6 @@ class SkippedOverride:
     reason: str
 
 
-@dataclass(frozen=True)
-class BundleReport:
-    applied: list[str]
-    skipped: list[SkippedOverride]
-
-
 SPECS = [
     OverrideSpec(
         name="api_app",
@@ -64,6 +59,14 @@ SPECS = [
         output_name="app.py",
         requirement=Requirement.REQUIRED,
         render=lambda repo_dir, ctx: render_api_app_override(repo_dir),
+    ),
+    OverrideSpec(
+        name="logger",
+        feature="secret redaction in the startup log",
+        container_path="/app/comet/core/logger.py",
+        output_name="logger.py",
+        requirement=Requirement.REQUIRED,
+        render=lambda repo_dir, ctx: render_logger_override(repo_dir),
     ),
     OverrideSpec(
         name="formatter",
