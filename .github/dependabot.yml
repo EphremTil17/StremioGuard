@@ -62,7 +62,9 @@ updates:
       - dependency-name: "postgres"
         update-types: ["version-update:semver-major"]
 
-  - package-ecosystem: "pip"
+  # uv, not pip: the pip ecosystem bumps pyproject.toml but leaves uv.lock
+  # stale, so every merged update needed a manual relock.
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
