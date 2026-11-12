@@ -60,6 +60,13 @@ STACK_LOCK_MAX_DEFER_SECONDS = 600
 # Long enough to outlast one watchdog tick that is starting services.
 LIFECYCLE_LOCK_WAIT_SECONDS = 300
 TEARDOWN_LOCK_WAIT_SECONDS = 60
+# A summary window in which nothing happened is only a liveness heartbeat;
+# logging one every WATCHDOG_LOG_INTERVAL_SECONDS buried every real event in
+# `./stremio logs` under identical lines. Eventful windows still log on the
+# regular interval.
+QUIET_SUMMARY_INTERVAL_SECONDS = 3600
+# While a failure persists, repeat its warning at most this often.
+REPEAT_WARNING_SECONDS = 300
 
 logger.remove()
 if os.environ.get("STREMIO_BACKGROUND") != "1":
@@ -78,6 +85,9 @@ class Orchestrator:
         self.started_at = time.monotonic()
         self.summary_started_at = self.started_at
         self.last_public_ip: str | None = None
+        # The public IP the last logged summary reported.
+        self.summary_public_ip: str | None = None
+        self.ip_failure_warned_at: float | None = None
         self.checks_since_summary = 0
         self.auto_starts_since_summary = 0
         self.vpn_drops_since_summary = 0
@@ -440,17 +450,34 @@ class Orchestrator:
         elif assessment == PublicIPAssessment.UNKNOWN:
             self.consecutive_ip_unknowns += 1
             limit = self.guard.config.public_ip_failure_threshold
-            g.warn(
-                f"Public IP check returned UNKNOWN "
-                f"({self.consecutive_ip_unknowns}/{limit} consecutive failures)."
-            )
-            if self.consecutive_ip_unknowns >= self.guard.config.public_ip_failure_threshold:
-                self.last_public_ip = g.last_observed_ip or self.last_public_ip
+            if self.consecutive_ip_unknowns < limit:
                 g.warn(
-                    f"Public IP check has failed {self.consecutive_ip_unknowns} consecutive times. "
-                    "Stopping active services to fail closed."
+                    f"Public IP check returned UNKNOWN "
+                    f"({self.consecutive_ip_unknowns}/{limit} consecutive failures)."
                 )
+            else:
+                self.last_public_ip = g.last_observed_ip or self.last_public_ip
                 self.public_ip_failures_since_summary += 1
+                # The stop below runs on every tick (it is silent once the
+                # services are confirmed stopped); only the warning is
+                # rate-limited, so an hour-long checker outage is a dozen
+                # lines rather than seven hundred.
+                now = time.monotonic()
+                if self.consecutive_ip_unknowns == limit:
+                    self.ip_failure_warned_at = now
+                    g.warn(
+                        f"Public IP check has failed {self.consecutive_ip_unknowns} consecutive "
+                        "times. Stopping active services to fail closed."
+                    )
+                elif (
+                    self.ip_failure_warned_at is None
+                    or now - self.ip_failure_warned_at >= REPEAT_WARNING_SECONDS
+                ):
+                    self.ip_failure_warned_at = now
+                    g.warn(
+                        f"Public IP check is still failing ({self.consecutive_ip_unknowns} "
+                        "consecutive checks); active services stay stopped."
+                    )
                 g.stop_active_services(services=services)
             self._maybe_log_summary()
 
@@ -679,7 +706,10 @@ class Orchestrator:
             self._handle_unhealthy_ip_assessment(assessment, services)
             return
 
+        if self.consecutive_ip_unknowns >= g.config.public_ip_failure_threshold > 0:
+            g.log(f"Public IP check recovered after {self.consecutive_ip_unknowns} failures.")
         self.consecutive_ip_unknowns = 0
+        self.ip_failure_warned_at = None
         self.consecutive_leak_verdicts = 0
         self.last_public_ip = g.last_observed_ip or self.last_public_ip
 
@@ -690,13 +720,40 @@ class Orchestrator:
 
         self._maybe_log_summary()
 
+    def _summary_eventful(self) -> bool:
+        """Whether the current window has anything an operator would want to see."""
+        return bool(
+            # A long outage drops each counter back to zero after its first
+            # window; it is still news until it ends.
+            self.outage_started_at is not None
+            or self.consecutive_ip_unknowns
+            or self.auto_starts_since_summary
+            or self.vpn_drops_since_summary
+            or self.namespace_rejoins_since_summary
+            or self.public_ip_failures_since_summary
+            or self.loop_errors_since_summary
+            or self.last_public_ip != self.summary_public_ip
+        )
+
     def _maybe_log_summary(self) -> None:
+        """Log the window summary: on the interval when something happened,
+        hourly as a heartbeat when nothing did, every tick when the interval is 0.
+
+        A quiet window that is not yet due keeps accumulating, so the
+        heartbeat's `checks` covers the whole quiet hour.
+        """
         now = time.monotonic()
         interval = self.guard.config.watchdog_log_interval_seconds
-        if interval > 0 and now - self.summary_started_at < interval:
-            return
+        elapsed = now - self.summary_started_at
+        if interval > 0:
+            if elapsed < interval:
+                return
+            if not self._summary_eventful() and elapsed < max(
+                interval, QUIET_SUMMARY_INTERVAL_SECONDS
+            ):
+                return
 
-        summary_seconds = int(now - self.summary_started_at)
+        summary_seconds = int(elapsed)
         self.guard.log(
             "Watchdog summary "
             f"window_seconds={summary_seconds} "
@@ -710,6 +767,7 @@ class Orchestrator:
             f"uptime_seconds={self.elapsed_seconds()}"
         )
         self.summary_started_at = now
+        self.summary_public_ip = self.last_public_ip
         self.checks_since_summary = 0
         self.auto_starts_since_summary = 0
         self.vpn_drops_since_summary = 0

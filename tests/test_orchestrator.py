@@ -313,6 +313,140 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(orch.checks_since_summary, 0)
             self.assertEqual(orch.summary_started_at, 16.0)
 
+    def _run_healthy_ticks(
+        self, orch: Orchestrator, guard: GluetunGuard, ticks: int, *, step: float = 10.0
+    ) -> list[str]:
+        """Run steady-state ticks `step` seconds apart; return the summary lines logged."""
+        clock = {"now": 1000.0}
+        orch.summary_started_at = clock["now"]
+
+        def advance() -> float:
+            return clock["now"]
+
+        messages: list[str] = []
+        with (
+            mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=advance),
+            mock.patch.object(guard, "gluetun_healthy", return_value=True),
+            mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
+            mock.patch.object(guard, "container_running", return_value=True),
+            mock.patch.object(guard, "log", side_effect=messages.append),
+        ):
+            for _ in range(ticks):
+                clock["now"] += step
+                orch.watch_once()
+        return [m for m in messages if "Watchdog summary" in m]
+
+    def test_quiet_windows_log_only_an_hourly_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = GluetunGuard(
+                make_config(Path(directory), watchdog_log_interval_seconds=300), FakeRunner({})
+            )
+            orch = Orchestrator(guard)
+            orch.last_public_ip = orch.summary_public_ip = "203.0.113.20"
+
+            # Two hours of 10 s ticks in which nothing happens.
+            summaries = self._run_healthy_ticks(orch, guard, 720)
+
+            self.assertEqual(len(summaries), 2)
+            self.assertIn("window_seconds=3600 checks=360 ", summaries[0])
+
+    def test_first_summary_and_ip_change_log_on_the_regular_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = GluetunGuard(
+                make_config(Path(directory), watchdog_log_interval_seconds=300), FakeRunner({})
+            )
+            orch = Orchestrator(guard)
+            orch.last_public_ip = "203.0.113.20"  # never reported yet
+
+            summaries = self._run_healthy_ticks(orch, guard, 30)
+            self.assertEqual(len(summaries), 1)
+            self.assertIn("window_seconds=300 ", summaries[0])
+
+            orch.last_public_ip = "203.0.113.99"  # the VPN moved servers
+            summaries = self._run_healthy_ticks(orch, guard, 30)
+            self.assertEqual(len(summaries), 1)
+            self.assertIn("last_public_ip=203.0.113.99", summaries[0])
+
+    def test_eventful_window_logs_on_the_regular_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = GluetunGuard(
+                make_config(Path(directory), watchdog_log_interval_seconds=300), FakeRunner({})
+            )
+            orch = Orchestrator(guard)
+            orch.last_public_ip = orch.summary_public_ip = "203.0.113.20"
+            orch.auto_starts_since_summary = 1
+
+            summaries = self._run_healthy_ticks(orch, guard, 30)
+
+            self.assertEqual(len(summaries), 1)
+            self.assertIn("auto_starts=1 ", summaries[0])
+
+    def test_ongoing_outage_keeps_the_regular_summary_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = GluetunGuard(
+                make_config(Path(directory), watchdog_log_interval_seconds=300), FakeRunner({})
+            )
+            orch = Orchestrator(guard)
+            orch.last_public_ip = orch.summary_public_ip = "203.0.113.20"
+            orch.summary_started_at = 0.0
+            orch.outage_started_at = 0.0  # counters already reset by an earlier window
+
+            self.assertTrue(orch._summary_eventful())
+            with (
+                mock.patch.object(orchestrator_mod.time, "monotonic", return_value=301.0),
+                mock.patch.object(guard, "log") as log_mock,
+            ):
+                orch._maybe_log_summary()
+            self.assertTrue(any("Watchdog summary" in c.args[0] for c in log_mock.call_args_list))
+
+    def test_persistent_unknown_ip_warns_at_a_bounded_rate_but_stops_every_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = GluetunGuard(
+                make_config(Path(directory), public_ip_failure_threshold=3), FakeRunner({})
+            )
+            orch = Orchestrator(guard)
+            clock = {"now": 1000.0}
+            orch.summary_started_at = clock["now"]
+            warnings: list[str] = []
+            logs: list[str] = []
+            with (
+                mock.patch.object(
+                    orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]
+                ),
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN
+                ),
+                mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
+                mock.patch.object(guard, "warn", side_effect=warnings.append),
+                mock.patch.object(guard, "log", side_effect=logs.append),
+            ):
+                # One hour of a public-IP checker outage, 10 s ticks.
+                for _ in range(360):
+                    clock["now"] += 10.0
+                    orch.watch_once()
+
+            # Fail-closed is not rate-limited: every tick past the threshold stops.
+            self.assertEqual(stop.call_count, 360 - 2)
+            # 2 below-threshold warnings, 1 on crossing, then one per 5 minutes.
+            self.assertLessEqual(len(warnings), 3 + 3600 // orchestrator_mod.REPEAT_WARNING_SECONDS)
+            self.assertIn("Stopping active services to fail closed", warnings[2])
+            self.assertTrue(any("still failing" in w for w in warnings[3:]))
+            # The window stays eventful, so the summary keeps the regular cadence.
+            self.assertGreaterEqual(sum("Watchdog summary" in m for m in logs), 11)
+
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(
+                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                ),
+                mock.patch.object(guard, "container_running", return_value=True),
+                mock.patch.object(guard, "log", side_effect=logs.append),
+            ):
+                orch.watch_once()
+            self.assertTrue(any("recovered after 360 failures" in m for m in logs))
+            self.assertIsNone(orch.ip_failure_warned_at)
+
     def test_record_home_ip_refuses_when_gluetun_healthy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
