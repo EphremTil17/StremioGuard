@@ -290,3 +290,41 @@ def test_retire_legacy_watchdog_terminates_recorded_watchdog(
     supervisor.retire_legacy_watchdog()
     assert alive["value"] is False
     assert not pid_file.exists()
+
+
+def test_endpoint_churn_is_not_a_settings_change_but_a_new_snapshot_is(
+    sandbox_deployment_paths: Path,
+) -> None:
+    import hashlib
+
+    snapshot = sandbox_deployment_paths / ".stremio" / "env.snapshot"
+    snapshot.write_text("# generated\nSERVER_COUNTRIES='Germany'\n", encoding="utf-8")
+    base = {
+        "STREMIO_RUN_ID": "a",
+        "WATCH_INTERVAL_SECONDS": "10",
+        "OPENVPN_ENDPOINT_IP": "203.0.113.7",
+        "WIREGUARD_ENDPOINT_IP": "203.0.113.7",
+    }
+    assert supervisor.write_watchdog_env(base) is True
+
+    # NordVPN re-resolves its endpoint by load on every start; that alone must
+    # not restart a running watchdog (and reset an outage in progress).
+    moved = {**base, "OPENVPN_ENDPOINT_IP": "198.51.100.9", "WIREGUARD_ENDPOINT_IP": "198.51.100.9"}
+    assert supervisor.write_watchdog_env(moved) is False
+    content = supervisor.watchdog_env_file().read_text(encoding="utf-8")
+    assert 'OPENVPN_ENDPOINT_IP="198.51.100.9"' in content
+
+    # A newly published snapshot is: the watchdog reads it only at start.
+    snapshot.write_text("# generated\nSERVER_COUNTRIES='Sweden'\n", encoding="utf-8")
+    assert supervisor.write_watchdog_env(moved) is True
+    generation = hashlib.sha256(snapshot.read_bytes()).hexdigest()[:16]
+    content = supervisor.watchdog_env_file().read_text(encoding="utf-8")
+    assert f'{supervisor.CONFIG_GENERATION_KEY}="{generation}"' in content
+    assert supervisor.write_watchdog_env(moved) is False
+
+
+def test_no_snapshot_means_no_generation_key(sandbox_deployment_paths: Path) -> None:
+    assert not (sandbox_deployment_paths / ".stremio" / "env.snapshot").exists()
+    supervisor.write_watchdog_env({"WATCH_INTERVAL_SECONDS": "10"})
+    content = supervisor.watchdog_env_file().read_text(encoding="utf-8")
+    assert supervisor.CONFIG_GENERATION_KEY not in content

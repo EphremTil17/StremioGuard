@@ -9,6 +9,7 @@ and stops the protected services once restarts are exhausted.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pwd
 import shutil
@@ -23,7 +24,7 @@ from pathlib import Path
 from loguru import logger
 
 from stremioguard.cli.context import ROOT_DIR, STATE_DIR, RunContext
-from stremioguard.config import CONFIG_ENV_KEYS, LOCKOUT_FILE_NAME
+from stremioguard.config import CONFIG_ENV_KEYS, LOCKOUT_FILE_NAME, PUBLISHED_ENV_FILE
 from stremioguard.env import atomic_write_text, fail
 
 WATCHDOG_UNIT = "stremioguard-watchdog.service"
@@ -62,10 +63,20 @@ _DOCKER_CLIENT_KEYS = (
 _ENDPOINT_KEYS = ("OPENVPN_ENDPOINT_IP", "WIREGUARD_ENDPOINT_IP")
 # The only process environment that reaches the supervised watchdog. Anything
 # else exported in the shell that ran `./stremio start` must live in .env.
-FORWARDED_ENV_KEYS = (*CONFIG_ENV_KEYS, *_ENDPOINT_KEYS, *_DOCKER_CLIENT_KEYS)
-# Every start mints a new run id and log file. Those alone do not justify
-# restarting a running watchdog, which would reset an outage in progress.
-_PER_RUN_KEYS = frozenset({"STREMIO_RUN_ID", "STREMIO_LOG_FILE"})
+# Fingerprint of the published configuration the watchdog was started with.
+# The watchdog reads that snapshot once, at start, so a new one must restart it.
+CONFIG_GENERATION_KEY = "STREMIO_CONFIG_GENERATION"
+FORWARDED_ENV_KEYS = (
+    *CONFIG_ENV_KEYS,
+    *_ENDPOINT_KEYS,
+    *_DOCKER_CLIENT_KEYS,
+    CONFIG_GENERATION_KEY,
+)
+# Values that differ between two starts without anything having been
+# reconfigured: every start mints a new run id and log file, and the NordVPN
+# endpoint is re-resolved by server load. None of them justifies restarting a
+# running watchdog, which would reset an outage in progress.
+_PER_RUN_KEYS = frozenset({"STREMIO_RUN_ID", "STREMIO_LOG_FILE", *_ENDPOINT_KEYS})
 
 _MANAGED_HEADER = "# Managed by StremioGuard: `./stremio start` rewrites this file.\n"
 
@@ -330,12 +341,21 @@ def _settings_view(text: str) -> list[str]:
     return [line for line in text.splitlines() if line.split("=", 1)[0] not in _PER_RUN_KEYS]
 
 
+def config_generation() -> str:
+    """Fingerprint of the published env snapshot; empty before the first publish."""
+    try:
+        return hashlib.sha256((ROOT_DIR / PUBLISHED_ENV_FILE).read_bytes()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
 def write_watchdog_env(env: Mapping[str, str]) -> bool:
     """Persist the forwarded settings for the unit's EnvironmentFile=.
 
-    Returns whether a setting other than the per-run log identity changed.
+    Returns whether a setting other than the per-run values changed.
     """
     path = watchdog_env_file()
+    env = {**env, CONFIG_GENERATION_KEY: config_generation()}
     content = "".join(_env_line(key, env[key]) for key in FORWARDED_ENV_KEYS if env.get(key))
     try:
         previous = path.read_text(encoding="utf-8")

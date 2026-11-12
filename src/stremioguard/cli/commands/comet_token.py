@@ -7,9 +7,7 @@ from loguru import logger
 
 from stremioguard.cli.context import (
     ROOT_DIR,
-    _comet_enabled,
     _comet_gateway_manager,
-    _comet_manager,
 )
 from stremioguard.comet_gateway import CometGatewayManager
 from stremioguard.config import compose_command
@@ -17,21 +15,11 @@ from stremioguard.env import fail
 
 
 def _refresh_comet_gateway_after_token_change(manager: CometGatewayManager) -> None:
-    # The token gate itself is already enforced by the token CRUD call (which
-    # rewrites tokens.map and nginx.conf). Regenerating the full Comet override
-    # bundle here only refreshes the configure-page install URL, so a drifted
-    # scraper/stream patch must never block a token operation like revoke.
-    if _comet_enabled():
-        comet_manager = _comet_manager()
-        if comet_manager.repo_exists():
-            try:
-                comet_manager.write_stack_override_file()
-            except RuntimeError as error:
-                logger.warning(
-                    "Token gate updated, but refreshing the Comet override bundle failed: "
-                    f"{error} Configure-page install links may be stale until the next "
-                    "`./stremio restart`."
-                )
+    # The token gate is the token map, which the token CRUD call has already
+    # rewritten; reloading nginx is what makes it take effect. Nothing is
+    # republished here: a token change must never deploy unrelated .env or
+    # compose edits. The configure page's install link lives in the patch
+    # bundle and follows the default token at the next `./stremio restart`.
     if manager.container_running():
         manager.reload_nginx()
         logger.info("Comet gateway config reloaded.")

@@ -130,7 +130,10 @@ class UpdateCheckTests(unittest.TestCase):
             tmp_path = Path(directory)
             manager = _manager(tmp_path)
             manager.save_state(CometState(active_digest=SHA_ACTIVE))
-            manifest_path = manager.config.state_dir / "bundle-manifest.json"
+            # The ACTIVE digest's bundle manifest is what the diff reads.
+            bundle_dir = manager.config.bundle_dir(SHA_ACTIVE)
+            bundle_dir.mkdir(parents=True)
+            manifest_path = bundle_dir / "bundle-manifest.json"
             manifest_path.write_text(
                 '{"applied": ["torrentio"], "skipped": [{"name": "filtering", '
                 '"reason": "disabled by configuration"}]}',

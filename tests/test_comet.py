@@ -22,6 +22,7 @@ from stremioguard.overrides import write_override_bundle
 from stremioguard.publishing import render_stack_compose_override
 
 from .conftest import (
+    TEST_COMET_DIGEST,
     FakeRunner,
     completed,
     make_comet_config,
@@ -613,15 +614,17 @@ class CometManagerTests(unittest.TestCase):
             manager = CometManager(cfg, FakeRunner({}))
             # Bundle generation now lives in prepare_runtime (image-source);
             # render here explicitly from the fixture sources, then publish.
+            bundle_dir = cfg.bundle_dir(TEST_COMET_DIGEST)
             write_override_bundle(
                 repo_dir=cfg.repo_dir,
-                state_dir=cfg.state_dir,
+                state_dir=bundle_dir,
                 result_format_style=cfg.result_format_style,
                 patch_episode_pack_results=cfg.patch_episode_pack_results,
                 gateway_addon_base_url=manager.gateway_addon_base_url(),
                 gateway_enabled=True,
                 image_digest="sha256:test",
                 patch_fingerprint="fp-test",
+                active_digest=TEST_COMET_DIGEST,
             )
             record_test_digest(cfg.state_dir)
             manager.write_stack_override_file()
@@ -633,39 +636,39 @@ class CometManagerTests(unittest.TestCase):
             self.assertNotIn('"10.0.0.5:18000:8000"', content)
             self.assertIn(str(cfg.runtime_env_file), content)
             self.assertIn(
-                f"{cfg.state_dir / 'formatting.py'}:/app/comet/utils/formatting.py:ro",
+                f"{bundle_dir / 'formatting.py'}:/app/comet/utils/formatting.py:ro",
                 content,
             )
             self.assertIn(
-                f"{cfg.state_dir / 'stream.py'}:/app/comet/api/endpoints/stream.py:ro",
+                f"{bundle_dir / 'stream.py'}:/app/comet/api/endpoints/stream.py:ro",
                 content,
             )
             self.assertIn(
-                f"{cfg.state_dir / 'config.py'}:/app/comet/api/endpoints/config.py:ro",
+                f"{bundle_dir / 'config.py'}:/app/comet/api/endpoints/config.py:ro",
                 content,
             )
             self.assertIn(
-                f"{cfg.state_dir / 'index.html'}:/app/comet/templates/index.html:ro",
+                f"{bundle_dir / 'index.html'}:/app/comet/templates/index.html:ro",
                 content,
             )
             self.assertIn(
-                f"{cfg.state_dir / 'torrentio.py'}:/app/comet/scrapers/torrentio.py:ro",
+                f"{bundle_dir / 'torrentio.py'}:/app/comet/scrapers/torrentio.py:ro",
                 content,
             )
             self.assertIn(
-                f"{cfg.state_dir / 'filtering.py'}:/app/comet/services/filtering.py:ro",
+                f"{bundle_dir / 'filtering.py'}:/app/comet/services/filtering.py:ro",
                 content,
             )
             self.assertIn(
-                f"{cfg.state_dir / 'orchestration.py'}:/app/comet/services/orchestration.py:ro",
+                f"{bundle_dir / 'orchestration.py'}:/app/comet/services/orchestration.py:ro",
                 content,
             )
             self.assertIn(
-                f"{cfg.state_dir / 'metadata_service.py'}:/app/comet/metadata_service.py:ro",
+                f"{bundle_dir / 'metadata_service.py'}:/app/comet/metadata_service.py:ro",
                 content,
             )
-            filtering_override = (cfg.state_dir / "filtering.py").read_text(encoding="utf-8")
-            torrentio_override = (cfg.state_dir / "torrentio.py").read_text(encoding="utf-8")
+            filtering_override = (bundle_dir / "filtering.py").read_text(encoding="utf-8")
+            torrentio_override = (bundle_dir / "torrentio.py").read_text(encoding="utf-8")
             self.assertIn("TITLE_TOKEN_STOPWORDS", filtering_override)
             self.assertIn("resolvedFileName", filtering_override)
             self.assertIn("sourceTitle", torrentio_override)
@@ -674,7 +677,7 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn("release_title = (", torrentio_override)
             self.assertIn('"title": release_title,', torrentio_override)
             self.assertIn('"resolvedFileName": resolved_filename,', torrentio_override)
-            formatting_override = (cfg.state_dir / "formatting.py").read_text(encoding="utf-8")
+            formatting_override = (bundle_dir / "formatting.py").read_text(encoding="utf-8")
             self.assertIn("def _strip_redundant_hdr_tokens(", formatting_override)
             self.assertIn("def _normalize_video_token(", formatting_override)
             self.assertIn('return "HEVC"', formatting_override)
@@ -692,7 +695,7 @@ class CometManagerTests(unittest.TestCase):
                 'video_audio = [components[k] for k in ["video", "audio"] if k in components]',
                 formatting_override,
             )
-            stream_override = (cfg.state_dir / "stream.py").read_text(encoding="utf-8")
+            stream_override = (bundle_dir / "stream.py").read_text(encoding="utf-8")
             self.assertIn("def _hdr_badge(", stream_override)
             self.assertIn("def _series_pack_badge(", stream_override)
             self.assertNotIn("def _promote_pack_backed_within_resolution(", stream_override)
@@ -717,9 +720,7 @@ class CometManagerTests(unittest.TestCase):
             self.assertLess(size_rank_position, metadata_position)
             self.assertLess(metadata_position, title_position)
             self.assertNotIn("RTN rank:", stream_override)
-            orchestration_override = (cfg.state_dir / "orchestration.py").read_text(
-                encoding="utf-8"
-            )
+            orchestration_override = (bundle_dir / "orchestration.py").read_text(encoding="utf-8")
             self.assertIn("self.pack_backed_hashes = set()", orchestration_override)
             self.assertIn("def _record_pack_backed_candidate(", orchestration_override)
             self.assertIn("async def _is_pack_backed_candidate(", orchestration_override)
@@ -729,9 +730,9 @@ class CometManagerTests(unittest.TestCase):
                 orchestration_override,
             )
             self.assertIn("self.pack_backed_hashes.add(info_hash)", orchestration_override)
-            self.assertTrue((cfg.state_dir / "metadata_service.py").exists())
-            config_override = (cfg.state_dir / "config.py").read_text(encoding="utf-8")
-            template_override = (cfg.state_dir / "index.html").read_text(encoding="utf-8")
+            self.assertTrue((bundle_dir / "metadata_service.py").exists())
+            config_override = (bundle_dir / "config.py").read_text(encoding="utf-8")
+            template_override = (bundle_dir / "index.html").read_text(encoding="utf-8")
             self.assertIn("def _prefixed_path(", config_override)
             self.assertIn('request.headers.get("x-forwarded-prefix"', config_override)
             self.assertIn("function getCometMountPath()", template_override)
@@ -760,14 +761,16 @@ class CometManagerTests(unittest.TestCase):
             )
             _write_upstream_patch_sources(cfg)
             manager = CometManager(cfg, FakeRunner({}))
+            bundle_dir = cfg.bundle_dir(TEST_COMET_DIGEST)
             write_override_bundle(
                 repo_dir=cfg.repo_dir,
-                state_dir=cfg.state_dir,
+                state_dir=bundle_dir,
                 result_format_style=cfg.result_format_style,
                 patch_episode_pack_results=False,
                 gateway_addon_base_url=None,
                 image_digest="sha256:test",
                 patch_fingerprint="fp-test",
+                active_digest=TEST_COMET_DIGEST,
             )
             record_test_digest(cfg.state_dir)
             manager.write_stack_override_file()
@@ -776,7 +779,7 @@ class CometManagerTests(unittest.TestCase):
             # Positive control: the comet section renders with other mounts.
             self.assertIn("/app/comet/scrapers/torrentio.py:ro", content)
             self.assertNotIn("/app/comet/services/orchestration.py:ro", content)
-            self.assertFalse((cfg.state_dir / "orchestration.py").exists())
+            self.assertFalse((bundle_dir / "orchestration.py").exists())
 
     def test_render_stack_compose_override_omits_comet_when_disabled(self) -> None:
         content = render_stack_compose_override(
@@ -998,6 +1001,8 @@ class CometManagerTests(unittest.TestCase):
             tmp_path = Path(directory)
             make_config(tmp_path)
             cfg = make_comet_config(tmp_path)
+            record_test_digest(cfg.state_dir)
+            active_ref = f"{cfg.image}@{TEST_COMET_DIGEST}"
 
             runner = FakeRunner(
                 {
@@ -1015,14 +1020,14 @@ class CometManagerTests(unittest.TestCase):
                     ("docker", "inspect", "comet-id", "--format", "{{.Image}}"): completed(
                         ["docker", "inspect"], "sha256:active-id\n"
                     ),
-                    ("docker", "image", "inspect", cfg.image, "--format", "{{.Id}}"): completed(
+                    ("docker", "image", "inspect", active_ref, "--format", "{{.Id}}"): completed(
                         ["docker", "image", "inspect"], "sha256:active-id\n"
                     ),
                     (
                         "docker",
                         "image",
                         "inspect",
-                        cfg.image,
+                        active_ref,
                         "--format",
                         "{{json .RepoDigests}}",
                     ): completed(
@@ -1036,11 +1041,20 @@ class CometManagerTests(unittest.TestCase):
             # 1. Manifest missing -> RuntimeError
             with self.assertRaises(RuntimeError) as ctx:
                 manager._verify_doctor_image_and_manifest()
-            self.assertIn("Bundle manifest is missing", str(ctx.exception))
+            self.assertIn("Bundle manifest for the active image is missing", str(ctx.exception))
 
-            # Write manifest
-            cfg.state_dir.mkdir(parents=True, exist_ok=True)
-            manifest_file = cfg.state_dir / "bundle-manifest.json"
+            # A legacy flat manifest directly in state_dir is not the active
+            # digest's bundle and must not satisfy the check.
+            (cfg.state_dir / "bundle-manifest.json").write_text(
+                '{"image_digest": "sha256:digest"}', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "missing or unreadable"):
+                manager._verify_doctor_image_and_manifest()
+
+            # Write the active digest's manifest
+            bundle_dir = cfg.bundle_dir(TEST_COMET_DIGEST)
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            manifest_file = bundle_dir / "bundle-manifest.json"
             manifest_file.write_text('{"image_digest": "sha256:different"}', encoding="utf-8")
 
             # 2. Digest mismatch -> RuntimeError

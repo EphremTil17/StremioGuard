@@ -31,9 +31,12 @@ services:
     depends_on:
       use-stremio-start-instead:
         condition: service_completed_successfully
-    # Release channel, not master builds; the guard best-effort pulls this
-    # tag on every start/restart so the newest v3 release is always used.
-    image: qmcgaw/gluetun:v3
+    # Pinned by digest like every other image here; Dependabot proposes bumps.
+    # This is the container the kill switch lives in, and the watchdog depends
+    # on details of it (its healthcheck, `wget`, its log wording, the control
+    # server route), so a new release is something to review, not something a
+    # start should pick up on its own.
+    image: qmcgaw/gluetun:v3.41.3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
@@ -175,8 +178,10 @@ services:
       - path: ./.stremio/stremthru/stremthru.env
         required: false
     environment:
-      # Must match STREMTHRU_INTERNAL_URL in src/stremioguard/config.py.
-      STREMTHRU_LISTEN_ADDR: 127.0.0.1:8080
+      # Must match STREMTHRU_PORT in src/stremioguard/config.py, whose
+      # NAMESPACE_PORTS is the registry of ports in this shared namespace.
+      # Not 8080: the Stremio image's own nginx listens there.
+      STREMTHRU_LISTEN_ADDR: 127.0.0.1:8091
       # Upstream peers with the public instance by default; "-" turns it off.
       STREMTHRU_PEER_URI: "-"
       # Comet uses only the store API. `torz` must stay on: it registers the
@@ -189,7 +194,7 @@ services:
     volumes:
       - ./.stremio/stremthru/data:/app/data
     healthcheck:
-      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8080/v0/health"]
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8091/v0/health"]
       interval: 30s
       timeout: 5s
       retries: 3

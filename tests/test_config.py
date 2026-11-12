@@ -201,3 +201,110 @@ def test_bind_addresses_have_one_parser_with_every_rule(tmp_path) -> None:
         env.write_text(f"STREMIO_BIND_ADDRS={bad}\n")
         with pytest.raises(RuntimeError):
             parse_bind_addresses(env)
+
+
+# --- docker-compose.yml against the namespace port registry ----------------------
+
+_COMPOSE_FILE = Path(__file__).resolve().parent.parent / "docker-compose.yml"
+
+
+def _compose_services() -> dict[str, str]:
+    """Each top-level service's block of docker-compose.yml, by name.
+
+    A structural split (two-space service keys under `services:`), not a YAML
+    parse: PyYAML is not a dependency. Good enough to read single-line values.
+    """
+    import re
+
+    text = _COMPOSE_FILE.read_text(encoding="utf-8")
+    body = text.split("\nservices:\n", 1)[1] if not text.startswith("services:\n") else text
+    parts = re.split(r"^  ([a-z0-9][a-z0-9_-]*):\n", body, flags=re.MULTILINE)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+def test_stremthru_listens_and_is_probed_on_the_registered_port() -> None:
+    import re
+
+    from stremioguard.config import NAMESPACE_PORTS, STREMTHRU_INTERNAL_URL, STREMTHRU_PORT
+
+    stremthru = _compose_services()["stremthru"]
+    listen = re.search(r"^\s+STREMTHRU_LISTEN_ADDR:\s*\"?127\.0\.0\.1:(\d+)\"?$", stremthru, re.M)
+    assert listen, "STREMTHRU_LISTEN_ADDR not found in the stremthru service"
+    assert int(listen.group(1)) == STREMTHRU_PORT
+    health = re.search(r"^\s+test:.*http://127\.0\.0\.1:(\d+)/v0/health", stremthru, re.M)
+    assert health, "stremthru healthcheck URL not found"
+    assert int(health.group(1)) == STREMTHRU_PORT
+    assert f"http://127.0.0.1:{STREMTHRU_PORT}" == STREMTHRU_INTERNAL_URL
+    assert NAMESPACE_PORTS["stremthru"] == STREMTHRU_PORT
+    # The collision this registry exists to prevent: Stremio's own nginx.
+    assert NAMESPACE_PORTS["stremio web UI (image's nginx)"] != STREMTHRU_PORT
+
+
+def test_namespace_ports_are_unique_and_match_the_compose_file() -> None:
+    import re
+
+    from stremioguard.comet_gateway import COMET_GATEWAY_CONTAINER_PORT
+    from stremioguard.config import COMET_PORT, NAMESPACE_PORTS
+
+    ports = list(NAMESPACE_PORTS.values())
+    duplicates = {port for port in ports if ports.count(port) > 1}
+    assert not duplicates, f"two namespace listeners share {sorted(duplicates)}"
+    assert NAMESPACE_PORTS["comet"] == COMET_PORT
+    assert NAMESPACE_PORTS["comet-gateway"] == COMET_GATEWAY_CONTAINER_PORT
+    gluetun = _compose_services()["gluetun"]
+    control = re.search(r"HTTP_CONTROL_SERVER_ADDRESS:\s*\"?127\.0\.0\.1:(\d+)", gluetun)
+    assert control and int(control.group(1)) == NAMESPACE_PORTS["gluetun control server"]
+
+
+def test_gluetun_image_is_digest_pinned() -> None:
+    import re
+
+    image = re.search(r"^\s+image:\s*(\S+)\s*$", _compose_services()["gluetun"], re.M)
+    assert image, "gluetun has no image line"
+    assert re.fullmatch(r"qmcgaw/gluetun(:[\w.-]+)?@sha256:[0-9a-f]{64}", image.group(1)), (
+        image.group(1)
+    )
+
+
+# --- Deployed configuration ----------------------------------------------------------
+
+
+def test_deployed_env_file_prefers_the_published_snapshot(tmp_path) -> None:
+    from stremioguard.config import deployed_env_file
+
+    assert deployed_env_file(tmp_path) == tmp_path / ".env"
+    snapshot = tmp_path / ".stremio" / "env.snapshot"
+    snapshot.parent.mkdir()
+    snapshot.write_text("", encoding="utf-8")
+    assert deployed_env_file(tmp_path) == snapshot
+
+
+def test_config_reads_alert_url_and_auto_start_limit_from_its_env_file(
+    tmp_path, monkeypatch
+) -> None:
+    import pytest
+
+    for key in ("MAX_AUTO_STARTS_PER_HOUR", "STREMIO_MAX_AUTO_STARTS_PER_HOUR"):
+        monkeypatch.delenv(key, raising=False)
+    snapshot = tmp_path / "env.snapshot"
+    snapshot.write_text(
+        "STREMIO_ALERT_URL='https://ntfy.example.test/topic'\nMAX_AUTO_STARTS_PER_HOUR='0'\n",
+        encoding="utf-8",
+    )
+    config = Config.from_env(tmp_path, env_file=snapshot)
+    assert config.env_file == snapshot
+    assert config.alert_url == "https://ntfy.example.test/topic"
+    assert config.max_auto_starts_per_hour == 0
+    # Defaults when unset.
+    empty = tmp_path / "empty.env"
+    empty.write_text("", encoding="utf-8")
+    config = Config.from_env(tmp_path, env_file=empty)
+    assert config.alert_url is None
+    assert config.max_auto_starts_per_hour == 10
+    # A malformed URL fails loudly instead of silently never alerting.
+    empty.write_text("STREMIO_ALERT_URL=ntfy.example.test/topic\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="STREMIO_ALERT_URL"):
+        Config.from_env(tmp_path, env_file=empty)
+    empty.write_text("MAX_AUTO_STARTS_PER_HOUR=-1\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="MAX_AUTO_STARTS_PER_HOUR"):
+        Config.from_env(tmp_path, env_file=empty)

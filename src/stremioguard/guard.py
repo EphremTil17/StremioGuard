@@ -9,6 +9,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from functools import cached_property
@@ -18,8 +19,10 @@ from loguru import logger
 
 from stremioguard.config import (
     COMET_GATEWAY_SERVICE,
+    DOCKER_QUERY_TIMEOUT_SECONDS,
     GENERATED_COMPOSE_FILE,
     MANAGED_STACK_ENV,
+    WATCHDOG_MUTATION_TIMEOUT_SECONDS,
     CometConfig,
     Config,
     Runner,
@@ -42,6 +45,65 @@ HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
 # docker-compose.yml's `docker compose up` guard; it is not a protected service.
 COMPOSE_GATE_SERVICE = "use-stremio-start-instead"
 GLUETUN_PULL_TIMEOUT_SECONDS = 180
+GLUETUN_STATE_FORMAT = "{{.State.Health.Status}}|{{.State.StartedAt}}"
+ENDPOINT_ENV_KEYS = ("OPENVPN_ENDPOINT_IP", "WIREGUARD_ENDPOINT_IP")
+# What decides which VPN server gluetun connects to.
+VPN_SELECTION_KEYS = (
+    "VPN_SERVICE_PROVIDER",
+    "VPN_TYPE",
+    "SERVER_COUNTRIES",
+    "SERVER_REGIONS",
+    "SERVER_CITIES",
+    "SERVER_HOSTNAMES",
+    "SERVER_CATEGORIES",
+)
+# What OpenVPN/WireGuard print when the provider refuses the credentials.
+# Providers also print these for reasons that are not the credentials (a
+# connection limit, an overloaded server), which is why one sighting is not
+# enough to lock out; see Orchestrator._note_auth_rejection.
+AUTH_REJECTION_MARKERS = (
+    "AUTH_FAILED",
+    "Your credentials might be wrong",
+    "authentication failure",
+    "incorrect key size",
+)
+EVIDENCE_LINE_LIMIT = 300
+
+
+@dataclass(frozen=True)
+class GluetunState:
+    """One observation of the gluetun container."""
+
+    container_id: str | None
+    health: str | None
+    started_at: str | None
+
+    @property
+    def healthy(self) -> bool:
+        return self.health == "healthy"
+
+    @property
+    def identity(self) -> tuple[str, str] | None:
+        """Changes whenever gluetun gets a new network namespace.
+
+        A restart keeps the container ID but changes StartedAt; a recreate
+        changes both. Either way every service that joined the old namespace
+        is now attached to a dead one.
+        """
+        if not self.container_id or not self.started_at:
+            return None
+        return (self.container_id, self.started_at)
+
+
+def _started_at_key(value: str) -> tuple[str, int]:
+    """Docker's RFC 3339 timestamp as something that orders correctly.
+
+    The fractional part has a variable number of digits, so comparing the
+    raw strings would misorder them.
+    """
+    seconds, _, fraction = value.rstrip("Z").partition(".")
+    digits = "".join(ch for ch in fraction if ch.isdigit())
+    return (seconds, int(digits.ljust(9, "0")[:9] or "0"))
 
 
 class PublicIPAssessment(Enum):
@@ -65,6 +127,15 @@ LOCKOUT_REMEDIATION = {
     "watchdog_unstable": (
         "The watchdog kept failing under systemd. Inspect "
         "`journalctl --user -u stremioguard-watchdog.service`, then run `./stremio restart`."
+    ),
+    "egress_leak": (
+        "Traffic left through this host's own connection instead of the VPN on consecutive "
+        "checks. Find out why gluetun's kill switch did not hold before running "
+        "`./stremio restart`."
+    ),
+    "service_flapping": (
+        "Services were stopped and auto-started too many times within an hour. Read the run "
+        "log (`./stremio logs`) for the repeating cause, then run `./stremio restart`."
     ),
 }
 DEFAULT_LOCKOUT_REMEDIATION = (
@@ -95,10 +166,18 @@ class GluetunUnavailableError(RuntimeError):
 
 
 class GluetunGuard:
-    def __init__(self, config: Config, runner: Runner | None = None) -> None:
+    def __init__(
+        self, config: Config, runner: Runner | None = None, *, frozen: bool = False
+    ) -> None:
+        """``frozen`` is the watchdog's mode: run the published generation as
+        it is, never render a new one, and bound every Docker call."""
         self.config = config
         self.runner = runner or SubprocessRunner()
-        self._env_path = self.config.root_dir / ".env"
+        self._env_path = self.config.env_file or self.config.root_dir / ".env"
+        self.frozen = frozen
+        self.mutation_timeout: float | None = WATCHDOG_MUTATION_TIMEOUT_SECONDS if frozen else None
+        self.last_gluetun_state: GluetunState | None = None
+        self._evidence_cursor = 0.0
         self.last_observed_ip: str | None = None
         self._warned_stale_home_ip = False
         self._control_server_failed = False
@@ -154,8 +233,19 @@ class GluetunGuard:
             "To clear the lockout manually without starting services, run `./stremio unlock`."
         )
 
-    def write_vpn_lockout(self, *, reason: str, outage_duration_seconds: float = 0.0) -> None:
-        container_id = self.service_container_id("gluetun") or "unknown"
+    def write_vpn_lockout(
+        self,
+        *,
+        reason: str,
+        outage_duration_seconds: float = 0.0,
+        evidence: str | None = None,
+    ) -> None:
+        try:
+            container_id = self.service_container_id("gluetun") or "unknown"
+        except (OSError, subprocess.SubprocessError):
+            # The marker is what blocks the next start; a Docker daemon that
+            # does not answer must not be able to prevent it being written.
+            container_id = "unknown"
         provider = env_file_value(self._env_path, "VPN_SERVICE_PROVIDER") or "unknown"
         vpn_type = env_file_value(self._env_path, "VPN_TYPE") or "unknown"
         payload = {
@@ -167,6 +257,9 @@ class GluetunGuard:
             "vpn_type": vpn_type,
             "remediation": LOCKOUT_REMEDIATION.get(reason, DEFAULT_LOCKOUT_REMEDIATION),
         }
+        if evidence:
+            # What was observed, not only the label it was filed under.
+            payload["evidence"] = evidence[:EVIDENCE_LINE_LIMIT]
         atomic_write_text(
             self.config.vpn_lockout_file, json.dumps(payload, indent=2) + "\n", mode=0o600
         )
@@ -193,7 +286,7 @@ class GluetunGuard:
     def _comet_config(self) -> CometConfig:
         # Read once per process: the watchdog applies .env changes on restart,
         # like every other setting, instead of re-parsing it every tick.
-        return CometConfig.from_env(self.config.root_dir)
+        return CometConfig.from_env(self.config.root_dir, env_file=self._env_path)
 
     def deployment_profile(self) -> str:
         comet_enabled = self._comet_config.enabled
@@ -238,6 +331,7 @@ class GluetunGuard:
         check: bool = True,
         capture: bool = True,
         env: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Query/teardown compose call: uses the override if one exists, but
         never publishes one.
@@ -249,7 +343,11 @@ class GluetunGuard:
         """
         call_env = {MANAGED_STACK_ENV: "1", **os.environ, **(env or {})}
         return self.runner.run(
-            self._compose_command(*args), check=check, capture=capture, env=call_env
+            self._compose_command(*args),
+            check=check,
+            capture=capture,
+            env=call_env,
+            timeout=timeout if timeout is not None else self.mutation_timeout,
         )
 
     def compose_fresh(
@@ -259,11 +357,24 @@ class GluetunGuard:
         capture: bool = True,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        self.write_compose_override()
-        call_env = {MANAGED_STACK_ENV: "1", **os.environ, **(env or {})}
-        return self.runner.run(
-            self._compose_command(*args), check=check, capture=capture, env=call_env
-        )
+        """Lifecycle compose call against an up-to-date generation.
+
+        The CLI publishes a new generation from .env first. The watchdog
+        (``frozen``) never does: it starts services from the generation the
+        last deliberate start published, so an .env edit or a `git pull`
+        cannot be deployed by a 3 AM recovery. It refuses to start anything
+        when no generation exists, because the base file alone would run
+        Comet unpatched from a floating tag.
+        """
+        if self.frozen:
+            if not (self.config.root_dir / GENERATED_COMPOSE_FILE).exists():
+                raise RuntimeError(
+                    "No published stack configuration exists; refusing to start services "
+                    "from the base compose file alone. Run `./stremio start`."
+                )
+        else:
+            self.write_compose_override()
+        return self.compose(*args, check=check, capture=capture, env=env)
 
     def _compose_command(self, *args: str) -> list[str]:
         return compose_command(self.config.root_dir, *args)
@@ -271,15 +382,89 @@ class GluetunGuard:
     def service_container_id(self, service: str) -> str | None:
         return service_container_id(self.runner, self.config.root_dir, service)
 
-    def gluetun_healthy(self) -> bool:
+    def gluetun_state(self) -> GluetunState:
+        """Gluetun's container ID, health and start time in one inspect."""
         container_id = self.service_container_id("gluetun")
         if not container_id:
-            return False
+            state = GluetunState(None, None, None)
+        else:
+            result = self.runner.run(
+                ["docker", "inspect", "--format", GLUETUN_STATE_FORMAT, container_id],
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                state = GluetunState(container_id, None, None)
+            else:
+                health, _, started_at = (result.stdout or "").strip().partition("|")
+                state = GluetunState(container_id, health or None, started_at or None)
+        self.last_gluetun_state = state
+        return state
+
+    def gluetun_healthy(self) -> bool:
+        return self.gluetun_state().healthy
+
+    def stale_namespace_services(
+        self, services: list[str], gluetun: GluetunState
+    ) -> list[str] | None:
+        """Running services attached to a network namespace gluetun no longer has.
+
+        A service joins gluetun's namespace when it starts. If gluetun has
+        since restarted or been recreated, the service keeps the old, dead
+        namespace: its loopback healthcheck still passes, but nothing reaches
+        it and it reaches nothing. It must be restarted to rejoin.
+
+        Ground truth, not bookkeeping: a service is stale when it names a
+        different gluetun container or started before gluetun did. None when
+        Docker cannot answer.
+        """
+        if gluetun.identity is None:
+            return None
+        gluetun_id, gluetun_started = gluetun.identity
+        container_ids: dict[str, str] = {}
+        for service in services:
+            container_id = self.service_container_id(service)
+            if container_id:
+                container_ids[container_id] = service
+        if not container_ids:
+            return []
         result = self.runner.run(
-            ["docker", "inspect", "--format", "{{.State.Health.Status}}", container_id],
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.Id}}|{{.State.Running}}|{{.State.StartedAt}}|{{.HostConfig.NetworkMode}}",
+                *container_ids,
+            ],
             check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
         )
-        return result.returncode == 0 and (result.stdout or "").strip() == "healthy"
+        if result.returncode != 0:
+            return None
+        stale: list[str] = []
+        seen: set[str] = set()
+        for line in (result.stdout or "").splitlines():
+            fields = line.strip().split("|")
+            if len(fields) != 4:
+                return None
+            container_id, running, started_at, network_mode = fields
+            service = container_ids.get(container_id)
+            if service is None:
+                # An answer about a container that was not asked about: the
+                # two queries disagree, so nothing has been verified.
+                return None
+            seen.add(container_id)
+            if running != "true":
+                continue
+            if (
+                network_mode.startswith("container:")
+                and (network_mode.removeprefix("container:") != gluetun_id)
+                or _started_at_key(started_at) < _started_at_key(gluetun_started)
+            ):
+                stale.append(service)
+        if seen != set(container_ids):
+            return None
+        return stale
 
     def gluetun_recent_logs(self, lines: int = 20, since_epoch: float | None = None) -> str:
         container_id = self.service_container_id("gluetun")
@@ -289,25 +474,41 @@ class GluetunGuard:
         if since_epoch is not None:
             cmd.extend(["--since", str(int(since_epoch))])
         cmd.append(container_id)
-        result = self.runner.run(
-            cmd,
-            check=False,
-        )
+        result = self.runner.run(cmd, check=False, timeout=DOCKER_QUERY_TIMEOUT_SECONDS)
         parts = [p for p in (result.stdout or "", result.stderr or "") if p.strip()]
         return "\n".join(parts).strip()
 
-    def gluetun_auth_failed(self, lines: int = 50, since_epoch: float | None = None) -> bool:
+    def gluetun_auth_evidence(
+        self, lines: int = 50, since_epoch: float | None = None
+    ) -> str | None:
+        """The most recent log line showing the provider refused the credentials."""
         recent = self.gluetun_recent_logs(lines=lines, since_epoch=since_epoch)
+        for line in reversed(recent.splitlines()):
+            if any(marker in line for marker in AUTH_REJECTION_MARKERS):
+                return line.strip()[:EVIDENCE_LINE_LIMIT]
+        return None
+
+    def gluetun_auth_failed(self, lines: int = 50, since_epoch: float | None = None) -> bool:
+        return self.gluetun_auth_evidence(lines=lines, since_epoch=since_epoch) is not None
+
+    def capture_gluetun_evidence(self, context: str, lines: int = 60) -> None:
+        """Copy gluetun's recent log into the run log before it is destroyed.
+
+        Recreating the container deletes its log, which is the only record
+        of why the tunnel failed. Each call records what was logged since
+        the previous call, so repeated restarts do not repeat the same lines.
+        """
+        since = self._evidence_cursor or None
+        self._evidence_cursor = time.time()
+        try:
+            recent = self.gluetun_recent_logs(lines=lines, since_epoch=since)
+        except (OSError, subprocess.SubprocessError):
+            recent = ""
         if not recent:
-            return False
-        auth_markers = (
-            "AUTH_FAILED",
-            "Your credentials might be wrong",
-            "authentication failure",
-            "AUTH: Received control message: AUTH_FAILED",
-            "incorrect key size",
-        )
-        return any(m in recent for m in auth_markers)
+            self.log(f"No new gluetun log lines to record ({context}).")
+            return
+        self.log(f"Gluetun log before {context}:")
+        self.log_lines(recent)
 
     def wait_for_gluetun_healthy(self) -> None:
         deadline = time.monotonic() + self.config.gluetun_healthy_timeout_seconds
@@ -358,12 +559,13 @@ class GluetunGuard:
         return None
 
     def public_ip_via_gluetun(self) -> str | None:
+        container_id = self.service_container_id("gluetun") or ""
         for url in self.config.ip_check_urls:
             result = self.runner.run(
                 [
                     "docker",
                     "exec",
-                    self.service_container_id("gluetun") or "",
+                    container_id,
                     "wget",
                     "-qO-",
                     "--timeout",
@@ -543,15 +745,15 @@ class GluetunGuard:
         )
 
     def refresh_gluetun_image(self) -> None:
-        """Best-effort `compose pull gluetun` so every start/restart tracks
-        the pinned release channel (`qmcgaw/gluetun:v3` in the compose file).
+        """Best-effort `compose pull gluetun` so the pinned image is present.
 
-        The health wait and IP check right after `up` validate whatever was
-        pulled, and a broken image fails closed. A registry hiccup, hung
-        pull, or offline host must never block a start, so every failure
-        only warns and gluetun boots from the existing local image.
+        docker-compose.yml pins gluetun by digest, so this fetches exactly
+        that image when it is missing (after a Dependabot bump was pulled)
+        and is a no-op otherwise. A registry hiccup, hung pull, or offline
+        host must never block a start, so every failure only warns and
+        gluetun boots from the image already on the host.
         """
-        self.log("Checking the gluetun release channel for a newer image.")
+        self.log("Making sure the pinned gluetun image is present.")
         try:
             if not (self.config.root_dir / GENERATED_COMPOSE_FILE).exists():
                 self.write_compose_override()
@@ -573,8 +775,57 @@ class GluetunGuard:
             logger.opt(exception=True).debug("gluetun image pull failed unexpectedly.")
             self.warn("gluetun image pull failed; starting with the existing image.")
 
-    def preflight(self, *, allow_recovery: bool = False, defer_vpn_recovery: bool = False) -> bool:
+    def running_gluetun_endpoint_env(self) -> dict[str, str]:
+        """The VPN endpoint the running gluetun container was created with.
+
+        The NordVPN endpoint is re-resolved by load, so it differs between
+        any two calls an hour apart. Handing Compose the value the running
+        container already has keeps `./stremio start` from recreating a
+        healthy tunnel, and dropping live streams, over a new recommendation.
+        Empty when gluetun is not running.
+        """
+        state = self.gluetun_state()
+        if not state.container_id or state.health is None:
+            return {}
+        result = self.runner.run(
+            ["docker", "inspect", "--format", "{{json .Config.Env}}", state.container_id],
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            return {}
+        try:
+            entries = json.loads((result.stdout or "").strip() or "[]")
+        except json.JSONDecodeError:
+            return {}
+        running: dict[str, str] = {}
+        for entry in entries if isinstance(entries, list) else []:
+            key, separator, value = str(entry).partition("=")
+            if separator:
+                running[key] = value
+        # Only while the container still matches what is configured. After a
+        # provider or location change gluetun is about to be recreated, and
+        # its old server would pin the new filters to the wrong place.
+        for key in VPN_SELECTION_KEYS:
+            configured = os.environ.get(key)
+            if configured is None:
+                configured = env_file_value(self._env_path, key) or ""
+            if running.get(key, "") != configured:
+                return {}
+        return {key: running[key] for key in ENDPOINT_ENV_KEYS if running.get(key)}
+
+    def preflight(
+        self,
+        *,
+        allow_recovery: bool = False,
+        defer_vpn_recovery: bool = False,
+        keep_running_gluetun: bool = False,
+    ) -> bool:
         """Prepare Gluetun and verify a safe tunnel.
+
+        ``keep_running_gluetun`` is `./stremio start`'s mode: a gluetun that
+        is already running keeps its VPN endpoint, so it is recreated only
+        when its configuration really changed.
 
         If ``defer_vpn_recovery`` is enabled, an unavailable tunnel returns
         ``False`` after Gluetun has been launched. The caller must immediately
@@ -599,11 +850,16 @@ class GluetunGuard:
             comet_manager.prepare_runtime()
 
         self.log("Ensuring the gluetun service is running.")
+        # Publish first: the pull below and the `up` after it must act on the
+        # same generation, or a newly pinned gluetun image would be fetched by
+        # `up` itself, without the pull's timeout and offline tolerance.
+        self.write_compose_override()
         self.refresh_gluetun_image()
         # Lifecycle path: gluetun must come up against a freshly rendered
         # override so bind/mount changes apply BEFORE the VPN is verified,
         # not via a surprise dependency-recreate during the services `up`.
-        self.compose_fresh("up", "-d", "gluetun", capture=False)
+        endpoint_env = self.running_gluetun_endpoint_env() if keep_running_gluetun else {}
+        self.compose_fresh("up", "-d", "gluetun", capture=False, env=endpoint_env or None)
         try:
             self.wait_for_gluetun_healthy()
         except GluetunUnavailableError:
@@ -651,6 +907,7 @@ class GluetunGuard:
         result = self.runner.run(
             self._compose_command("ps", "--status", "running", "--services", *services),
             check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
         )
         if result.returncode != 0:
             return None
@@ -664,7 +921,7 @@ class GluetunGuard:
 
     def start_services(
         self, services: list[str], *, build: bool = False, check: bool = True
-    ) -> None:
+    ) -> bool:
         """Start protected services against the gluetun that is already running.
 
         `--no-deps` keeps this from touching gluetun: Compose otherwise
@@ -674,10 +931,21 @@ class GluetunGuard:
         Every enabled runtime service is listed explicitly, so no dependency
         between them is skipped.
         """
-        build_args = ("--build",) if build else ()
-        self.compose_fresh(
+        # The watchdog never rebuilds: a build reads the working tree, and
+        # nothing from the working tree is deployed outside a deliberate
+        # start. Compose still builds an image that does not exist at all.
+        build_args = ("--build",) if build and not self.frozen else ()
+        result = self.compose_fresh(
             "up", "-d", "--no-deps", *build_args, *services, check=check, capture=False
         )
+        if result.returncode != 0:
+            self.warn(
+                f"Starting {', '.join(services)} failed (exit {result.returncode}); Compose's "
+                "own message is in the console or `journalctl --user -u "
+                "stremioguard-watchdog.service`."
+            )
+            return False
+        return True
 
     def services_confirmed_stopped(self, services: list[str]) -> bool:
         """Whether Docker positively reports none of ``services`` running.
@@ -692,7 +960,11 @@ class GluetunGuard:
         Read from Compose, not .env: stopping must keep working when a .env
         edit no longer parses, and stopping a disabled service is harmless.
         """
-        result = self.runner.run(self._compose_command("config", "--services"), check=True)
+        result = self.runner.run(
+            self._compose_command("config", "--services"),
+            check=True,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+        )
         return [
             service
             for service in (result.stdout or "").split()
@@ -722,7 +994,11 @@ class GluetunGuard:
         if self.container_running(["gluetun"]) or result.returncode != 0:
             container_id = self.service_container_id("gluetun")
             if container_id:
-                self.runner.run(["docker", "stop", "-t", "5", container_id], check=False)
+                self.runner.run(
+                    ["docker", "stop", "-t", "5", container_id],
+                    check=False,
+                    timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+                )
             if self.container_running(["gluetun"]):
                 self.warn(
                     "FATAL: Gluetun VPN container could not be stopped. "
@@ -731,20 +1007,54 @@ class GluetunGuard:
                 return
         self.success("Gluetun VPN container is stopped.")
 
-    def restart_gluetun(self) -> None:
+    def _recreate_gluetun(self, env_override: dict[str, str]) -> bool:
+        """Recreate gluetun and report whether Compose accepted the command.
+
+        `--no-deps`: recovery must not depend on the gate service, whose
+        image may not be on the host (a pulled Dependabot bump) at the very
+        moment the network is unreliable. A failure is logged with Compose's
+        own message; the caller's recovery budget handles the rest.
+        """
+        result = self.compose(
+            "up", "-d", "--no-deps", "--force-recreate", "gluetun", check=False, env=env_override
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            self.warn(
+                f"Recreating gluetun failed (exit {result.returncode})"
+                + (f": {detail[-1][:EVIDENCE_LINE_LIMIT]}" if detail else ".")
+            )
+            return False
+        return True
+
+    def restart_gluetun(self) -> bool:
+        """Restart gluetun; return whether the restart command succeeded.
+
+        Success here is only "Docker accepted it": whether the tunnel came
+        back is what the next health check observes.
+        """
         self.log("Restarting gluetun service (best-effort candidate reselection).")
+        self.capture_gluetun_evidence("restart")
         env_override = nordvpn_endpoint_env(
             self._env_path,
             self.config.root_dir / ".stremio" / "nordvpn-endpoint-cache.json",
             force_refresh=True,
         )
         if env_override:
-            self.compose("up", "-d", "--force-recreate", "gluetun", check=False, env=env_override)
-        else:
-            self.compose("restart", "gluetun", check=False)
+            return self._recreate_gluetun(env_override)
+        result = self.compose("restart", "gluetun", check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            self.warn(
+                f"Restarting gluetun failed (exit {result.returncode})"
+                + (f": {detail[-1][:EVIDENCE_LINE_LIMIT]}" if detail else ".")
+            )
+            return False
+        return True
 
-    def restart_gluetun_relaxed(self) -> None:
+    def restart_gluetun_relaxed(self) -> bool:
         self.log("Restarting gluetun service with relaxed broad country pool.")
+        self.capture_gluetun_evidence("relaxed restart")
         env_override = {
             "SERVER_REGIONS": "",
             "SERVER_CITIES": "",
@@ -753,4 +1063,4 @@ class GluetunGuard:
             "OPENVPN_ENDPOINT_IP": "",
             "WIREGUARD_ENDPOINT_IP": "",
         }
-        self.compose("up", "-d", "--force-recreate", "gluetun", check=False, env=env_override)
+        return self._recreate_gluetun(env_override)

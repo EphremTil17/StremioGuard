@@ -3,7 +3,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,10 +50,13 @@ from stremioguard.config import (
 )
 from stremioguard.env import atomic_write_text, ensure_directory, env_file_value
 from stremioguard.overrides import write_override_bundle
+from stremioguard.overrides.bundle import SPECS
 from stremioguard.preflight import require_docker, verify_bind_addresses
-from stremioguard.publishing import StackPublisher
+from stremioguard.publishing import BUNDLE_MANIFEST_NAME, StackPublisher
+from stremioguard.stacklock import required_stack_lock, stack_lock
 
 ADVISORY_CHECK_INTERVAL_SECONDS = 24 * 3600
+STACK_LOCK_WAIT_SECONDS = 300
 
 # A cached "passed" result is only reusable for a request at the same or a
 # LOWER stage — a compile-only-era cache entry (no "stage" key) must never
@@ -177,7 +182,7 @@ class CometManager:
         return (result.stdout or "").strip() or None
 
     def gateway_config(self) -> CometGatewayConfig:
-        return CometGatewayConfig.from_env(self.config.root_dir)
+        return CometGatewayConfig.from_env(self.config.root_dir, env_file=self.config.env_file)
 
     def gateway_manager(self) -> CometGatewayManager:
         return CometGatewayManager(self.gateway_config(), self.runner)
@@ -207,7 +212,10 @@ class CometManager:
         gateway_manager = CometGatewayManager(gateway_config, self.runner)
         if gateway_config.enabled:
             gateway_manager.prepare_runtime()
-        publisher = StackPublisher(self.config.root_dir)
+        # Rendered from the same configuration this manager was built from:
+        # .env during `./stremio start|restart` (a deploy), the published
+        # snapshot for the Comet-only commands.
+        publisher = StackPublisher(self.config.root_dir, env_file=self.config.env_file)
         publisher.publish()
 
     def postgres_env_file(self) -> Path:
@@ -423,21 +431,107 @@ class CometManager:
             and cached.get("status") == "passed"
         )
 
-    def _manifest_cache_valid(self, image_digest: str, patch_fingerprint: str) -> bool:
-        manifest_path = self.config.state_dir / "bundle-manifest.json"
-        if not manifest_path.exists():
-            return False
+    def active_bundle_manifest(self) -> dict[str, object] | None:
+        """The manifest of the bundle rendered for the active digest, if readable."""
+        active_digest = self.load_state().active_digest
+        if not active_digest:
+            return None
+        manifest_path = self.config.bundle_dir(active_digest) / BUNDLE_MANIFEST_NAME
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return manifest if isinstance(manifest, dict) else None
+
+    def _manifest_cache_valid(
+        self, active_digest: str, image_digest: str, patch_fingerprint: str
+    ) -> bool:
+        bundle_dir = self.config.bundle_dir(active_digest)
+        try:
+            manifest = json.loads((bundle_dir / BUNDLE_MANIFEST_NAME).read_text(encoding="utf-8"))
             return (
-                manifest.get("image_digest") == image_digest
+                manifest.get("active_digest") == active_digest
+                and manifest.get("image_digest") == image_digest
                 and manifest.get("patch_fingerprint") == patch_fingerprint
                 and manifest.get("format_style") == self.config.result_format_style
                 and manifest.get("patch_episode_pack") == self.config.patch_episode_pack_results
                 and manifest.get("gateway_addon_base_url") == self.gateway_addon_base_url()
+                and all((bundle_dir / name).is_file() for name in manifest.get("outputs", {}))
             )
         except Exception:
             return False
+
+    def _render_bundle(self, active_digest: str) -> None:
+        """Render the override bundle for ``active_digest`` into its own directory.
+
+        Rendered into a staging directory and renamed into place only once
+        complete, so the directory for a digest is either absent or whole. A
+        failed render (a required patch that no longer applies, a Docker
+        error) leaves every existing bundle, including the running one,
+        exactly as it was.
+        """
+        image_ref = f"{self.config.image}@{active_digest}"
+        image_digest = self.ensure_image(image_ref)
+        patch_fingerprint = self._managed_patch_fingerprint()
+        if self._manifest_cache_valid(active_digest, image_digest, patch_fingerprint):
+            return
+
+        self.log(
+            "Cache miss for Comet override bundle. "
+            f"Extracting and rendering from image: {image_ref}"
+        )
+        final = self.config.bundle_dir(active_digest)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=final.parent))
+        try:
+            staging.chmod(0o755)
+            with extract_image_source(self.runner, image_ref) as source_root:
+                write_override_bundle(
+                    repo_dir=source_root,
+                    state_dir=staging,
+                    result_format_style=self.config.result_format_style,
+                    patch_episode_pack_results=self.config.patch_episode_pack_results,
+                    gateway_addon_base_url=self.gateway_addon_base_url(),
+                    gateway_enabled=self.gateway_config().enabled,
+                    image_digest=image_digest,
+                    patch_fingerprint=patch_fingerprint,
+                    active_digest=active_digest,
+                )
+            retired: Path | None = None
+            if final.exists():
+                # A running container keeps the files it mounted (bind mounts
+                # hold the inode), so moving the old directory aside is safe.
+                retired = final.with_name(f".retired-{final.name}-{secrets.token_hex(4)}")
+                os.rename(final, retired)
+            try:
+                os.rename(staging, final)
+            except BaseException:
+                if retired is not None:
+                    os.rename(retired, final)
+                    retired = None
+                raise
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        if retired is not None:
+            shutil.rmtree(retired, ignore_errors=True)
+
+    def _prune_bundles(self, keep: set[str | None]) -> None:
+        """Drop bundles for digests that are neither active nor the rollback target."""
+        bundles_root = self.config.state_dir / "bundles"
+        if not bundles_root.is_dir():
+            return
+        keep_names = {self.config.bundle_dir(digest).name for digest in keep if digest}
+        for entry in bundles_root.iterdir():
+            if entry.is_dir() and entry.name not in keep_names:
+                shutil.rmtree(entry, ignore_errors=True)
+
+    def _remove_legacy_flat_bundle(self) -> None:
+        """Delete the pre-per-digest bundle files that lived directly in state_dir."""
+        for name in [*(spec.output_name for spec in SPECS), BUNDLE_MANIFEST_NAME]:
+            legacy = self.config.state_dir / name
+            if legacy.is_file():
+                legacy.unlink()
 
     def _compatibility_diagnostic(self, error: Exception, source_root: Path) -> str:
         text = str(error)
@@ -489,8 +583,11 @@ class CometManager:
             f"Recommended action:\n{action}"
         )
 
-    def validate_compatibility(self, *, force: bool = False, deep: bool = False) -> None:
-        image_ref = self.active_image_ref()
+    def validate_compatibility(
+        self, *, force: bool = False, deep: bool = False, digest: str | None = None
+    ) -> None:
+        """Validate the active image, or ``digest`` before it becomes active."""
+        image_ref = f"{self.config.image}@{digest}" if digest else self.active_image_ref()
         image_digest = self.ensure_image(image_ref)
         source_commit = self.current_commit() or self.load_lock().pinned_commit
         patch_fingerprint = self._managed_patch_fingerprint()
@@ -591,7 +688,8 @@ class CometManager:
         return self.compose(*args, check=check, capture=capture)
 
     def install(self, *, deep: bool = False) -> None:
-        self.prepare_runtime(deep=deep)
+        # Setup, not a deploy: the stack is published by the start that follows.
+        self.prepare_runtime(deep=deep, publish=False)
         if sys.stdin.isatty():
             import typer
 
@@ -745,7 +843,7 @@ class CometManager:
             "StremioGuard and run `./stremio comet update` once support ships."
         )
 
-    def prepare_runtime(self, *, deep: bool = False) -> None:
+    def prepare_runtime(self, *, deep: bool = False, publish: bool = True) -> None:
         self.write_runtime_env()
         if self.gateway_config().enabled:
             # nginx.conf is generated, not mounted from the repo: render it on
@@ -756,30 +854,12 @@ class CometManager:
             self._bootstrap_active_digest(deep=deep)
             state = self.load_state()
 
-        image_ref = f"{self.config.image}@{state.active_digest}"
-        image_digest = self.ensure_image(image_ref)
-        patch_fingerprint = self._managed_patch_fingerprint()
-
-        if self._manifest_cache_valid(image_digest, patch_fingerprint):
+        assert state.active_digest is not None
+        self._render_bundle(state.active_digest)
+        self._prune_bundles({state.active_digest, state.previous_digest})
+        self._remove_legacy_flat_bundle()
+        if publish:
             self.write_stack_override_file()
-            return
-
-        self.log(
-            "Cache miss for Comet override bundle. "
-            f"Extracting and rendering from image: {image_ref}"
-        )
-        with extract_image_source(self.runner, image_ref) as source_root:
-            write_override_bundle(
-                repo_dir=source_root,
-                state_dir=self.config.state_dir,
-                result_format_style=self.config.result_format_style,
-                patch_episode_pack_results=self.config.patch_episode_pack_results,
-                gateway_addon_base_url=self.gateway_addon_base_url(),
-                gateway_enabled=self.gateway_config().enabled,
-                image_digest=image_digest,
-                patch_fingerprint=patch_fingerprint,
-            )
-        self.write_stack_override_file()
 
     def check_bind_addresses(self) -> None:
         verify_bind_addresses(
@@ -865,10 +945,13 @@ class CometManager:
     def promote_candidate(self) -> None:
         """Swap the candidate digest in as active and restart the Comet trio.
 
-        Re-validates in isolation first — the stored candidate report may be
-        stale (patch sources or config can change between check and apply) —
-        so a promotion can never apply a digest that hasn't passed against
-        the exact bits it will run with."""
+        Everything that can fail is done before the swap: the candidate is
+        re-validated in isolation (the stored report may be stale), its
+        bundle is rendered into its own directory, and that bundle is
+        validated against the image. Only then does state.json change, in
+        one atomic write. A failure at any earlier step leaves the active
+        digest, its bundle and the running stack untouched.
+        """
         state = self.load_state()
         if state.candidate is None:
             raise RuntimeError("No candidate digest recorded. Run a remote check first.")
@@ -879,47 +962,71 @@ class CometManager:
                 f"Candidate {digest} failed re-validation and cannot be promoted:\n"
                 f"{report['detail']}"
             )
-        self.save_state(
+        self._activate_digest(
+            digest,
             CometState(
                 active_digest=digest,
                 previous_digest=state.active_digest,
                 candidate=None,
                 last_remote_check=state.last_remote_check,
-            )
+            ),
+            f"Promoted Comet to {self.config.image}@{digest}. Restarting the Comet stack.",
         )
-        self.prepare_runtime()
-        self.validate_compatibility(force=True)
-        self.log(f"Promoted Comet to {self.config.image}@{digest}. Restarting the Comet stack.")
-        self._up()
 
     def rollback(self) -> None:
         """Swap active/previous digest one level deep and restart."""
         state = self.load_state()
         if not state.previous_digest:
             raise RuntimeError("No previous digest recorded; nothing to roll back to.")
-        self.save_state(
+        self._activate_digest(
+            state.previous_digest,
             CometState(
                 active_digest=state.previous_digest,
                 previous_digest=state.active_digest,
                 candidate=None,
                 last_remote_check=state.last_remote_check,
-            )
+            ),
+            f"Rolled back Comet to {self.config.image}@{state.previous_digest}. Restarting.",
         )
-        self.prepare_runtime()
-        self.validate_compatibility(force=True)
-        self.log(f"Rolled back Comet to {self.config.image}@{state.previous_digest}. Restarting.")
-        self._up()
+
+    def _activate_digest(self, digest: str, new_state: CometState, message: str) -> None:
+        # Prepare: nothing here changes what the stack runs.
+        self._render_bundle(digest)
+        self.validate_compatibility(force=True, digest=digest)
+        # Commit: one atomic write. From here the active digest has a
+        # complete, validated bundle, whatever happens next.
+        self.save_state(new_state)
+        self.log(message)
+        try:
+            self.prepare_runtime()
+            self._up()
+        except Exception:
+            self.warn(
+                f"{self.config.image}@{digest} is now the active image and its bundle is "
+                "complete, but restarting the Comet stack failed. Fix the cause and run "
+                "`./stremio restart`, or return with `./stremio comet update rollback`."
+            )
+            raise
 
     def _up(self) -> None:
         # `--no-deps`: never let a Comet restart recreate gluetun (see
         # GluetunGuard.start_services). If gluetun is not running, joining its
-        # namespace fails and nothing starts.
-        self.compose_fresh("up", "-d", "--no-deps", *self.config.runtime_services, capture=False)
+        # namespace fails and nothing starts. Under the stack lock so the
+        # watchdog's own auto-start cannot run `compose up` on the same
+        # services at the same moment.
+        with required_stack_lock(
+            self.config.root_dir, wait_seconds=STACK_LOCK_WAIT_SECONDS, purpose="restart Comet"
+        ):
+            self.compose_fresh(
+                "up", "-d", "--no-deps", *self.config.runtime_services, capture=False
+            )
 
     def stop(self) -> None:
         self.require_commands()
         self.log("Stopping Comet stack.")
-        self.compose("stop", *self.config.runtime_services, check=False, capture=False)
+        # Best-effort lock: stopping is never less safe, so it does not wait forever.
+        with stack_lock(self.config.root_dir, wait_seconds=60):
+            self.compose("stop", *self.config.runtime_services, check=False, capture=False)
 
     def status(self) -> None:
         current = self.current_commit()
@@ -1087,14 +1194,10 @@ class CometManager:
             )
 
         # Check mounted bundle manifest matches active digest
-        manifest_path = self.config.state_dir / "bundle-manifest.json"
-        if not manifest_path.exists():
-            raise RuntimeError("Bundle manifest is missing.")
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest_digest = manifest.get("image_digest")
-        except Exception as error:
-            raise RuntimeError(f"Failed to read bundle manifest: {error}") from error
+        manifest = self.active_bundle_manifest()
+        if manifest is None:
+            raise RuntimeError("Bundle manifest for the active image is missing or unreadable.")
+        manifest_digest = manifest.get("image_digest")
 
         active_digest = self._image_digest(active_image_ref)
         if manifest_digest != active_digest:

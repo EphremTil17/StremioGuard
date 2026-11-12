@@ -604,15 +604,33 @@ class PromoteCandidateTests(unittest.TestCase):
                     candidate=CandidateDigest(digest=SHA_OTHER, checked_at="t"),
                 )
             )
+            # What state.json said at the moment each step ran: rendering and
+            # validating the candidate must happen BEFORE the commit.
+            seen: list[tuple[str, str | None]] = []
+
+            def record(step: str):
+                return lambda *args, **kwargs: seen.append(
+                    (step, manager.load_state().active_digest)
+                )
+
             with (
                 mock.patch.object(
                     manager,
                     "_validate_digest",
                     return_value={"status": "passed", "detail": "", "degraded": []},
                 ),
-                mock.patch.object(manager, "prepare_runtime") as prepare_runtime,
-                mock.patch.object(manager, "validate_compatibility") as validate_compat,
-                mock.patch.object(manager, "compose_fresh") as compose_fresh,
+                mock.patch.object(
+                    manager, "_render_bundle", side_effect=record("render")
+                ) as render_bundle,
+                mock.patch.object(
+                    manager, "validate_compatibility", side_effect=record("validate")
+                ) as validate_compat,
+                mock.patch.object(
+                    manager, "prepare_runtime", side_effect=record("prepare")
+                ) as prepare_runtime,
+                mock.patch.object(
+                    manager, "compose_fresh", side_effect=record("up")
+                ) as compose_fresh,
             ):
                 manager.promote_candidate()
 
@@ -620,10 +638,53 @@ class PromoteCandidateTests(unittest.TestCase):
             self.assertEqual(state.active_digest, SHA_OTHER)
             self.assertEqual(state.previous_digest, SHA_LATEST)
             self.assertIsNone(state.candidate)
+            render_bundle.assert_called_once_with(SHA_OTHER)
+            validate_compat.assert_called_once_with(force=True, digest=SHA_OTHER)
             prepare_runtime.assert_called_once()
-            validate_compat.assert_called_once_with(force=True)
             compose_fresh.assert_called_once()
             self.assertEqual(compose_fresh.call_args.args[0], "up")
+            self.assertEqual(
+                seen,
+                [
+                    ("render", SHA_LATEST),
+                    ("validate", SHA_LATEST),
+                    ("prepare", SHA_OTHER),
+                    ("up", SHA_OTHER),
+                ],
+            )
+
+    def test_promote_leaves_state_unchanged_when_candidate_validation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = make_comet_config(Path(directory))
+            manager = CometManager(cfg, FakeRunner({}))
+            manager.save_state(
+                CometState(
+                    active_digest=SHA_LATEST,
+                    candidate=CandidateDigest(digest=SHA_OTHER, checked_at="t"),
+                )
+            )
+            state_file = cfg.state_dir / "state.json"
+            before = state_file.read_bytes()
+            with (
+                mock.patch.object(
+                    manager,
+                    "_validate_digest",
+                    return_value={"status": "passed", "detail": "", "degraded": []},
+                ),
+                mock.patch.object(manager, "_render_bundle"),
+                mock.patch.object(
+                    manager,
+                    "validate_compatibility",
+                    side_effect=RuntimeError("import-smoke stage failed"),
+                ),
+                mock.patch.object(manager, "prepare_runtime") as prepare_runtime,
+                mock.patch.object(manager, "compose_fresh") as compose_fresh,
+                self.assertRaisesRegex(RuntimeError, "import-smoke"),
+            ):
+                manager.promote_candidate()
+            self.assertEqual(state_file.read_bytes(), before)
+            prepare_runtime.assert_not_called()
+            compose_fresh.assert_not_called()
 
 
 class RollbackTests(unittest.TestCase):
@@ -640,8 +701,9 @@ class RollbackTests(unittest.TestCase):
             manager = CometManager(cfg, FakeRunner({}))
             manager.save_state(CometState(active_digest=SHA_OTHER, previous_digest=SHA_LATEST))
             with (
+                mock.patch.object(manager, "_render_bundle") as render_bundle,
                 mock.patch.object(manager, "prepare_runtime"),
-                mock.patch.object(manager, "validate_compatibility"),
+                mock.patch.object(manager, "validate_compatibility") as validate_compat,
                 mock.patch.object(manager, "compose_fresh") as compose_fresh,
             ):
                 manager.rollback()
@@ -649,6 +711,8 @@ class RollbackTests(unittest.TestCase):
             state = manager.load_state()
             self.assertEqual(state.active_digest, SHA_LATEST)
             self.assertEqual(state.previous_digest, SHA_OTHER)
+            render_bundle.assert_called_once_with(SHA_LATEST)
+            validate_compat.assert_called_once_with(force=True, digest=SHA_LATEST)
             compose_fresh.assert_called_once()
 
 
@@ -717,3 +781,147 @@ class AdvisoryUpdateCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _tree_bytes(directory: Path) -> dict[str, bytes]:
+    """Every file under ``directory`` with its exact contents."""
+    return {
+        str(path.relative_to(directory)): path.read_bytes()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+    }
+
+
+class BundleActivationTests(unittest.TestCase):
+    """promote_candidate with the real per-digest renderer: only Docker
+    (image inspect/pull, `docker cp`) and the import-smoke validation are
+    stubbed. Assertions are on state.json bytes, bundle directories on disk
+    and the published compose override, not on which mocks were called."""
+
+    def _manager(self, tmp_path: Path) -> CometManager:
+        (tmp_path / ".env").write_text(
+            "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=0\n", encoding="utf-8"
+        )
+        cfg = make_comet_config(tmp_path, patch_episode_pack_results=False)
+        _write_lock(cfg.lock_file, commit="deadbeef")
+        _write_valid_sources_without_torrentio(cfg)
+        manager = CometManager(cfg, FakeRunner({}))
+        # Render the running image's bundle for real, then record a candidate.
+        with self._docker_stubs(manager):
+            manager._render_bundle(SHA_LATEST)
+        manager.save_state(
+            CometState(
+                active_digest=SHA_LATEST,
+                candidate=CandidateDigest(digest=SHA_OTHER, checked_at="t"),
+            )
+        )
+        return manager
+
+    @staticmethod
+    def _docker_stubs(manager: CometManager):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        stack.enter_context(
+            mock.patch.object(
+                manager, "ensure_image", side_effect=lambda ref: ref.rsplit("@", 1)[1]
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                manager_mod,
+                "extract_image_source",
+                side_effect=lambda runner, image_ref: _stub_extract(manager.config.repo_dir),
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                manager,
+                "_validate_digest",
+                return_value={"status": "passed", "detail": "", "degraded": []},
+            )
+        )
+        stack.enter_context(mock.patch.object(manager, "validate_compatibility"))
+        return stack
+
+    def test_failed_render_leaves_state_and_running_bundle_byte_for_byte(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(Path(directory))
+            cfg = manager.config
+            state_file = cfg.state_dir / "state.json"
+            active_bundle = cfg.bundle_dir(SHA_LATEST)
+            state_before = state_file.read_bytes()
+            bundle_before = _tree_bytes(active_bundle)
+            self.assertIn("bundle-manifest.json", bundle_before)
+
+            def half_written(*, state_dir: Path, **kwargs: object) -> None:
+                # A renderer that got partway before a required patch failed.
+                (state_dir / "stream.py").write_text("# partial\n", encoding="utf-8")
+                raise RuntimeError("Required patch 'stream' failed to apply")
+
+            with (
+                self._docker_stubs(manager),
+                mock.patch.object(manager_mod, "write_override_bundle", side_effect=half_written),
+                mock.patch.object(manager, "compose_fresh") as compose_fresh,
+                self.assertRaisesRegex(RuntimeError, "Required patch 'stream'"),
+            ):
+                manager.promote_candidate()
+
+            self.assertEqual(state_file.read_bytes(), state_before)
+            self.assertEqual(_tree_bytes(active_bundle), bundle_before)
+            self.assertFalse(cfg.bundle_dir(SHA_OTHER).exists())
+            # No staging directory is left behind for a later prune to find.
+            self.assertEqual(
+                sorted(p.name for p in (cfg.state_dir / "bundles").iterdir()),
+                [active_bundle.name],
+            )
+            compose_fresh.assert_not_called()
+
+    def test_successful_promotion_keeps_both_bundles_and_publishes_the_new_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = self._manager(root)
+            cfg = manager.config
+            # A legacy flat bundle from before the per-digest layout.
+            (cfg.state_dir / "bundle-manifest.json").write_text("{}", encoding="utf-8")
+            (cfg.state_dir / "stream.py").write_text("# legacy\n", encoding="utf-8")
+            # An unused bundle for a digest that is neither active nor previous.
+            stale = cfg.bundle_dir("sha256:" + "4" * 64)
+            stale.mkdir(parents=True)
+            (stale / "bundle-manifest.json").write_text("{}", encoding="utf-8")
+
+            with self._docker_stubs(manager):
+                manager.promote_candidate()
+
+            state = manager.load_state()
+            self.assertEqual(state.active_digest, SHA_OTHER)
+            self.assertEqual(state.previous_digest, SHA_LATEST)
+            for digest in (SHA_LATEST, SHA_OTHER):
+                manifest = json.loads(
+                    (cfg.bundle_dir(digest) / "bundle-manifest.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["active_digest"], digest)
+                for name in manifest["outputs"]:
+                    self.assertTrue((cfg.bundle_dir(digest) / name).is_file(), name)
+            self.assertFalse(stale.exists())
+            self.assertFalse((cfg.state_dir / "bundle-manifest.json").exists())
+            self.assertFalse((cfg.state_dir / "stream.py").exists())
+
+            override = (root / ".stremio" / "docker-compose.bindings.yml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(f"image: g0ldyy/comet@{SHA_OTHER}", override)
+            new_bundle = cfg.bundle_dir(SHA_OTHER)
+            self.assertIn(
+                f"- {new_bundle / 'stream.py'}:/app/comet/api/endpoints/stream.py:ro", override
+            )
+            self.assertNotIn(str(cfg.bundle_dir(SHA_LATEST)), override)
+            # The restart ran `up` for the Comet services against that override.
+            runner = manager.runner
+            assert isinstance(runner, FakeRunner)
+            up_calls = [call for call in runner.calls if "up" in call]
+            self.assertEqual(len(up_calls), 1)
+            self.assertEqual(
+                up_calls[0][-len(cfg.runtime_services) - 3 :],
+                ["up", "-d", "--no-deps", *cfg.runtime_services],
+            )

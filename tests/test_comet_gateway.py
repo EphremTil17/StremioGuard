@@ -323,3 +323,73 @@ def test_access_log_masks_every_path_but_the_gateway_admin_ones(tmp_path: Path) 
     assert masked("GET /eyJrZXkiOiJzZWNyZXQifQ==/manifest.json HTTP/1.1") == "GET /*** HTTP/1.1"
     assert masked("GET /configure HTTP/1.1") == "GET /configure HTTP/1.1"
     assert masked("GET / HTTP/1.1") == "GET / HTTP/1.1"
+
+
+def _nginx_maps(text: str) -> dict[tuple[str, str], dict[str, str]]:
+    """Every `map $source $target { key value; }` block as a dict."""
+    maps: dict[tuple[str, str], dict[str, str]] = {}
+    for match in re.finditer(r"map (\$\w+) (\$\w+) \{\n(.*?)\n\}", text, re.DOTALL):
+        entries: dict[str, str] = {}
+        for line in match.group(3).splitlines():
+            key, value = line.strip().rstrip(";").rsplit(" ", 1)
+            entries[key.strip('"')] = value.strip('"')
+        maps[(match.group(1), match.group(2))] = entries
+    return maps
+
+
+def test_access_log_attributes_requests_by_token_id_never_token(tmp_path: Path) -> None:
+    manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
+    first_id, first = manager.add_token("Living room")
+    second_id, second = manager.add_token("Phone")
+    manager.write_nginx_configs()
+    tokens_map = manager.config.tokens_map_file.read_text(encoding="utf-8")
+
+    maps = _nginx_maps(tokens_map)
+    assert maps[("$gateway_token", "$token_valid")] == {"default": "0", first: "1", second: "1"}
+    ids = maps[("$gateway_token", "$gateway_token_id")]
+    assert ids == {"default": "-", first: first_id, second: second_id}
+    # A token is only ever a map KEY; no value nginx can log is a token.
+    for table in maps.values():
+        assert not {first, second} & set(table.values())
+
+    conf = manager.config.nginx_conf_file.read_text(encoding="utf-8")
+    log_format = conf.split("log_format main", 1)[1].split(";", 1)[0]
+    assert "tid=$gateway_token_id" in log_format
+    assert "$gateway_token " not in log_format and "$gateway_token'" not in log_format
+    assert first not in conf and second not in conf
+
+    # A revoked token disappears from both maps.
+    manager.revoke_token(first_id)
+    maps = _nginx_maps(manager.render_tokens_map())
+    assert first not in maps[("$gateway_token", "$gateway_token_id")]
+    assert first not in maps[("$gateway_token", "$token_valid")]
+
+
+def test_token_commands_reload_nginx_but_never_republish_the_stack(tmp_path: Path) -> None:
+    from stremioguard.cli.commands import comet_token
+
+    state = tmp_path / ".stremio"
+    state.mkdir(exist_ok=True)
+    published = {
+        "docker-compose.bindings.yml": b"# published override\n",
+        "env.snapshot": b"# published snapshot\n",
+        "compose.base.yml": b"# published base\n",
+    }
+    for name, content in published.items():
+        (state / name).write_bytes(content)
+    # An undeployed .env edit that a republish would pick up.
+    (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=10.9.9.9\nCOMET_ENABLED=1\n")
+    manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
+    with (
+        mock.patch.object(comet_token, "_comet_gateway_manager", return_value=manager),
+        mock.patch.object(manager, "container_running", return_value=True),
+        mock.patch.object(manager, "reload_nginx") as reload_nginx,
+        mock.patch("stremioguard.publishing.StackPublisher.publish") as publish,
+    ):
+        comet_token.comet_token_add("Phone", make_default=False)
+        token_id = manager.list_tokens()[0]["id"]
+        comet_token.comet_token_revoke(str(token_id))
+    assert reload_nginx.call_count == 2
+    publish.assert_not_called()
+    for name, content in published.items():
+        assert (state / name).read_bytes() == content, name

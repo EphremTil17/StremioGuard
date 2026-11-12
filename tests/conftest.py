@@ -75,6 +75,7 @@ class FakeRunner:
         self.responses = responses
         self.calls: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
+        self.timeouts: list[float | None] = []
 
     def run(
         self,
@@ -87,6 +88,7 @@ class FakeRunner:
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
         self.envs.append(env)
+        self.timeouts.append(timeout)
         key = tuple(args)
         response = self.responses.get(key)
         if isinstance(response, list):
@@ -242,26 +244,56 @@ def record_test_digest(state_dir: Path) -> None:
     CometState(active_digest=TEST_COMET_DIGEST).save(state_dir / STATE_FILE_NAME)
 
 
-def write_minimal_bundle_manifest(comet_config: CometConfig) -> None:
-    """Satisfy StackPublisher's fail-closed manifest and digest-pin checks."""
+MINIMAL_BUNDLE_OUTPUTS = {
+    "app.py": "/app/comet/api/app.py",
+    "logger.py": "/app/comet/core/logger.py",
+    "stream.py": "/app/comet/api/endpoints/stream.py",
+    "media_search.py": "/app/comet/services/media_search.py",
+    "config.py": "/app/comet/api/endpoints/config.py",
+    "index.html": "/app/comet/templates/index.html",
+}
+
+
+def write_bundle(
+    comet_config: CometConfig,
+    digest: str = TEST_COMET_DIGEST,
+    *,
+    outputs: dict[str, str] | None = None,
+    manifest_digest: str | None = None,
+    create_files: bool = True,
+    extra: dict[str, object] | None = None,
+) -> Path:
+    """Write a per-digest override bundle: its manifest and the listed files.
+
+    ``manifest_digest`` overrides the recorded ``active_digest`` (to build a
+    bundle that claims another image); ``create_files=False`` leaves the
+    listed outputs absent on disk.
+    """
     import json
 
+    bundle_dir = comet_config.bundle_dir(digest)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    outputs = dict(MINIMAL_BUNDLE_OUTPUTS if outputs is None else outputs)
+    if create_files:
+        for name in outputs:
+            (bundle_dir / name).write_text(f"# patched {name}\n", encoding="utf-8")
+    manifest: dict[str, object] = {
+        "active_digest": digest if manifest_digest is None else manifest_digest,
+        "outputs": outputs,
+        **(extra or {}),
+    }
+    (bundle_dir / "bundle-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return bundle_dir
+
+
+def write_minimal_bundle_manifest(comet_config: CometConfig) -> Path:
+    """Satisfy StackPublisher's fail-closed manifest and digest-pin checks.
+
+    Records TEST_COMET_DIGEST as active and writes a complete bundle for it
+    in ``comet_config.bundle_dir(TEST_COMET_DIGEST)``.
+    """
     record_test_digest(comet_config.state_dir)
-    (comet_config.state_dir / "bundle-manifest.json").write_text(
-        json.dumps(
-            {
-                "outputs": {
-                    "app.py": "/app/comet/api/app.py",
-                    "logger.py": "/app/comet/core/logger.py",
-                    "stream.py": "/app/comet/api/endpoints/stream.py",
-                    "media_search.py": "/app/comet/services/media_search.py",
-                    "config.py": "/app/comet/api/endpoints/config.py",
-                    "index.html": "/app/comet/templates/index.html",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
+    return write_bundle(comet_config)
 
 
 # Current upstream shape of comet/api/app.py's request logger (the parts the

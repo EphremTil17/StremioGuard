@@ -119,7 +119,7 @@ automatically.
   [StremThru](https://github.com/MunifTanjim/stremthru) container (`stremthru`),
   pinned by digest. Comet's default is a public instance run by a third party,
   which sees the debrid key in every request and has gone offline before. Ours
-  listens on `127.0.0.1:8080` inside gluetun's namespace, is never published,
+  listens on `127.0.0.1:8091` inside gluetun's namespace, is never published,
   has peering with the public instance and every optional feature turned off,
   and gets a generated user (`.stremio/stremthru/stremthru.env`) so it never
   prints an auto-generated admin password. `./stremio status` reports whether
@@ -309,7 +309,8 @@ With no arguments, `./stremio` behaves like `./stremio start`.
 - `stremio`, `comet`, `comet-postgres`, and `comet-gateway` use `restart: "no"` so Docker does not revive them before the verifier and validation checks have run.
 - `gluetun` uses `restart: unless-stopped` so it can recover across host reboots and transient handshake failures.
 - Every other third-party image (`stremthru`, `comet-gateway`'s nginx, `comet-postgres`, and the `docker compose up` gate's busybox) is pinned by digest; Dependabot proposes bumps, and Postgres majors stay manual because they need a data-directory upgrade. Comet is pinned by the generated override to the digest `./stremio comet update` promoted.
-- `gluetun` tracks the `qmcgaw/gluetun:v3` release channel (not `latest` master builds). Every `./stremio start`/`restart` best-effort pulls the newest v3 release before bringing gluetun up; a failed or slow pull only logs a warning and gluetun boots from the existing local image. A bad release fails closed: the watchdog holds all services down until gluetun is healthy and the IP check passes, and rolling back is re-pinning one line in `docker-compose.yml`.
+- `gluetun` is pinned by digest too, and Dependabot proposes its bumps. It is the container the kill switch lives in, and the watchdog relies on details of it (its healthcheck, `wget`, its log wording, the control-server route), so a new release is reviewed rather than picked up by whichever start happens next. `./stremio start`/`restart` best-effort pull the pinned image when it is missing; a failed or slow pull only logs a warning and gluetun boots from the image already on the host.
+- Every service shares gluetun's network namespace and therefore one port space. `NAMESPACE_PORTS` in `src/stremioguard/config.py` is the registry; a test checks `docker-compose.yml` against it. Add a port there before giving a new service one.
 
 ### Useful commands
 
@@ -329,7 +330,7 @@ Command guide:
   Guided setup and safe re-init. Creates `.env` from `.env.example` when needed; later runs offer a redacted `.env` summary and can restart unchanged configuration without re-entering secrets. Declining reuse opens the guided editor with existing non-secret values as defaults. Generated `.stremio` files are runtime state, never a second configuration source.
 
 - `./stremio start`
-  Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then starts the supervised watchdog and returns to the shell. A watchdog that is already running is left alone unless its unit or forwarded settings changed. When `COMET_ENABLED=1`, it also prepares and starts Comet automatically.
+  Normal day-to-day entry point. If no Compose instance exists yet, it performs the safe first start automatically, then starts the supervised watchdog and returns to the shell. It is also the deploy step: it publishes the current `.env` and `docker-compose.yml` (see [What the stack runs from](#what-the-stack-runs-from)), so that is when an edit takes effect. A gluetun that is already running keeps its VPN server and is recreated only if its own configuration changed. A watchdog that is already running is left alone unless its unit, a forwarded setting or the published configuration changed. When `COMET_ENABLED=1`, it also prepares and starts Comet automatically.
 
 - `./stremio restart`
   Reset/build/start flow. Runs `docker compose down --remove-orphans`, brings gluetun back up, rebuilds the local Stremio image, and starts Stremio again. When `COMET_ENABLED=1`, it also refreshes Comet runtime files and restarts Comet. It does not delete `stremio-data/`, `gluetun-data/`, or `.stremio/comet/`.
@@ -361,15 +362,35 @@ Additional watchdog parameters:
 - `PUBLIC_IP_FAILURE_THRESHOLD`: The number of consecutive failed public IP checks (returning `UNKNOWN` status) before the watchdog shuts down the stack to fail closed (default: `3`).
 - `EGRESS_PROBE_INTERVAL_SECONDS`: How long a verified tunnel egress IP is trusted before the watchdog re-probes it live and re-compares it with this host's direct IP (default: `300`). This bounds leak-detection latency. Recovery after a VPN outage always re-probes immediately. Gluetun's control-server IP is only fetched once per gluetun start and goes stale after an in-tunnel reconnect, so a difference between it and the live egress is logged once and never stops services.
 - `VPN_RECOVERY_BUDGET_SECONDS` / `VPN_RESTART_CADENCE_SECONDS`: How long the watchdog keeps restarting an unhealthy gluetun (default: `300`, every `45` seconds) before it trips the circuit breaker.
+- `MAX_AUTO_STARTS_PER_HOUR`: How many times the watchdog may start the services on its own within an hour before it treats the cycle as a fault and trips the circuit breaker (default: `10`; `0` disables the limit).
 
 Log summaries are decoupled from the poll cadence and default to every 5 minutes. Tune them with `WATCHDOG_LOG_INTERVAL_SECONDS` (`0` logs every tick). All of these can live in `.env`. A value exported in your shell reaches the supervised watchdog only because `./stremio start` forwards a fixed list of known keys to `.stremio/watchdog.env`; anything else exported in the shell does not. Changing a forwarded value and rerunning `./stremio start` restarts the watchdog to apply it.
 
 On a bad signal, the watchdog fails closed:
 
-- **gluetun unhealthy:** it stops the protected services, restarts gluetun every `VPN_RESTART_CADENCE_SECONDS` (widening a narrow server filter to the whole country halfway through the budget), and resumes services once gluetun is healthy and a fresh egress probe passes. If the provider rejects the credentials or the budget runs out, it trips the circuit breaker: it writes the lockout marker `.stremio/vpn-lockout`, stops the services and gluetun, and exits with status 78.
-- **public IP check unsafe:** it stops the protected services at once; after `PUBLIC_IP_FAILURE_THRESHOLD` consecutive unknown results, it does the same.
+- **gluetun unhealthy:** it stops the protected services, copies gluetun's recent log into the run log (recreating the container deletes it), restarts gluetun every `VPN_RESTART_CADENCE_SECONDS` (widening a narrow server filter to the whole country halfway through the budget), and resumes services once gluetun is healthy and a fresh egress probe passes. If the budget runs out, it trips the circuit breaker: it writes the lockout marker `.stremio/vpn-lockout`, stops the services and gluetun, and exits with status 78.
+- **credentials rejected:** providers answer `AUTH_FAILED` for a connection limit or a busy server as well as for bad credentials, so one sighting only logs a warning. Seen again after gluetun has been restarted onto another server, it trips the circuit breaker (`auth_rejected`).
+- **leak verdict** (the tunnel egress equals this host's own address, the saved home baseline, or differs from `EXPECTED_VPN_IP`): it stops the protected services at once. A second verdict in a row trips the circuit breaker (`egress_leak`); a leak means the kill switch did not hold, so resuming is your decision. After `PUBLIC_IP_FAILURE_THRESHOLD` consecutive *unknown* results it stops the services and keeps checking.
+- **gluetun restarted on its own** (a crash, an OOM kill, a manual `docker restart`): services that joined its previous network namespace still look healthy but can reach nothing. The watchdog compares each service's start time and namespace with gluetun's and restarts the ones left behind.
+- **stop/start loop:** more than `MAX_AUTO_STARTS_PER_HOUR` automatic starts trips the circuit breaker (`service_flapping`), whatever the cause.
+
+The lockout marker records the reason and the evidence behind it (for example the log line, or how long gluetun stayed unhealthy); `./stremio status` shows both.
 
 Restarting services never touches gluetun (`docker compose up --no-deps`), so the tunnel that was just verified is the one they join.
+
+### What the stack runs from
+
+`./stremio start` and `./stremio restart` publish a generation under `.stremio/`: a copy of `docker-compose.yml` (`compose.base.yml`), a normalized snapshot of `.env` (`env.snapshot`), gluetun's share of it (`gluetun.env`), the generated override, and one patch bundle per Comet image digest (`comet/bundles/`). Every Compose call and the watchdog use those files, not the working tree. Editing `.env`, editing `docker-compose.yml` or running `git pull` therefore changes nothing until the next start or restart, and a mistake in an edit is reported by the command you ran, not by the watchdog during a later VPN recovery. The Comet commands (`./stremio comet start`, `comet update apply|rollback`, `comet token ...`) act on the running stack, so they read the published snapshot rather than `.env`: they change the Comet image, its bundle or the token map, and never deploy a pending edit.
+
+`.env` is read by one parser, and Compose only ever sees the normalized snapshot, so the two cannot disagree about a value. The grammar is Compose's without variable expansion: optional `export`, single or double quotes, `#` after whitespace starts a comment, and the last assignment of a key wins. A `$` in a value is literal.
+
+The Python code itself still runs from the checkout. Run a deployment from a checkout you do not develop in (a tagged clone or `git worktree`), so a half-finished branch is never what the boot unit starts.
+
+Commands that start, stop or recreate containers take one lock (`.stremio/stack.lock`). The watchdog holds it for each check and stands aside while a CLI command holds it, for at most ten minutes; it keeps checking for a leak meanwhile and stops the services on a definitive verdict without waiting.
+
+### Alerts
+
+Set `STREMIO_ALERT_URL` in `.env` to an HTTP(S) endpoint to be told about events that otherwise only reach the run log: a lockout, a leak verdict, the fail-safe running, a watchdog that keeps failing, and gluetun restarting on its own. Each is one plain-text `POST` with ntfy-style `Title`/`Priority`/`Tags` headers (an [ntfy](https://ntfy.sh) topic URL works as is; other webhooks ignore the headers). Alerts never contain an IP address or a secret, repeat at most every 15 minutes per event, and are best-effort: delivery is not retried and a failure only logs a warning. The request leaves from this host's own connection, not through the tunnel, because an alert about a dead VPN cannot depend on the VPN.
 
 ### Watchdog supervision
 
@@ -385,7 +406,7 @@ Because the watchdog runs in your user's service manager, it no longer belongs t
 
 What happens when the watchdog stops unexpectedly:
 
-1. **Crash, or no heartbeat for 10 minutes** (for example, a hung Docker call): systemd restarts it after 5s, then about 10s, 20s, 40s and so on, up to 5 minutes between attempts. The protected services keep running during these retries, and gluetun's kill switch still blocks traffic outside the tunnel.
+1. **Crash, or no heartbeat for 5 minutes** (for example, a hung Docker call; each Docker call the watchdog makes is also bounded on its own): systemd restarts it after 5s, then about 10s, 20s, 40s and so on, up to 5 minutes between attempts. The protected services keep running during these retries, and gluetun's kill switch still blocks traffic outside the tunnel.
 2. **Too many restarts** (the seventh start within an hour): systemd gives up, and the fail-safe unit locks out and stops the protected services. That bounds the time without a watchdog to roughly five minutes of retries.
 3. **Exit status 78** (circuit breaker or an existing lockout): no restart. The fail-safe runs and keeps the original lockout reason.
 

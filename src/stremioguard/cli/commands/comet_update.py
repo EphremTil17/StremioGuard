@@ -4,8 +4,6 @@ state machine (Phase 4). Never auto-applies: `check` only recommends,
 
 from __future__ import annotations
 
-import json
-
 import typer
 from loguru import logger
 
@@ -19,15 +17,15 @@ from stremioguard.env import fail
 def _current_manifest_names(manager: CometManager) -> tuple[set[str], set[str]]:
     """Applied/skipped patch names from the manifest of the CURRENTLY active
     digest, for diffing against a validated candidate's report."""
-    manifest_path = manager.config.state_dir / "bundle-manifest.json"
-    if not manifest_path.exists():
+    manifest = manager.active_bundle_manifest()
+    if manifest is None:
         return set(), set()
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set(), set()
-    applied = set(manifest.get("applied", []))
-    skipped = {entry.get("name") for entry in manifest.get("skipped", []) if entry.get("name")}
+    applied = set(manifest.get("applied") or [])  # type: ignore[arg-type]
+    skipped = {
+        entry.get("name")
+        for entry in manifest.get("skipped") or []  # type: ignore[union-attr]
+        if entry.get("name")
+    }
     return applied, skipped
 
 

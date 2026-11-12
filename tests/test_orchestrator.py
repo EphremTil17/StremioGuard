@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 import unittest
@@ -29,7 +30,7 @@ GLUETUN_HEALTH_INSPECT = (
     "docker",
     "inspect",
     "--format",
-    "{{.State.Health.Status}}",
+    guard_mod.GLUETUN_STATE_FORMAT,
     "gluetun",
 )
 
@@ -201,7 +202,10 @@ class OrchestratorTests(unittest.TestCase):
 
             # First-time setup reached from `start` is not a recovery request:
             # it must honour a lockout like any other start.
-            preflight_mock.assert_called_once_with(allow_recovery=False, defer_vpn_recovery=True)
+            # Not a reset either: a running gluetun keeps its endpoint.
+            preflight_mock.assert_called_once_with(
+                allow_recovery=False, defer_vpn_recovery=True, keep_running_gluetun=True
+            )
             compose_fresh_mock.assert_not_called()
 
     def test_first_time_setup_never_clears_a_lockout(self) -> None:
@@ -313,7 +317,11 @@ class OrchestratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             runner = FakeRunner(
-                {GLUETUN_HEALTH_INSPECT: completed(list(GLUETUN_HEALTH_INSPECT), "healthy\n")}
+                {
+                    GLUETUN_HEALTH_INSPECT: completed(
+                        list(GLUETUN_HEALTH_INSPECT), "healthy|2026-11-11T10:00:00Z\n"
+                    )
+                }
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
@@ -580,32 +588,107 @@ class OrchestratorTests(unittest.TestCase):
                     orch.watch_stremio()
                 self.assertEqual(ctx.exception.exit_code, 78)
 
-    def test_immediate_trip_on_first_tick_auth_failure(self) -> None:
+    def test_first_tick_auth_rejection_alone_does_not_lock_out(self) -> None:
+        # Providers also answer AUTH_FAILED for a connection limit or a busy
+        # server: one sighting restarts gluetun, it does not lock out.
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
             orch = Orchestrator(guard)
+            line = (
+                "2026-11-11T10:00:00Z ERROR [openvpn] AUTH: Received control message: AUTH_FAILED"
+            )
+
+            with (
+                mock.patch.object(guard, "gluetun_healthy", return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", return_value=line) as evidence,
+                mock.patch.object(guard, "stop_active_services") as mock_stop_services,
+                mock.patch.object(guard, "restart_gluetun") as mock_restart,
+                mock.patch.object(guard, "stop_gluetun") as mock_stop_gluetun,
+                mock.patch("time.monotonic", return_value=1000.0),
+                mock.patch("time.time", return_value=5000.0),
+            ):
+                orch.watch_once()
+
+            evidence.assert_called_once_with(lines=200, since_epoch=5000.0 - 600)
+            mock_stop_services.assert_called()
+            mock_restart.assert_called_once()
+            mock_stop_gluetun.assert_not_called()
+            self.assertFalse(guard.config.vpn_lockout_file.exists())
+            self.assertEqual(orch.auth_rejection_generations, {0})
+
+    def test_auth_rejection_in_two_restart_generations_locks_out(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_config(
+                tmp_path, vpn_recovery_budget_seconds=1000, vpn_restart_cadence_seconds=45
+            )
+            guard = GluetunGuard(cfg, FakeRunner({}))
+            orch = Orchestrator(guard)
+
+            def line(stamp: str) -> str:
+                # Gluetun timestamps every line, which is what tells a new
+                # rejection apart from the same line read again.
+                return f"2026-11-11T10:00:{stamp}Z ERROR [openvpn] AUTH_FAILED"
+
+            answers: list[str | None] = []
+            now = [1000.0]
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=False),
                 mock.patch.object(
-                    guard, "gluetun_auth_failed", return_value=True
-                ) as mock_auth_failed,
-                mock.patch.object(guard, "stop_active_services") as mock_stop_services,
+                    guard, "gluetun_auth_evidence", side_effect=lambda **_: answers.pop(0)
+                ),
+                mock.patch.object(guard, "stop_active_services"),
+                mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
+                mock.patch.object(guard, "restart_gluetun") as mock_restart,
                 mock.patch.object(guard, "stop_gluetun") as mock_stop_gluetun,
-                mock.patch.object(guard, "write_vpn_lockout") as mock_write_lockout,
-                mock.patch("time.monotonic", return_value=1000.0),
+                mock.patch("time.monotonic", side_effect=lambda: now[0]),
+                mock.patch("time.time", side_effect=lambda: now[0]),
             ):
+                # Tick 1 (generation 0): clean log; restart -> generation 1.
+                answers.append(None)
+                orch.watch_once()
+                self.assertEqual(orch.restart_generation, 1)
+
+                # Ticks 2 and 3 (generation 1, before the next cadence
+                # restart): the rejection twice in ONE generation is still
+                # one sighting.
+                for t, stamp in ((1010.0, "10"), (1020.0, "20")):
+                    now[0] = t
+                    answers.append(line(stamp))
+                    orch.watch_once()
+                self.assertFalse(cfg.vpn_lockout_file.exists())
+                mock_stop_gluetun.assert_not_called()
+
+                # Tick 4: cadence restart -> generation 2 (clean log).
+                now[0] = 1050.0
+                answers.append(None)
+                orch.watch_once()
+                self.assertEqual(mock_restart.call_count, 2)
+                self.assertEqual(orch.restart_generation, 2)
+
+                # Tick 5: generation 2 re-reads generation 1's last line
+                # (`docker logs --since` has one-second resolution). The same
+                # event must not count as a second generation.
+                now[0] = 1055.0
+                answers.append(line("20"))
+                orch.watch_once()
+                self.assertFalse(cfg.vpn_lockout_file.exists())
+
+                # Tick 6: a new rejection after gluetun was restarted onto
+                # another server: confirmed.
+                now[0] = 1060.0
+                answers.append(line("58"))
                 with self.assertRaises(typer.Exit) as ctx:
                     orch.watch_once()
 
-                self.assertEqual(ctx.exception.exit_code, 78)
-                mock_auth_failed.assert_called_once_with(lines=100, since_epoch=None)
-                mock_stop_services.assert_called()
-                mock_stop_gluetun.assert_called_once()
-                mock_write_lockout.assert_called_once_with(
-                    reason="auth_rejected", outage_duration_seconds=0.0
-                )
+            self.assertEqual(ctx.exception.exit_code, 78)
+            mock_stop_gluetun.assert_called_once()
+            marker = json.loads(cfg.vpn_lockout_file.read_text(encoding="utf-8"))
+            self.assertEqual(marker["reason"], "auth_rejected")
+            self.assertEqual(marker["evidence"], line("58"))
+            self.assertIn("credentials", marker["remediation"].lower())
 
     def test_outage_restart_cycling_and_budget_exhaustion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -623,7 +706,7 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_failed", return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
                 mock.patch.object(guard, "stop_active_services") as mock_stop_services,
                 mock.patch.object(guard, "restart_gluetun") as mock_restart,
                 mock.patch.object(guard, "stop_gluetun") as mock_stop_gluetun,
@@ -657,7 +740,9 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.exit_code, 78)
                 mock_stop_gluetun.assert_called_once()
                 mock_write_lockout.assert_called_once_with(
-                    reason="recovery_budget_exhausted", outage_duration_seconds=301.0
+                    reason="recovery_budget_exhausted",
+                    outage_duration_seconds=301.0,
+                    evidence="gluetun stayed unhealthy for 301s across 2 restart attempts",
                 )
 
     def test_hybrid_failover_escalates_to_broad_country(self) -> None:
@@ -680,7 +765,7 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_failed", return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
                 mock.patch.object(guard, "stop_active_services"),
                 mock.patch.object(guard, "restart_gluetun") as mock_restart_preferred,
                 mock.patch.object(guard, "restart_gluetun_relaxed") as mock_restart_relaxed,
@@ -781,9 +866,9 @@ class OrchestratorTests(unittest.TestCase):
 
             auth_calls: list[tuple[int, float | None]] = []
 
-            def mock_auth_failed(lines: int = 50, since_epoch: float | None = None) -> bool:
+            def mock_auth_evidence(lines: int = 50, since_epoch: float | None = None) -> str | None:
                 auth_calls.append((lines, since_epoch))
-                return False
+                return None
 
             current_time = 1000.0
 
@@ -792,25 +877,26 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_failed", side_effect=mock_auth_failed),
+                mock.patch.object(guard, "gluetun_auth_evidence", side_effect=mock_auth_evidence),
                 mock.patch.object(guard, "stop_active_services"),
                 mock.patch.object(guard, "restart_gluetun"),
                 mock.patch("time.monotonic", side_effect=fake_time),
                 mock.patch("time.time", side_effect=fake_time),
             ):
-                # Tick 1: t=1000 -> initial tail-only check (lines=100, since_epoch=None)
+                # Tick 1: t=1000 -> look back a bounded 600s for the rejection
+                # that caused the outage; an older one must not count.
                 orch.watch_once()
-                self.assertEqual(auth_calls, [(100, None)])
+                self.assertEqual(auth_calls, [(200, 400.0)])
 
                 # Tick 2: t=1010 -> incremental check since 1000, updates cursor to 1010
                 current_time = 1010.0
                 orch.watch_once()
-                self.assertEqual(auth_calls, [(100, None), (50, 1000.0)])
+                self.assertEqual(auth_calls, [(200, 400.0), (50, 1000.0)])
 
                 # Tick 3: t=1020 -> incremental check since 1010
                 current_time = 1020.0
                 orch.watch_once()
-                self.assertEqual(auth_calls, [(100, None), (50, 1000.0), (50, 1010.0)])
+                self.assertEqual(auth_calls, [(200, 400.0), (50, 1000.0), (50, 1010.0)])
 
     def test_hybrid_failover_escalates_on_region_only_filter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -829,7 +915,7 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_failed", return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
                 mock.patch.object(guard, "stop_active_services"),
                 mock.patch.object(guard, "restart_gluetun"),
                 mock.patch.object(guard, "restart_gluetun_relaxed") as mock_restart_relaxed,
@@ -861,7 +947,7 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_failed", return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
                 mock.patch.object(guard, "stop_active_services"),
                 mock.patch.object(guard, "restart_gluetun"),
                 mock.patch.object(guard, "restart_gluetun_relaxed") as mock_restart_relaxed,
@@ -1086,7 +1172,7 @@ class SupervisedWatchdogTests(unittest.TestCase):
             g = orch.guard
             with (
                 mock.patch.object(g, "gluetun_healthy", return_value=False),
-                mock.patch.object(g, "gluetun_auth_failed", return_value=False),
+                mock.patch.object(g, "gluetun_auth_evidence", return_value=None),
                 mock.patch.object(g, "services_confirmed_stopped", return_value=False),
                 mock.patch.object(g, "stop_active_services") as stop,
             ):
@@ -1143,3 +1229,417 @@ def test_run_logs_are_owner_only(tmp_path: Path) -> None:
     configure_file_logging(make_config(tmp_path, log_file=log_file))
     assert (tmp_path / "logs").stat().st_mode & 0o777 == 0o700
     assert log_file.stat().st_mode & 0o777 == 0o600
+
+
+# --- Gluetun namespace identity ----------------------------------------------
+
+NAMESPACE_INSPECT = (
+    "docker",
+    "inspect",
+    "--format",
+    "{{.Id}}|{{.State.Running}}|{{.State.StartedAt}}|{{.HostConfig.NetworkMode}}",
+    "stremio",
+)
+
+
+def test_gluetun_identity_change_restarts_a_stale_service(tmp_path: Path) -> None:
+    t1, t2 = "2026-11-11T10:00:00.5Z", "2026-11-11T11:00:00Z"
+    runner = FakeRunner(
+        {
+            GLUETUN_HEALTH_INSPECT: [
+                completed(list(GLUETUN_HEALTH_INSPECT), f"healthy|{started}\n")
+                for started in (t1, t1, t2)
+            ],
+            NAMESPACE_INSPECT: [
+                # Tick 1: stremio predates this gluetun (it was restarted
+                # outside the watchdog), so it holds a dead namespace.
+                completed(
+                    list(NAMESPACE_INSPECT), "stremio|true|2026-11-11T09:00:00Z|container:gluetun\n"
+                ),
+                # Tick 3: after gluetun restarted again at t2.
+                completed(
+                    list(NAMESPACE_INSPECT), "stremio|true|2026-11-11T10:00:01Z|container:gluetun\n"
+                ),
+            ],
+        }
+    )
+    guard = GluetunGuard(make_config(tmp_path), runner, frozen=True)
+    orch = Orchestrator(guard)
+    events: list[str] = []
+    running = {"stremio": True}
+    real_start = guard.start_services
+
+    def stop(*, services: list[str] | None = None) -> bool:
+        events.append(f"stop:{','.join(services or [])}")
+        running.update(dict.fromkeys(services or [], False))
+        return True
+
+    def start(services: list[str], **kwargs: object) -> bool:
+        events.append(f"start:{','.join(services)}")
+        running.update(dict.fromkeys(services, True))
+        return real_start(services, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
+        mock.patch.object(guard, "stop_active_services", side_effect=stop),
+        mock.patch.object(guard, "start_services", side_effect=start),
+        mock.patch.object(
+            guard,
+            "container_running",
+            side_effect=lambda services: all(running[s] for s in services),
+        ),
+    ):
+        orch.watch_once()
+        assert events == ["stop:stremio", "start:stremio"]
+        assert orch.gluetun_identity == ("gluetun", t1)
+        assert orch.namespace_rejoins_since_summary == 1
+        # The restart actually reached Compose.
+        # Without --build: the frozen watchdog never rebuilds from the tree.
+        up = [*compose_args_prefix(tmp_path), "up", "-d", "--no-deps", "stremio"]
+        assert runner.calls.count(up) == 1
+
+        # Tick 2: same gluetun, nothing to reconcile and no Docker query for it.
+        orch.watch_once()
+        assert events == ["stop:stremio", "start:stremio"]
+        assert runner.calls.count(list(NAMESPACE_INSPECT)) == 1
+
+        # Tick 3: gluetun restarted on its own at t2.
+        orch.watch_once()
+        assert events == ["stop:stremio", "start:stremio"] * 2
+        assert orch.gluetun_identity == ("gluetun", t2)
+        assert runner.calls.count(up) == 2
+
+
+def test_unverifiable_namespace_keeps_identity_unverified(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        {
+            GLUETUN_HEALTH_INSPECT: completed(
+                list(GLUETUN_HEALTH_INSPECT), "healthy|2026-11-11T10:00:00Z\n"
+            ),
+            NAMESPACE_INSPECT: completed(list(NAMESPACE_INSPECT), "", "boom", returncode=1),
+        }
+    )
+    guard = GluetunGuard(make_config(tmp_path), runner, frozen=True)
+    orch = Orchestrator(guard)
+    with (
+        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
+        mock.patch.object(guard, "stop_active_services") as stop,
+    ):
+        orch.watch_once()
+        orch.watch_once()
+    stop.assert_not_called()
+    # Not marked verified, so every tick retries the check.
+    assert orch.gluetun_identity is None
+    assert runner.calls.count(list(NAMESPACE_INSPECT)) == 2
+
+
+# --- Leak verdicts --------------------------------------------------------------
+
+
+def _leak_orchestrator(tmp_path: Path, **overrides: object):
+    guard = GluetunGuard(make_config(tmp_path, **overrides), FakeRunner({}))
+    return guard, Orchestrator(guard)
+
+
+def test_second_consecutive_leak_verdict_locks_out(tmp_path: Path) -> None:
+    import pytest
+
+    guard, orch = _leak_orchestrator(tmp_path)
+    with (
+        mock.patch.object(guard, "gluetun_healthy", return_value=True),
+        mock.patch.object(
+            guard,
+            "public_ip_assessment",
+            side_effect=[PublicIPAssessment.UNSAFE_DEFINITIVE] * 2,
+        ),
+        mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
+        mock.patch.object(guard, "stop_gluetun") as stop_gluetun,
+        mock.patch.object(guard, "start_services") as start,
+    ):
+        # First verdict: services stop at once, no lockout yet.
+        orch.watch_once()
+        stop.assert_called_once_with(services=["stremio"])
+        assert not guard.config.vpn_lockout_file.exists()
+        stop_gluetun.assert_not_called()
+
+        with pytest.raises(typer.Exit) as excinfo:
+            orch.watch_once()
+    assert excinfo.value.exit_code == 78
+    marker = json.loads(guard.config.vpn_lockout_file.read_text(encoding="utf-8"))
+    assert marker["reason"] == "egress_leak"
+    assert "2 times in a row" in marker["evidence"]
+    stop_gluetun.assert_called_once()
+    start.assert_not_called()
+
+
+def test_single_leak_verdict_followed_by_safe_resumes(tmp_path: Path) -> None:
+    guard, orch = _leak_orchestrator(tmp_path)
+    with (
+        mock.patch.object(guard, "gluetun_healthy", return_value=True),
+        mock.patch.object(
+            guard,
+            "public_ip_assessment",
+            side_effect=[
+                PublicIPAssessment.UNSAFE_DEFINITIVE,
+                PublicIPAssessment.SAFE,
+                PublicIPAssessment.UNSAFE_DEFINITIVE,
+            ],
+        ),
+        mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
+        mock.patch.object(guard, "stop_gluetun") as stop_gluetun,
+        mock.patch.object(guard, "container_running", return_value=False),
+        mock.patch.object(guard, "start_services") as start,
+    ):
+        orch.watch_once()
+        orch.watch_once()
+        start.assert_called_once_with(["stremio"], build=True, check=False)
+        assert orch.consecutive_leak_verdicts == 0
+        # A later, non-consecutive verdict counts from one again.
+        orch.watch_once()
+    assert stop.call_count == 2
+    stop_gluetun.assert_not_called()
+    assert not guard.config.vpn_lockout_file.exists()
+
+
+# --- Auto-start loop limit --------------------------------------------------------
+
+
+def test_auto_start_limit_trips_service_flapping(tmp_path: Path) -> None:
+    import pytest
+
+    guard, orch = _leak_orchestrator(tmp_path, max_auto_starts_per_hour=3)
+    clock = {"now": 10_000.0}
+    with (
+        mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
+        mock.patch.object(guard, "gluetun_healthy", return_value=True),
+        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
+        mock.patch.object(guard, "container_running", return_value=False),
+        mock.patch.object(guard, "start_services") as start,
+        mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
+        mock.patch.object(guard, "stop_gluetun"),
+    ):
+        for _ in range(3):
+            clock["now"] += 60
+            orch.watch_once()
+        assert start.call_count == 3
+        clock["now"] += 60
+        with pytest.raises(typer.Exit) as excinfo:
+            orch.watch_once()
+    assert excinfo.value.exit_code == 78
+    assert start.call_count == 3
+    stop.assert_called()
+    marker = json.loads(guard.config.vpn_lockout_file.read_text(encoding="utf-8"))
+    assert marker["reason"] == "service_flapping"
+    assert marker["evidence"] == "3 automatic starts within the last hour"
+
+
+def test_auto_starts_older_than_an_hour_do_not_count(tmp_path: Path) -> None:
+    guard, orch = _leak_orchestrator(tmp_path, max_auto_starts_per_hour=2)
+    clock = {"now": 10_000.0}
+    with (
+        mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
+        mock.patch.object(guard, "gluetun_healthy", return_value=True),
+        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
+        mock.patch.object(guard, "container_running", return_value=False),
+        mock.patch.object(guard, "start_services") as start,
+    ):
+        for _ in range(6):
+            clock["now"] += 1801  # two per hour at most
+            orch.watch_once()
+    assert start.call_count == 6
+    assert not guard.config.vpn_lockout_file.exists()
+
+
+def test_auto_start_limit_zero_disables_it(tmp_path: Path) -> None:
+    guard, orch = _leak_orchestrator(tmp_path, max_auto_starts_per_hour=0)
+    with (
+        mock.patch.object(guard, "gluetun_healthy", return_value=True),
+        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
+        mock.patch.object(guard, "container_running", return_value=False),
+        mock.patch.object(guard, "start_services") as start,
+    ):
+        for _ in range(25):
+            orch.watch_once()
+    assert start.call_count == 25
+    assert not guard.config.vpn_lockout_file.exists()
+
+
+# --- Stack lock deferral ------------------------------------------------------------
+
+
+def test_tick_defers_while_another_holder_has_the_stack_lock(tmp_path: Path) -> None:
+    import fcntl
+    import os
+
+    from stremioguard.stacklock import stack_lock_path
+
+    guard, orch = _leak_orchestrator(tmp_path)
+    lock_path = stack_lock_path(tmp_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # A CLI command in another process: a separate open file description.
+    holder = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    clock = {"now": 500.0}
+    held_during_check: list[bool] = []
+
+    def check() -> None:
+        probe = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            held_during_check.append(True)
+        else:
+            held_during_check.append(False)
+        finally:
+            os.close(probe)
+
+    try:
+        with (
+            mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
+            mock.patch.object(orch, "watch_once", side_effect=check) as watch_once,
+            mock.patch.object(orchestrator_mod, "notify"),
+        ):
+            # Deferred: alive (True), but no check ran.
+            assert orch._tick() is True
+            clock["now"] += orchestrator_mod.STACK_LOCK_MAX_DEFER_SECONDS - 1
+            assert orch._tick() is True
+            watch_once.assert_not_called()
+
+            # Released: the next tick checks, holding the lock itself.
+            os.close(holder)
+            holder = -1
+            assert orch._tick() is True
+            assert watch_once.call_count == 1
+            assert held_during_check == [True]
+            assert orch.lock_deferred_since is None
+    finally:
+        if holder >= 0:
+            os.close(holder)
+
+
+def test_tick_stops_deferring_after_the_maximum(tmp_path: Path) -> None:
+    import fcntl
+    import os
+
+    from stremioguard.stacklock import stack_lock_path
+
+    guard, orch = _leak_orchestrator(tmp_path)
+    lock_path = stack_lock_path(tmp_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    holder = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    clock = {"now": 500.0}
+    try:
+        with (
+            mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
+            mock.patch.object(orch, "watch_once") as watch_once,
+            mock.patch.object(orchestrator_mod, "notify"),
+        ):
+            assert orch._tick() is True
+            watch_once.assert_not_called()
+            # A hung command must not blind the watchdog indefinitely.
+            clock["now"] += orchestrator_mod.STACK_LOCK_MAX_DEFER_SECONDS
+            assert orch._tick() is True
+            watch_once.assert_called_once()
+    finally:
+        os.close(holder)
+
+
+# --- Alerts never get in the way of a shutdown --------------------------------------
+
+
+def test_breaker_stops_everything_and_exits_78_when_alerting_raises(tmp_path: Path) -> None:
+    import pytest
+
+    guard, orch = _leak_orchestrator(tmp_path, alert_url="https://alerts.example.test/topic")
+    order: list[str] = []
+
+    def exploding_alert(*args: object, **kwargs: object) -> bool:
+        order.append("alert")
+        raise RuntimeError("alert endpoint exploded")
+
+    with (
+        mock.patch.object(orchestrator_mod, "send_alert", side_effect=exploding_alert) as send,
+        mock.patch.object(
+            guard, "stop_active_services", side_effect=lambda **_: order.append("stop_services")
+        ),
+        mock.patch.object(guard, "stop_gluetun", side_effect=lambda: order.append("stop_gluetun")),
+        pytest.raises(typer.Exit) as excinfo,
+    ):
+        orch._trip_circuit_breaker("egress_leak", evidence="probe saw the home IP")
+    assert excinfo.value.exit_code == 78
+    assert order == ["stop_services", "stop_gluetun", "alert"]
+    send.assert_called_once()
+    assert send.call_args.args[0] == "https://alerts.example.test/topic"
+    marker = json.loads(guard.config.vpn_lockout_file.read_text(encoding="utf-8"))
+    assert marker["reason"] == "egress_leak"
+    assert marker["evidence"] == "probe saw the home IP"
+
+
+def test_alerts_are_rate_limited_per_event(tmp_path: Path) -> None:
+    guard, orch = _leak_orchestrator(tmp_path, alert_url="https://alerts.example.test/topic")
+    clock = {"now": 0.0}
+    with (
+        mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
+        mock.patch.object(orchestrator_mod, "send_alert", return_value=True) as send,
+    ):
+        orch._alert("leak_verdict", "t", "m")
+        orch._alert("leak_verdict", "t", "m")
+        orch._alert("namespace_stale", "t", "m")
+        clock["now"] += orchestrator_mod.ALERT_REPEAT_SECONDS
+        orch._alert("leak_verdict", "t", "m")
+    assert [c.args[0] for c in send.call_args_list] == ["https://alerts.example.test/topic"] * 3
+
+
+def test_deferred_tick_still_stops_services_on_a_definitive_leak(tmp_path: Path) -> None:
+    import fcntl
+    import os
+
+    from stremioguard.stacklock import stack_lock_path
+
+    guard, orch = _leak_orchestrator(tmp_path)
+    lock_path = stack_lock_path(tmp_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    holder = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with (
+            mock.patch.object(guard, "gluetun_healthy", return_value=True),
+            mock.patch.object(
+                guard,
+                "public_ip_assessment",
+                side_effect=[PublicIPAssessment.SAFE, PublicIPAssessment.UNSAFE_DEFINITIVE],
+            ),
+            mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
+            mock.patch.object(guard, "start_services") as start,
+            mock.patch.object(guard, "restart_gluetun") as restart,
+            mock.patch.object(orch, "watch_once") as watch_once,
+            mock.patch.object(orchestrator_mod, "notify"),
+        ):
+            # Safe: the watchdog stands aside completely.
+            assert orch._tick() is True
+            stop.assert_not_called()
+            # Leak: it stops the services without the lock, and does nothing else.
+            assert orch._tick() is True
+            stop.assert_called_once_with(services=guard.enabled_runtime_services())
+            watch_once.assert_not_called()
+            start.assert_not_called()
+            restart.assert_not_called()
+        assert not guard.config.vpn_lockout_file.exists()
+    finally:
+        os.close(holder)
+
+
+def test_restart_moves_the_auth_scan_cursor_past_the_restart(tmp_path: Path) -> None:
+    # A rejection the OLD gluetun process logged between this check's scan
+    # and its restart must not be read by the next check and counted as a
+    # second, post-restart sighting.
+    guard, orch = _leak_orchestrator(tmp_path)
+    orch.last_auth_check_wall = 1000.0
+    with (
+        mock.patch.object(guard, "restart_gluetun", return_value=True),
+        mock.patch.object(orchestrator_mod.time, "time", return_value=1042.0),
+    ):
+        orch._restart_gluetun(relaxed=False)
+    assert orch.restart_generation == 1
+    assert orch.last_auth_check_wall == 1042.0

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from stremioguard.comet import CometManager
 from stremioguard.comet_gateway import CometGatewayConfig, CometGatewayManager
-from stremioguard.config import MANAGED_STACK_ENV, CometConfig
+from stremioguard.config import MANAGED_STACK_ENV, CometConfig, deployed_env_file
 from stremioguard.resolver import nordvpn_endpoint_env
 
 # Path resolution: src/stremioguard/cli/context.py
@@ -64,13 +64,19 @@ class RunContext:
         return env
 
 
+# Comet and gateway commands act on the running stack, so they read the
+# configuration it was started with (the published snapshot), not .env. An
+# .env edit is deployed by `./stremio start|restart` and by nothing else;
+# `comet start` or a token change must not half-apply it.
 def _comet_manager() -> CometManager:
-    return CometManager(CometConfig.from_env(ROOT_DIR))
+    return CometManager(CometConfig.from_env(ROOT_DIR, env_file=deployed_env_file(ROOT_DIR)))
 
 
 def _comet_enabled() -> bool:
-    return CometConfig.from_env(ROOT_DIR).enabled
+    return CometConfig.from_env(ROOT_DIR, env_file=deployed_env_file(ROOT_DIR)).enabled
 
 
 def _comet_gateway_manager() -> CometGatewayManager:
-    return CometGatewayManager(CometGatewayConfig.from_env(ROOT_DIR))
+    return CometGatewayManager(
+        CometGatewayConfig.from_env(ROOT_DIR, env_file=deployed_env_file(ROOT_DIR))
+    )

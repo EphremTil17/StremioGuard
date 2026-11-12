@@ -12,12 +12,18 @@ from pathlib import Path
 
 from loguru import logger
 
-from stremioguard.config import Runner, SubprocessRunner, service_container_id
+from stremioguard.config import (
+    COMET_GATEWAY_CONTAINER_PORT,
+    COMET_PORT,
+    Runner,
+    SubprocessRunner,
+    service_container_id,
+)
 from stremioguard.env import atomic_write_text, ensure_directory
 
-# NOTE: the gateway runs in gluetun's network namespace, where Stremio's own
-# nginx already owns 8080 (web UI) and Comet owns 8000. 8090 is free there.
-COMET_GATEWAY_CONTAINER_PORT = 8090
+# COMET_GATEWAY_CONTAINER_PORT is re-exported from config, where the registry
+# of ports in gluetun's shared namespace lives (config.NAMESPACE_PORTS).
+__all__ = ["COMET_GATEWAY_CONTAINER_PORT", "CometGatewayConfig", "CometGatewayManager"]
 # The gateway's state directory, mounted read-only. A directory, not single
 # files: a file bind mount pins the inode it started with, so an atomically
 # replaced tokens.map would never reach nginx and revoked tokens kept working.
@@ -41,10 +47,12 @@ class CometGatewayConfig:
     enabled: bool
 
     @classmethod
-    def from_env(cls, root_dir: Path | None = None) -> CometGatewayConfig:
+    def from_env(
+        cls, root_dir: Path | None = None, *, env_file: Path | None = None
+    ) -> CometGatewayConfig:
         from stremioguard.config import CometConfig
 
-        comet = CometConfig.from_env(root_dir)
+        comet = CometConfig.from_env(root_dir, env_file=env_file)
         state_dir = comet.root_dir / ".stremio" / "comet-gateway"
         return cls(
             root_dir=comet.root_dir,
@@ -237,6 +245,16 @@ class CometGatewayManager:
             if token:
                 lines.append(f'    "{token}" 1;')
         lines.append("}")
+        # The token's ID, for the access log. The ID is what `./stremio comet
+        # token list` shows and is not a credential, so a request can be
+        # attributed to a token (and that token revoked) without the log ever
+        # holding the token itself.
+        lines.extend(["map $gateway_token $gateway_token_id {", '    default "-";'])
+        for token_id, entry in tokens.items():
+            token = entry.get("token", "")
+            if token:
+                lines.append(f'    "{token}" "{token_id}";')
+        lines.append("}")
         return "\n".join(lines) + "\n"
 
     def render_nginx_conf(self) -> str:
@@ -267,6 +285,14 @@ http {{
     # access phase, which runs AFTER limit_req. Valid tokens never enter that
     # location, so authenticated playback (with its bursty range requests
     # during seeks) is never throttled.
+    #
+    # These zones are keyed by client address, but behind rootless Docker's
+    # port forwarder (and behind a reverse proxy) every client arrives from
+    # the same address, so each zone is in practice ONE shared bucket. That
+    # is the safe direction for the invalid-token limiter (a guesser cannot
+    # spread across addresses); keying on X-Forwarded-For instead would let
+    # any client pick its own bucket. $remote_addr in the log is likewise not
+    # a client identity; `tid=` is what attributes a request.
     limit_req_zone $binary_remote_addr zone=gateway_auth:1m rate=5r/s;
     limit_req_zone $binary_remote_addr zone=gateway_admin:1m rate=10r/s;
     limit_req_zone $binary_remote_addr zone=gateway_fail:1m rate=5r/s;
@@ -286,6 +312,7 @@ http {{
     }}
 
     log_format main '$remote_addr [$time_local] "$request_masked" $status $body_bytes_sent '
+                    'tid=$gateway_token_id '
                     'upstream=$upstream_status urt=$upstream_response_time rt=$request_time';
     access_log /var/log/nginx/access.log main;
 
@@ -297,7 +324,7 @@ http {{
     server {{
         listen {COMET_GATEWAY_CONTAINER_PORT};
         server_name _;
-        set $comet_upstream http://127.0.0.1:8000;
+        set $comet_upstream http://127.0.0.1:{COMET_PORT};
 
         location ~ "^/comet/(?<gateway_token>{token_re})(?<comet_uri>/.*)$" {{
             if ($token_valid = 0) {{

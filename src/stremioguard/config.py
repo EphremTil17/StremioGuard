@@ -27,6 +27,17 @@ MANAGED_STACK_ENV = "STREMIOGUARD_MANAGED"
 GENERATED_COMPOSE_FILE = ".stremio/docker-compose.bindings.yml"
 # gluetun's share of .env (see publishing.render_gluetun_env).
 GLUETUN_ENV_FILE = ".stremio/gluetun.env"
+# The published generation: what `./stremio start|restart` last deployed. Every
+# compose call and the watchdog read these, never the working tree's
+# docker-compose.yml or .env, so an edit or a `git pull` changes nothing until
+# the next deliberate start (see publishing.StackPublisher).
+PUBLISHED_COMPOSE_FILE = ".stremio/compose.base.yml"
+PUBLISHED_ENV_FILE = ".stremio/env.snapshot"
+# Bound on a Docker query (ps, inspect, exec). A wedged daemon must surface as
+# a failed check, not as a watchdog that blocks until systemd kills it.
+DOCKER_QUERY_TIMEOUT_SECONDS = 30
+# Bound on one watchdog-driven `compose up/stop`; below the unit's WatchdogSec.
+WATCHDOG_MUTATION_TIMEOUT_SECONDS = 240
 DEFAULT_COMET_HOST_PORT = 18000
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
 CIRCUIT_BREAKER_EXIT_CODE = 78
@@ -40,8 +51,26 @@ LOCKOUT_FILE_NAME = "vpn-lockout"
 # is never published, so the debrid key in each request only leaves the host
 # towards the debrid service itself, through the tunnel.
 STREMTHRU_SERVICE = "stremthru"
-STREMTHRU_INTERNAL_URL = "http://127.0.0.1:8080"
+STREMTHRU_PORT = 8091
+STREMTHRU_INTERNAL_URL = f"http://127.0.0.1:{STREMTHRU_PORT}"
 COMET_GATEWAY_SERVICE = "comet-gateway"
+COMET_PORT = 8000
+COMET_GATEWAY_CONTAINER_PORT = 8090
+# Every service shares gluetun's network namespace, so they also share one
+# port space: two listeners on the same port collide whatever address each
+# binds. This is the registry; tests/test_config.py checks docker-compose.yml
+# against it. Add a service's port here before giving it one.
+NAMESPACE_PORTS: dict[str, int] = {
+    "stremio web UI (image's nginx)": 8080,
+    "stremio streaming server": 11470,
+    "stremio streaming server (https)": 12470,
+    "comet": COMET_PORT,
+    "comet-gateway": COMET_GATEWAY_CONTAINER_PORT,
+    "comet-postgres": 5432,
+    "stremthru": STREMTHRU_PORT,
+    "gluetun control server": 18080,
+    "gluetun health server": 9999,
+}
 # Comet's per-scraper context: `true` is Comet's alias for `both`; `off` is
 # accepted and stored as `false`. Comet silently disables a scraper on any
 # other value, so a typo is rejected here instead.
@@ -57,6 +86,7 @@ TUNABLE_KEYS = (
     "PUBLIC_IP_FAILURE_THRESHOLD",
     "VPN_RECOVERY_BUDGET_SECONDS",
     "VPN_RESTART_CADENCE_SECONDS",
+    "MAX_AUTO_STARTS_PER_HOUR",
 )
 # Every process-environment key Config.from_env reads. The systemd-supervised
 # watchdog does not inherit the shell that ran `./stremio start`, so the CLI
@@ -89,13 +119,45 @@ def parse_public_ip(text: str) -> str | None:
 def compose_command(root_dir: Path, *args: str) -> list[str]:
     """`docker compose` for this stack, the one way every caller builds it.
 
-    The base file plus the generated override once it exists. Paths come
-    from the checkout, never the environment: an exported COMPOSE_FILE from
-    another project must not point the watchdog at a different stack.
+    Once a generation has been published, that is the stack: its copy of
+    the base file, its override and its env snapshot. Before the first
+    publish (a fresh checkout) the working tree's base file is all there is.
+    Paths come from the checkout, never the environment: an exported
+    COMPOSE_FILE from another project must not point the watchdog at a
+    different stack.
     """
     override = root_dir / GENERATED_COMPOSE_FILE
+    published_base = root_dir / PUBLISHED_COMPOSE_FILE
+    published_env = root_dir / PUBLISHED_ENV_FILE
+    if override.exists() and published_base.exists() and published_env.exists():
+        return [
+            "docker",
+            "compose",
+            # Relative paths in the copied base file must keep resolving
+            # against the checkout, and the project name keeps deriving from it.
+            "--project-directory",
+            str(root_dir),
+            "--env-file",
+            str(published_env),
+            "-f",
+            str(published_base),
+            "-f",
+            str(override),
+            *args,
+        ]
     override_args = ["-f", str(override)] if override.exists() else []
     return ["docker", "compose", "-f", str(root_dir / "docker-compose.yml"), *override_args, *args]
+
+
+def deployed_env_file(root_dir: Path) -> Path:
+    """The configuration the running stack was started with.
+
+    The published snapshot once one exists, else .env. Long-lived readers (the
+    watchdog, the fail-safe) use this so a later .env edit cannot change
+    their behavior, or crash them, before the next deliberate start.
+    """
+    snapshot = root_dir / PUBLISHED_ENV_FILE
+    return snapshot if snapshot.exists() else root_dir / ".env"
 
 
 class Runner(Protocol):
@@ -111,7 +173,11 @@ class Runner(Protocol):
 
 
 def service_container_id(runner: Runner, root_dir: Path, service: str) -> str | None:
-    result = runner.run(compose_command(root_dir, "ps", "-q", service), check=False)
+    result = runner.run(
+        compose_command(root_dir, "ps", "-q", service),
+        check=False,
+        timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
         return None
     return next((line.strip() for line in (result.stdout or "").splitlines() if line.strip()), None)
@@ -208,6 +274,13 @@ class Config:
     server_cities: str | None
     server_hostnames: str | None
     server_categories: str | None
+    # Where the configuration was read from; the guard reads provider and
+    # server settings from the same file.
+    env_file: Path | None = None
+    alert_url: str | None = None
+    # More auto-starts than this in an hour trips the circuit breaker; 0
+    # disables the limit.
+    max_auto_starts_per_hour: int = 10
 
     @classmethod
     def from_env(cls, root_dir: Path | None = None, *, env_file: Path | None = None) -> Config:
@@ -271,7 +344,26 @@ class Config:
             server_cities=env_file_value(env_file, "SERVER_CITIES"),
             server_hostnames=env_file_value(env_file, "SERVER_HOSTNAMES"),
             server_categories=env_file_value(env_file, "SERVER_CATEGORIES"),
+            env_file=env_file,
+            alert_url=_alert_url(env_file),
+            max_auto_starts_per_hour=_tunable_int(
+                env_file, "MAX_AUTO_STARTS_PER_HOUR", 10, minimum=0
+            ),
         )
+
+
+def _alert_url(env_file: Path) -> str | None:
+    # STREMIO_-prefixed so publishing.render_gluetun_env never hands it to the
+    # VPN container. Deferred import: alerts imports nothing from here, but
+    # keeping config free of network modules keeps its import cheap.
+    from stremioguard.alerts import valid_alert_url
+
+    url = (env_file_value(env_file, "STREMIO_ALERT_URL") or "").strip()
+    if not url:
+        return None
+    if not valid_alert_url(url):
+        raise RuntimeError("Invalid STREMIO_ALERT_URL value; expected an absolute HTTP(S) URL")
+    return url
 
 
 def _scrape_mode(env_file: Path, key: str, default: str) -> str:
@@ -381,6 +473,15 @@ class CometConfig:
     scrape_dmm: str = "false"
     dmm_ingest_interval_seconds: int = DEFAULT_DMM_INGEST_INTERVAL_SECONDS
 
+    def bundle_dir(self, digest: str) -> Path:
+        """Where the override bundle rendered for image ``digest`` lives.
+
+        One directory per digest: a promotion renders the next image's bundle
+        beside the running one, so the active digest always points at a
+        complete bundle and a failed render changes nothing.
+        """
+        return self.state_dir / "bundles" / digest.replace(":", "-")
+
     @property
     def stremthru_state_dir(self) -> Path:
         return self.state_dir.parent / STREMTHRU_SERVICE
@@ -397,9 +498,9 @@ class CometConfig:
         return services
 
     @classmethod
-    def from_env(cls, root_dir: Path | None = None) -> CometConfig:
+    def from_env(cls, root_dir: Path | None = None, *, env_file: Path | None = None) -> CometConfig:
         root_dir = root_dir or Path(__file__).resolve().parent.parent.parent
-        env_file = root_dir / ".env"
+        env_file = env_file or root_dir / ".env"
         host_port = env_int_value(
             env_file, "COMET_HOST_PORT", DEFAULT_COMET_HOST_PORT, minimum=1, maximum=65535
         )

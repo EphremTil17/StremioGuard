@@ -21,6 +21,7 @@ from .conftest import (
     make_comet_config,
     make_comet_gateway_config,
     record_test_digest,
+    write_bundle,
     write_comet_api_app,
     write_comet_logger,
     write_required_comet_sources,
@@ -132,27 +133,27 @@ class TestOverridesBundle(unittest.TestCase):
             comet_cfg = make_comet_config(root, enabled=True)
             comet_cfg.state_dir.mkdir(parents=True, exist_ok=True)
 
-            # Write dummy manifest listing all required rank-context mounts.
-            manifest = {
-                "image_digest": "sha256:123",
-                "patch_fingerprint": "fp123",
-                "format_style": "emoji",
-                "patch_episode_pack": False,
-                "applied": ["formatter", "stream", "media_search"],
-                "skipped": [],
-                "outputs": {
+            # A bundle listing all required rank-context mounts, rendered for
+            # the active digest and present on disk.
+            record_test_digest(comet_cfg.state_dir)
+            bundle_dir = write_bundle(
+                comet_cfg,
+                outputs={
                     "app.py": "/app/comet/api/app.py",
                     "logger.py": "/app/comet/core/logger.py",
                     "formatting.py": "/app/comet/utils/formatting.py",
                     "stream.py": "/app/comet/api/endpoints/stream.py",
                     "media_search.py": "/app/comet/services/media_search.py",
                 },
-            }
-            (comet_cfg.state_dir / "bundle-manifest.json").write_text(
-                json.dumps(manifest), encoding="utf-8"
+                extra={
+                    "image_digest": "sha256:123",
+                    "patch_fingerprint": "fp123",
+                    "format_style": "emoji",
+                    "patch_episode_pack": False,
+                    "applied": ["formatter", "stream", "media_search"],
+                    "skipped": [],
+                },
             )
-
-            record_test_digest(comet_cfg.state_dir)
             # Run StackPublisher
             pub = StackPublisher(root)
             with (
@@ -166,10 +167,14 @@ class TestOverridesBundle(unittest.TestCase):
 
             override_content = pub.compose_override_file.read_text(encoding="utf-8")
 
-            # Formatting and stream should be in volume mounts
-            self.assertIn("/app/comet/utils/formatting.py:ro", override_content)
-            self.assertIn("/app/comet/api/endpoints/stream.py:ro", override_content)
-            self.assertIn("/app/comet/services/media_search.py:ro", override_content)
+            # Formatting and stream should be in volume mounts, from the bundle
+            # directory of the active digest.
+            for name, target in (
+                ("formatting.py", "/app/comet/utils/formatting.py"),
+                ("stream.py", "/app/comet/api/endpoints/stream.py"),
+                ("media_search.py", "/app/comet/services/media_search.py"),
+            ):
+                self.assertIn(f"- {bundle_dir / name}:{target}:ro", override_content)
 
             # Others like config or torrentio should NOT be in volume mounts
             self.assertNotIn("/app/comet/api/endpoints/config.py:ro", override_content)

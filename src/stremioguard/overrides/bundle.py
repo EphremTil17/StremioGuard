@@ -198,6 +198,7 @@ def write_override_bundle(
     gateway_enabled: bool = False,
     image_digest: str = "",
     patch_fingerprint: str = "",
+    active_digest: str = "",
 ) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     ctx = RenderContext(
@@ -235,6 +236,9 @@ def write_override_bundle(
 
     manifest = {
         "image_digest": image_digest,
+        # The digest in state.json this bundle belongs to; the publisher
+        # refuses to mount it over any other image.
+        "active_digest": active_digest or image_digest,
         "patch_fingerprint": patch_fingerprint,
         "format_style": result_format_style,
         "patch_episode_pack": patch_episode_pack_results,

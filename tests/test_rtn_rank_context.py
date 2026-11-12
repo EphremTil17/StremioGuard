@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
+
+import pytest
 
 from stremioguard.overrides.bundle import (
     _validate_rtn_rank_display_contract,
@@ -272,3 +275,113 @@ class StreamSafetyAndMarkerTests(unittest.TestCase):
     def test_render_is_idempotent(self) -> None:
         once = self._render()
         self.assertEqual(self._render(once), once)
+
+
+# --- Structural proof that no P2P stream can be emitted -------------------------
+
+_GUARDED_STREAM = """\
+async def stream(request):
+    enable_torrent = False
+    streams = []
+    for info_hash in hashes:
+        streams.append({"name": "debrid", "url": url})
+        if enable_torrent:
+            streams.append({"name": "p2p", "infoHash": info_hash})
+        if seeders and enable_torrent:
+            entry = {}
+            entry["infoHash"] = info_hash
+            streams.append(make_entry(infoHash=info_hash))
+    return streams
+"""
+
+
+def _assert_blocked(source: str) -> None:
+    from stremioguard.overrides.stream import _assert_p2p_blocked
+
+    _assert_p2p_blocked(source)
+
+
+def test_p2p_proof_accepts_emissions_guarded_by_the_disabled_switch() -> None:
+    _assert_blocked(_GUARDED_STREAM)
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    [
+        # A second switch assignment, e.g. upstream re-reading the config.
+        (
+            _GUARDED_STREAM.replace(
+                "    streams = []\n",
+                '    streams = []\n    enable_torrent = config["_enableTorrent"]\n',
+            ),
+            "found 2 assignment",
+        ),
+        (
+            _GUARDED_STREAM.replace(
+                "    streams = []\n", "    streams = []\n    enable_torrent |= flag\n"
+            ),
+            "found 2 assignment",
+        ),
+        (
+            _GUARDED_STREAM.replace(
+                "    for info_hash",
+                "    if (enable_torrent := cfg):\n        pass\n    for info_hash",
+            ),
+            "found 2 assignment",
+        ),
+        # The one assignment is not False.
+        (_GUARDED_STREAM.replace("enable_torrent = False", "enable_torrent = 0"), "found 1"),
+        (_GUARDED_STREAM.replace("enable_torrent = False", "enable_torrent = None"), "found 1"),
+        # An emission path outside the switch.
+        (
+            _GUARDED_STREAM.replace(
+                '        streams.append({"name": "debrid", "url": url})\n',
+                '        streams.append({"name": "debrid", "url": url, "infoHash": info_hash})\n',
+            ),
+            "not inside an `if enable_torrent` block",
+        ),
+        (
+            _GUARDED_STREAM + 'def other(entry, h):\n    entry["infoHash"] = h\n',
+            "not inside",
+        ),
+        (_GUARDED_STREAM + "def other(h):\n    return make_entry(infoHash=h)\n", "not inside"),
+        # Inverted or weakened guards.
+        (
+            _GUARDED_STREAM.replace("        if enable_torrent:", "        if not enable_torrent:"),
+            "not inside",
+        ),
+        (
+            _GUARDED_STREAM.replace(
+                "if seeders and enable_torrent:", "if seeders or enable_torrent:"
+            ),
+            "not inside",
+        ),
+        # In the else branch of the switch.
+        (
+            _GUARDED_STREAM.replace(
+                "        if enable_torrent:\n"
+                '            streams.append({"name": "p2p", "infoHash": info_hash})\n',
+                "        if enable_torrent:\n            pass\n        else:\n"
+                '            streams.append({"name": "p2p", "infoHash": info_hash})\n',
+            ),
+            "not inside",
+        ),
+        ("def broken(:\n", "Unable to prove"),
+    ],
+)
+def test_p2p_proof_rejects_unproven_code(source: str, reason: str) -> None:
+    with pytest.raises(RuntimeError, match=re.escape(reason)):
+        _assert_blocked(source)
+
+
+def test_stream_render_runs_the_p2p_proof() -> None:
+    # A Comet update that adds an unguarded torrent entry must fail the
+    # required stream patch, not pass through it.
+    root = Path(tempfile.mkdtemp())
+    stream_file = root / "comet" / "api" / "endpoints" / "stream.py"
+    stream_file.parent.mkdir(parents=True)
+    stream_file.write_text(
+        STREAM_SOURCE + '\n\ndef _p2p_entry(h):\n    return {"infoHash": h}\n', encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="not inside an `if enable_torrent` block"):
+        render_stream_override(root)

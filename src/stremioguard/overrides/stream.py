@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 from stremioguard.overrides._patching import replace_first_matching
@@ -228,7 +229,92 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
             "Unable to apply required RTN rank display patch; Comet stream formatting has changed."
         ),
     )
-    return _mark_uncached_streams(_block_p2p_streams(content))
+    content = _mark_uncached_streams(_block_p2p_streams(content))
+    _assert_p2p_blocked(content)
+    return content
+
+
+def _is_torrent_switch_test(test: ast.expr) -> bool:
+    """Whether an `if` test is true only when `enable_torrent` is."""
+    if isinstance(test, ast.Name):
+        return test.id == "enable_torrent"
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_is_torrent_switch_test(value) for value in test.values)
+    return False
+
+
+def _assert_p2p_blocked(content: str) -> None:
+    """Prove, from the rendered code itself, that no P2P stream can be emitted.
+
+    The substitution above only shows that one line was rewritten. This
+    checks the result: `enable_torrent` is assigned exactly once, to False,
+    and every place that produces an `infoHash` (what makes Stremio treat an
+    entry as a torrent) sits inside an `if enable_torrent` block. An upstream
+    change that adds a second switch or a second emission path then fails
+    the required patch instead of passing through unnoticed.
+
+    Structural, not behavioral: it reads the code, it does not request a
+    stream. A torrent entry built in another module would not be seen here.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError as error:
+        raise RuntimeError(f"Unable to prove P2P streams are blocked: {error}") from error
+
+    assigned: list[ast.expr | None] = []
+    for node in ast.walk(tree):
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets, value = list(node.targets), node.value
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            targets, value = [node.target], node.value
+        for target in targets:
+            for name in ast.walk(target):
+                if isinstance(name, ast.Name) and name.id == "enable_torrent":
+                    assigned.append(value)
+    if len(assigned) != 1 or not (
+        isinstance(assigned[0], ast.Constant) and assigned[0].value is False
+    ):
+        raise RuntimeError(
+            "Unable to prove P2P streams are blocked: expected exactly one "
+            f"`enable_torrent = False`, found {len(assigned)} assignment(s)."
+        )
+
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def guarded(node: ast.AST) -> bool:
+        child = node
+        while child in parents:
+            parent = parents[child]
+            if (
+                isinstance(parent, ast.If)
+                and _is_torrent_switch_test(parent.test)
+                and any(child is statement for statement in parent.body)
+            ):
+                return True
+            child = parent
+        return False
+
+    for node in ast.walk(tree):
+        emits = (
+            (
+                isinstance(node, ast.Dict)
+                and any(isinstance(k, ast.Constant) and k.value == "infoHash" for k in node.keys)
+            )
+            or (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.ctx, ast.Store)
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == "infoHash"
+            )
+            or (isinstance(node, ast.keyword) and node.arg == "infoHash")
+        )
+        if emits and not guarded(node):
+            raise RuntimeError(
+                "Unable to prove P2P streams are blocked: an `infoHash` stream entry at "
+                f"line {getattr(node, 'lineno', '?')} is not inside an `if enable_torrent` block."
+            )
 
 
 # Stremio cannot colour text, so an amber glyph is the nearest thing to an

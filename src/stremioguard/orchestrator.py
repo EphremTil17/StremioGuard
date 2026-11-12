@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
@@ -15,17 +16,25 @@ from types import FrameType
 import typer
 from loguru import logger
 
+from stremioguard.alerts import send_alert
 from stremioguard.config import (
     CIRCUIT_BREAKER_EXIT_CODE,
     DEFAULT_VPN_FAILOVER_ESCALATION_RATIO,
     CometConfig,
     Config,
+    deployed_env_file,
     docker_daemon_help,
     docker_permission_help,
 )
 from stremioguard.env import ensure_directory
-from stremioguard.guard import GluetunGuard, LockoutActiveError, PublicIPAssessment
+from stremioguard.guard import (
+    GluetunGuard,
+    GluetunState,
+    LockoutActiveError,
+    PublicIPAssessment,
+)
 from stremioguard.sdnotify import notify
+from stremioguard.stacklock import required_stack_lock, stack_lock
 
 app = typer.Typer(
     help="Guard Stremio behind the gluetun VPN container.",
@@ -36,6 +45,21 @@ app = typer.Typer(
 # Upper bound on one sleep between heartbeats; far below the unit's WatchdogSec.
 HEARTBEAT_SLEEP_CHUNK_SECONDS = 30.0
 LOOP_ERRORS_BEFORE_STOP = 3
+# A leak verdict stops services at once; a second one in a row locks out.
+LEAK_CONFIRMATIONS = 2
+# An authentication rejection must be seen again after gluetun has been
+# restarted onto another server before it counts as rejected credentials.
+AUTH_REJECTION_CONFIRMATIONS = 2
+# How far back the first outage tick looks for the rejection that caused it.
+AUTH_SCAN_LOOKBACK_SECONDS = 600
+AUTO_START_WINDOW_SECONDS = 3600
+ALERT_REPEAT_SECONDS = 900
+# The watchdog yields to a CLI command holding the stack lock, but never for
+# longer than this: a hung command must not blind it indefinitely.
+STACK_LOCK_MAX_DEFER_SECONDS = 600
+# Long enough to outlast one watchdog tick that is starting services.
+LIFECYCLE_LOCK_WAIT_SECONDS = 300
+TEARDOWN_LOCK_WAIT_SECONDS = 60
 
 logger.remove()
 if os.environ.get("STREMIO_BACKGROUND") != "1":
@@ -66,6 +90,18 @@ class Orchestrator:
         self.last_auth_check_wall: float | None = None
         self.last_restart_at: float = 0.0
         self.escalation_triggered: bool = False
+        # The gluetun (container, start time) whose namespace the services
+        # were last verified to share.
+        self.gluetun_identity: tuple[str, str] | None = None
+        self.namespace_rejoins_since_summary = 0
+        self.restart_generation = 0
+        self.auth_rejection_generations: set[int] = set()
+        self.auth_evidence_seen: set[str] = set()
+        self.consecutive_leak_verdicts = 0
+        self.auto_start_times: deque[float] = deque()
+        self.lock_deferred_since: float | None = None
+        self._lock_expiry_warned = False
+        self._alerts_sent: dict[str, float] = {}
         if self.guard.config.log_session:
             self._log_session_start()
 
@@ -100,7 +136,12 @@ class Orchestrator:
             time.sleep(2)
         # Only a reset (`./stremio restart`) is an operator's recovery request;
         # first-time setup reached from `start` must still honour a lockout.
-        if g.preflight(allow_recovery=reset, defer_vpn_recovery=True) is False:
+        if (
+            g.preflight(
+                allow_recovery=reset, defer_vpn_recovery=True, keep_running_gluetun=not reset
+            )
+            is False
+        ):
             if reset:
                 # The watchdog refuses to run under a marker, so hand recovery
                 # over now. Its budget writes a fresh marker if the tunnel
@@ -123,7 +164,10 @@ class Orchestrator:
         g = self.guard
         if g.config.stremio_enabled:
             g.ensure_data_dir()
-        if g.preflight(allow_recovery=False, defer_vpn_recovery=True) is False:
+        if (
+            g.preflight(allow_recovery=False, defer_vpn_recovery=True, keep_running_gluetun=True)
+            is False
+        ):
             return
         services = g.enabled_runtime_services()
         g.log(f"Starting services: {', '.join(services)}.")
@@ -205,7 +249,16 @@ class Orchestrator:
         it, and hand over to the fail-safe if that keeps happening.
         """
         try:
-            self.watch_once()
+            with stack_lock(self.guard.config.root_dir) as held:
+                if held:
+                    self.lock_deferred_since = None
+                    self._lock_expiry_warned = False
+                elif not self._lock_defer_expired():
+                    # A CLI command owns the stack right now. Stand aside from
+                    # everything that changes it, but keep looking for a leak.
+                    self._deferred_leak_check()
+                    return True
+                self.watch_once()
         except (typer.Exit, SystemExit, KeyboardInterrupt):
             raise
         except Exception:
@@ -219,6 +272,67 @@ class Orchestrator:
         notify("WATCHDOG=1")
         return True
 
+    def _lock_defer_expired(self) -> bool:
+        """Whether the watchdog has yielded the stack lock for too long."""
+        now = time.monotonic()
+        if self.lock_deferred_since is None:
+            self.lock_deferred_since = now
+            self.guard.log(
+                "Another StremioGuard command is changing the stack; deferring checks "
+                "until it finishes."
+            )
+            return False
+        if now - self.lock_deferred_since < STACK_LOCK_MAX_DEFER_SECONDS:
+            return False
+        if not self._lock_expiry_warned:
+            self._lock_expiry_warned = True
+            self.guard.warn(
+                f"The stack lock has been held for over {STACK_LOCK_MAX_DEFER_SECONDS}s; "
+                "resuming checks without it."
+            )
+        return True
+
+    def _deferred_leak_check(self) -> None:
+        """The one check that does not wait for the stack lock.
+
+        While a CLI command holds the lock the watchdog restarts and starts
+        nothing, but a leak is not something to sit out: a definitive verdict
+        stops the protected services regardless, because stopping is never
+        less safe. Everything else waits for the lock.
+        """
+        g = self.guard
+        if not g.gluetun_healthy():
+            return
+        if g.public_ip_assessment() != PublicIPAssessment.UNSAFE_DEFINITIVE:
+            return
+        g.warn(
+            "Leak verdict while another command holds the stack lock; stopping "
+            "active services anyway."
+        )
+        self.public_ip_failures_since_summary += 1
+        g.stop_active_services(services=g.enabled_runtime_services())
+        self._alert(
+            "leak_verdict",
+            "StremioGuard stopped services: possible VPN leak",
+            "The tunnel egress failed the leak check while another command was "
+            "changing the stack. Services are stopped.",
+        )
+
+    def _alert(self, event: str, title: str, message: str) -> None:
+        """Tell the operator, at most once per event per ALERT_REPEAT_SECONDS.
+
+        Best-effort: nothing here may raise into a shutdown path.
+        """
+        try:
+            now = time.monotonic()
+            last = self._alerts_sent.get(event)
+            if last is not None and now - last < ALERT_REPEAT_SECONDS:
+                return
+            self._alerts_sent[event] = now
+            send_alert(self.guard.config.alert_url, title=title, message=message)
+        except Exception:
+            logger.opt(exception=True).debug("Alert delivery raised unexpectedly.")
+
     def _stop_after_loop_errors(self) -> None:
         self.guard.warn(
             f"Watchdog has encountered {self.consecutive_loop_errors} consecutive "
@@ -229,6 +343,13 @@ class Orchestrator:
         except Exception:
             logger.exception("Failed to stop active services during loop error fallback.")
             stopped = False
+        self._alert(
+            "loop_errors",
+            "StremioGuard watchdog is failing",
+            f"The watchdog failed {self.consecutive_loop_errors} checks in a row and "
+            + ("stopped the protected services." if stopped else "could NOT stop the services.")
+            + " See `./stremio logs`.",
+        )
         if not stopped:
             # Neither checking nor stopping works: exit so systemd restarts us
             # now, rather than idling until the heartbeat deadline.
@@ -245,7 +366,7 @@ class Orchestrator:
             if heartbeat:
                 notify("WATCHDOG=1")
 
-    def _trip_circuit_breaker(self, reason: str) -> None:
+    def _trip_circuit_breaker(self, reason: str, evidence: str | None = None) -> None:
         elapsed = (
             time.monotonic() - self.outage_started_at if self.outage_started_at is not None else 0.0
         )
@@ -253,10 +374,14 @@ class Orchestrator:
             f"Circuit breaker tripped ({reason}). "
             "Persisting lockout marker and initiating fail-closed stack shutdown."
         )
+        if evidence:
+            self.guard.warn(f"Evidence: {evidence}")
         # Attempt to write atomic lockout marker BEFORE stopping containers.
         # Guarded so that filesystem/disk errors cannot bypass container shutdown or exit 78.
         try:
-            self.guard.write_vpn_lockout(reason=reason, outage_duration_seconds=elapsed)
+            self.guard.write_vpn_lockout(
+                reason=reason, outage_duration_seconds=elapsed, evidence=evidence
+            )
         except Exception:
             logger.exception("Failed to write VPN lockout marker during circuit breaker trip.")
         finally:
@@ -266,7 +391,17 @@ class Orchestrator:
                 try:
                     self.guard.stop_gluetun()
                 finally:
-                    raise typer.Exit(code=CIRCUIT_BREAKER_EXIT_CODE)
+                    try:
+                        # After the shutdown, and bounded: an unreachable alert
+                        # endpoint must not delay stopping anything.
+                        self._alert(
+                            f"lockout:{reason}",
+                            "StremioGuard locked out",
+                            f"Circuit breaker tripped ({reason}). Services and the VPN "
+                            "container were stopped; run `./stremio restart` to recover.",
+                        )
+                    finally:
+                        raise typer.Exit(code=CIRCUIT_BREAKER_EXIT_CODE)
 
     def _handle_unhealthy_ip_assessment(
         self, assessment: PublicIPAssessment, services: list[str]
@@ -274,10 +409,33 @@ class Orchestrator:
         g = self.guard
         if assessment == PublicIPAssessment.UNSAFE_DEFINITIVE:
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
-            g.warn("Definitive leak / unsafe IP detected. Stopping active services immediately.")
+            self.consecutive_leak_verdicts += 1
+            g.warn(
+                "Definitive leak / unsafe IP detected "
+                f"({self.consecutive_leak_verdicts}/{LEAK_CONFIRMATIONS}). "
+                "Stopping active services immediately."
+            )
             self.public_ip_failures_since_summary += 1
             self.consecutive_ip_unknowns = 0
             g.stop_active_services(services=services)
+            if self.consecutive_leak_verdicts >= LEAK_CONFIRMATIONS:
+                # A leak means the kill switch did not hold. Resuming on the
+                # next good probe would trust it again without evidence, and
+                # an intermittent verdict would stop and start services
+                # forever. Recovery is the operator's decision.
+                self._trip_circuit_breaker(
+                    "egress_leak",
+                    evidence=(
+                        f"the tunnel egress failed the leak check "
+                        f"{self.consecutive_leak_verdicts} times in a row"
+                    ),
+                )
+            self._alert(
+                "leak_verdict",
+                "StremioGuard stopped services: possible VPN leak",
+                "The tunnel egress failed the leak check. Services are stopped; a second "
+                "failed check locks the stack out.",
+            )
             self._maybe_log_summary()
         elif assessment == PublicIPAssessment.UNKNOWN:
             self.consecutive_ip_unknowns += 1
@@ -296,12 +454,109 @@ class Orchestrator:
                 g.stop_active_services(services=services)
             self._maybe_log_summary()
 
+    def _note_auth_rejection(self, evidence: str | None) -> None:
+        """Lock out on rejected credentials, but only once it is confirmed.
+
+        Providers answer AUTH_FAILED for a connection limit or an overloaded
+        server too, so a single sighting is not proof. It counts as rejected
+        credentials when it is seen again after gluetun has been restarted
+        onto another server.
+        """
+        # `docker logs --since` has one-second resolution, so a line can be
+        # read again on the next check. Gluetun's lines carry a timestamp, so
+        # the same text is the same event and must not count twice.
+        if not evidence or evidence in self.auth_evidence_seen:
+            return
+        self.auth_evidence_seen.add(evidence)
+        self.auth_rejection_generations.add(self.restart_generation)
+        if len(self.auth_rejection_generations) >= AUTH_REJECTION_CONFIRMATIONS:
+            self._trip_circuit_breaker(reason="auth_rejected", evidence=evidence)
+        self.guard.warn(
+            "Gluetun reported an authentication rejection. Providers also send this for a "
+            "connection limit or a busy server, so it locks out only if it repeats after "
+            f"gluetun is restarted. Line: {evidence}"
+        )
+
+    def _restart_gluetun(self, *, relaxed: bool) -> None:
+        self.restart_generation += 1
+        if relaxed:
+            self.guard.restart_gluetun_relaxed()
+        else:
+            self.guard.restart_gluetun()
+        # The next rejection scan starts after the restart. Scanning from the
+        # start of this check would attribute a line the OLD process logged
+        # just before it was restarted to the new one, and confirm a
+        # rejection that was only ever seen once.
+        self.last_auth_check_wall = time.time()
+
+    def _reconcile_namespace(self, gluetun: GluetunState | None, services: list[str]) -> None:
+        """Restart services left on a network namespace gluetun no longer has.
+
+        Runs whenever gluetun's identity differs from the one last verified:
+        on the first check, after the watchdog's own restarts, and when
+        gluetun restarted on its own (crash, OOM kill, a manual `docker
+        restart`), which nothing else here would notice.
+        """
+        if gluetun is None or gluetun.identity is None:
+            return
+        if gluetun.identity == self.gluetun_identity:
+            return
+        g = self.guard
+        stale = g.stale_namespace_services(services, gluetun)
+        if stale is None:
+            g.warn(
+                "Could not verify that services share gluetun's current network namespace; "
+                "retrying on the next check."
+            )
+            return
+        if stale:
+            g.warn(
+                f"Gluetun restarted outside the watchdog: {', '.join(stale)} still hold its "
+                "previous network namespace and cannot reach the network. Restarting them."
+            )
+            self.namespace_rejoins_since_summary += 1
+            self._alert(
+                "namespace_stale",
+                "StremioGuard: VPN container restarted on its own",
+                "Gluetun restarted outside the watchdog. Services attached to its old "
+                "network namespace are being restarted.",
+            )
+            if not g.stop_active_services(services=stale):
+                return
+        self.gluetun_identity = gluetun.identity
+
+    def _auto_start(self, services: list[str]) -> None:
+        """Start services, unless that has become a loop.
+
+        Every cause of a stop/start cycle ends up here: an intermittent leak
+        verdict, a flapping tunnel, a service that exits as soon as it
+        starts. More than the configured number in an hour is treated as a
+        fault that needs an operator, not another retry.
+        """
+        now = time.monotonic()
+        while self.auto_start_times and now - self.auto_start_times[0] > AUTO_START_WINDOW_SECONDS:
+            self.auto_start_times.popleft()
+        limit = self.guard.config.max_auto_starts_per_hour
+        if limit and len(self.auto_start_times) >= limit:
+            self._trip_circuit_breaker(
+                "service_flapping",
+                evidence=f"{len(self.auto_start_times)} automatic starts within the last hour",
+            )
+        self.auto_start_times.append(now)
+        self.auto_starts_since_summary += 1
+        self.guard.start_services(services, build=True, check=False)
+
     def watch_once(self) -> None:
         g = self.guard
         self.checks_since_summary += 1
         services = g.enabled_runtime_services()
 
-        if not g.gluetun_healthy():
+        healthy = g.gluetun_healthy()
+        # The observation behind that answer; None only when a caller
+        # replaced gluetun_healthy, in which case identity is not tracked.
+        gluetun = g.last_gluetun_state
+
+        if not healthy:
             budget = g.config.vpn_recovery_budget_seconds
             now_mono = time.monotonic()
             now_wall = time.time()
@@ -311,18 +566,26 @@ class Orchestrator:
                 self.outage_start_wall = now_wall
                 self.last_auth_check_wall = now_wall
                 self.last_restart_at = now_mono
+                self.restart_generation = 0
+                self.auth_rejection_generations.clear()
+                self.auth_evidence_seen.clear()
                 self.vpn_drops_since_summary += 1
                 g.warn(
                     "Gluetun is not healthy. Outage detected; entering recovery window "
                     f"(budget: {budget}s)."
                 )
                 g.stop_active_services(services=services)
-                # Bounded tail scan on tick 1 to catch the auth rejection that triggered the outage:
-                if g.gluetun_auth_failed(lines=100, since_epoch=None):
-                    self._trip_circuit_breaker(reason="auth_rejected")
+                # The rejection that caused the outage happened before this
+                # tick, so look back, but only a bounded distance: an old,
+                # resolved rejection still in the log must not count.
+                self._note_auth_rejection(
+                    g.gluetun_auth_evidence(
+                        lines=200, since_epoch=now_wall - AUTH_SCAN_LOOKBACK_SECONDS
+                    )
+                )
 
                 # Restart Gluetun (best-effort candidate reselection)
-                g.restart_gluetun()
+                self._restart_gluetun(relaxed=False)
                 self._maybe_log_summary()
                 return
 
@@ -334,12 +597,17 @@ class Orchestrator:
             # Incremental bounded log check since previous probe
             check_since = self.last_auth_check_wall or self.outage_start_wall
             self.last_auth_check_wall = now_wall
-            if g.gluetun_auth_failed(since_epoch=check_since):
-                self._trip_circuit_breaker(reason="auth_rejected")
+            self._note_auth_rejection(g.gluetun_auth_evidence(since_epoch=check_since))
 
             elapsed = now_mono - self.outage_started_at
             if elapsed >= budget:
-                self._trip_circuit_breaker(reason="recovery_budget_exhausted")
+                self._trip_circuit_breaker(
+                    reason="recovery_budget_exhausted",
+                    evidence=(
+                        f"gluetun stayed unhealthy for {int(elapsed)}s across "
+                        f"{self.restart_generation} restart attempts"
+                    ),
+                )
 
             # Check for hybrid failover escalation (at 50% of budget)
             has_narrow_filter = bool(
@@ -358,19 +626,16 @@ class Orchestrator:
                     f"Preferred location did not recover within {int(elapsed)}s. "
                     f"Escalating to broad country pool ({country})."
                 )
-                g.restart_gluetun_relaxed()
                 self.escalation_triggered = True
                 self.last_restart_at = now_mono
+                self._restart_gluetun(relaxed=True)
                 self._maybe_log_summary()
                 return
 
             # Check restart cadence
             if now_mono - self.last_restart_at >= g.config.vpn_restart_cadence_seconds:
                 self.last_restart_at = now_mono
-                if self.escalation_triggered:
-                    g.restart_gluetun_relaxed()
-                else:
-                    g.restart_gluetun()
+                self._restart_gluetun(relaxed=self.escalation_triggered)
 
             self._maybe_log_summary()
             return
@@ -394,10 +659,15 @@ class Orchestrator:
             self.last_auth_check_wall = None
             self.last_restart_at = 0.0
             self.escalation_triggered = False
+            self.restart_generation = 0
+            self.auth_rejection_generations.clear()
+            self.auth_evidence_seen.clear()
+            self.consecutive_leak_verdicts = 0
+            self.consecutive_ip_unknowns = 0
 
+            self._reconcile_namespace(gluetun, services)
             if not g.container_running(services=services):
-                self.auto_starts_since_summary += 1
-                g.start_services(services, build=True, check=False)
+                self._auto_start(services)
 
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
             self._maybe_log_summary()
@@ -410,12 +680,13 @@ class Orchestrator:
             return
 
         self.consecutive_ip_unknowns = 0
+        self.consecutive_leak_verdicts = 0
         self.last_public_ip = g.last_observed_ip or self.last_public_ip
 
+        self._reconcile_namespace(gluetun, services)
         if not g.container_running(services=services):
             g.log("Gluetun healthy; starting active services.")
-            self.auto_starts_since_summary += 1
-            g.start_services(services, build=True, check=False)
+            self._auto_start(services)
 
         self._maybe_log_summary()
 
@@ -433,6 +704,7 @@ class Orchestrator:
             f"last_public_ip={self.last_public_ip or 'unavailable'} "
             f"auto_starts={self.auto_starts_since_summary} "
             f"vpn_drops={self.vpn_drops_since_summary} "
+            f"namespace_rejoins={self.namespace_rejoins_since_summary} "
             f"public_ip_failures={self.public_ip_failures_since_summary} "
             f"loop_errors={self.loop_errors_since_summary} "
             f"uptime_seconds={self.elapsed_seconds()}"
@@ -441,6 +713,7 @@ class Orchestrator:
         self.checks_since_summary = 0
         self.auto_starts_since_summary = 0
         self.vpn_drops_since_summary = 0
+        self.namespace_rejoins_since_summary = 0
         self.public_ip_failures_since_summary = 0
         self.loop_errors_since_summary = 0
 
@@ -465,6 +738,8 @@ class Orchestrator:
                 f"ACTIVE: reason={lockout.get('reason', 'unreadable marker')} "
                 f"since={lockout.get('timestamp', 'unknown')} (inspect with `./stremio unlock`)"
             )
+            if lockout.get("evidence"):
+                logger.warning(f"evidence: {lockout['evidence']}")
         else:
             logger.info("none")
         logger.info("--- Containers ---")
@@ -522,7 +797,15 @@ class Orchestrator:
             # Refuse to verify against the wrong or an unreachable daemon:
             # an unanswered query is not a stopped container.
             g.require_commands()
-            if not g.stop_active_services():
+            stopped = g.stop_active_services()
+            self._alert(
+                "failsafe",
+                "StremioGuard fail-safe ran",
+                "Watchdog supervision failed, so the fail-safe locked the stack out and "
+                + ("stopped" if stopped else "could NOT confirm it stopped")
+                + " the protected services. Run `./stremio restart` to recover.",
+            )
+            if not stopped:
                 raise RuntimeError("Protected services could not be confirmed stopped.")
 
 
@@ -544,9 +827,35 @@ def configure_file_logging(config: Config) -> None:
     logger.info(f"Writing run log to {config.log_file}")
 
 
-def _run_command(action: Callable[[Orchestrator], None], *, teardown: bool = False) -> None:
+def _deployment_root() -> Path:
+    # The same derivation Config.from_env uses for its default root.
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _run_command(
+    action: Callable[[Orchestrator], None],
+    *,
+    teardown: bool = False,
+    deployed: bool = False,
+    lock: str | None = None,
+) -> None:
+    """Run one CLI action.
+
+    ``deployed`` reads the configuration the stack was last started with
+    (the published snapshot) instead of .env, and runs the guard frozen: for
+    the long-lived watchdog and the fail-safe, which must not pick up, or
+    crash on, an .env edit nobody has deployed yet.
+
+    ``lock`` is "required" for commands that start or recreate containers
+    (they refuse to overlap another one) and "preferred" for teardown (it
+    waits briefly, then proceeds: stopping is never less safe).
+    """
+    root_dir = _deployment_root()
     try:
-        config = Config.from_env()
+        if deployed:
+            config = Config.from_env(env_file=deployed_env_file(root_dir))
+        else:
+            config = Config.from_env()
     except (RuntimeError, ValueError) as error:
         if not teardown:
             raise
@@ -556,10 +865,26 @@ def _run_command(action: Callable[[Orchestrator], None], *, teardown: bool = Fal
         logger.warning(f"Ignoring .env for teardown: {error}")
         config = Config.from_env(env_file=Path(os.devnull))
     configure_file_logging(config)
-    guard = GluetunGuard(config)
+    guard = GluetunGuard(config, frozen=deployed and not teardown)
     orch = Orchestrator(guard)
     try:
-        action(orch)
+        if lock == "required":
+            with required_stack_lock(
+                config.root_dir,
+                wait_seconds=LIFECYCLE_LOCK_WAIT_SECONDS,
+                purpose="start or reset it",
+            ):
+                action(orch)
+        elif lock == "preferred":
+            with stack_lock(config.root_dir, wait_seconds=TEARDOWN_LOCK_WAIT_SECONDS) as held:
+                if not held:
+                    logger.warning(
+                        "Another StremioGuard command still holds the stack lock; "
+                        "proceeding anyway because stopping is never less safe."
+                    )
+                action(orch)
+        else:
+            action(orch)
     except (typer.Exit, SystemExit):
         raise
     except LockoutActiveError as error:
@@ -591,7 +916,7 @@ def _run_command(action: Callable[[Orchestrator], None], *, teardown: bool = Fal
 @app.command(hidden=True)
 def reset() -> None:
     """Reset/build/start active services safely."""
-    _run_command(lambda o: o.setup_active_services(reset=True))
+    _run_command(lambda o: o.setup_active_services(reset=True), lock="required")
 
 
 @app.command(hidden=True)
@@ -609,7 +934,7 @@ def pull() -> None:
 @app.command()
 def start() -> None:
     """Initialize if needed and start active services."""
-    _run_command(lambda o: o.start_active_services())
+    _run_command(lambda o: o.start_active_services(), lock="required")
 
 
 def _exit_on_sigterm(signum: int, _frame: FrameType | None) -> None:
@@ -623,13 +948,14 @@ def _exit_on_sigterm(signum: int, _frame: FrameType | None) -> None:
 def watchdog() -> None:
     """Run the watchdog loop and auto-start active services when gluetun is healthy."""
     signal.signal(signal.SIGTERM, _exit_on_sigterm)
-    _run_command(lambda o: o.watch_stremio())
+    # The lock is taken per check inside the loop, not for the process lifetime.
+    _run_command(lambda o: o.watch_stremio(), deployed=True)
 
 
 @app.command(hidden=True)
 def failsafe() -> None:
     """Lock out and stop protected services after watchdog supervision failed."""
-    _run_command(lambda o: o.fail_safe(), teardown=True)
+    _run_command(lambda o: o.fail_safe(), teardown=True, deployed=True, lock="preferred")
 
 
 @app.command()
@@ -641,7 +967,7 @@ def stop() -> None:
         if not o.guard.stop_active_services():
             raise RuntimeError("Protected services could not be confirmed stopped.")
 
-    _run_command(_stop, teardown=True)
+    _run_command(_stop, teardown=True, lock="preferred")
 
 
 @app.command()
