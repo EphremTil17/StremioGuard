@@ -46,7 +46,14 @@ const ESSENTIAL_PATCHES = [
             const requestBase = requestExternalOrigin(req, protocol).replace(/\\/$/, "");
             if (!internalBase) return mediaURL;
             for (const externalBase of [configuredExternalBase, requestBase]) {
-                if (externalBase && mediaURL.startsWith(externalBase)) return internalBase + mediaURL.slice(externalBase.length);
+                if (
+                    externalBase &&
+                    (mediaURL === externalBase ||
+                        mediaURL.startsWith(externalBase + "/") ||
+                        mediaURL.startsWith(externalBase + "?"))
+                ) {
+                    return internalBase + mediaURL.slice(externalBase.length);
+                }
             }
             return mediaURL;
         };`,
@@ -64,7 +71,7 @@ const ESSENTIAL_PATCHES = [
   {
     name: "derive streaming server url from forwarded request origin",
     from: 'var serverUrl = encodeURIComponent(protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
-    to: 'var configuredServerUrl = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, ""), forwardedProto = "string" == typeof req.headers["x-forwarded-proto"] ? req.headers["x-forwarded-proto"].split(",")[0].trim() : "", forwardedHost = "string" == typeof req.headers["x-forwarded-host"] ? req.headers["x-forwarded-host"].split(",")[0].trim() : "", forwardedPrefix = "string" == typeof req.headers["x-forwarded-prefix"] ? req.headers["x-forwarded-prefix"].split(",")[0].trim().replace(/\\/$/, "") : "", normalizedPrefix = forwardedPrefix ? forwardedPrefix.startsWith("/") ? forwardedPrefix : "/" + forwardedPrefix : "", detectedServerUrl = forwardedProto && forwardedHost ? forwardedProto + "://" + forwardedHost + normalizedPrefix : "", serverUrl = encodeURIComponent(detectedServerUrl || configuredServerUrl || protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
+    to: 'var configuredServerUrl = (process.env.EXTERNAL_BASE_URL || "").replace(/\\/$/, ""), forwardedProto = "string" == typeof req.headers["x-forwarded-proto"] ? req.headers["x-forwarded-proto"].split(",")[0].trim() : "", forwardedHost = "string" == typeof req.headers["x-forwarded-host"] ? req.headers["x-forwarded-host"].split(",")[0].trim() : "", forwardedPrefix = "string" == typeof req.headers["x-forwarded-prefix"] ? req.headers["x-forwarded-prefix"].split(",")[0].trim().replace(/\\/$/, "") : "", normalizedPrefix = forwardedPrefix ? forwardedPrefix.startsWith("/") ? forwardedPrefix : "/" + forwardedPrefix : "", detectedServerUrl = forwardedProto && forwardedHost ? forwardedProto + "://" + forwardedHost + normalizedPrefix : "", serverUrl = encodeURIComponent(configuredServerUrl || detectedServerUrl || protocol + req.headers.host), sep = webUILocation.includes("?") ? "&" : "?", location = webUILocation + sep + "streamingServer=" + serverUrl;',
   },
 ];
 
@@ -73,7 +80,7 @@ const COSMETIC_PATCHES = [
   {
     name: "skip noisy hardware probe",
     from: "hwAccelProfiler(port, onHardwareAcceleration);",
-    to: "if (process.env.STREMIO_SKIP_HW_PROBE) { onHardwareAcceleration([]); } else { hwAccelProfiler(port, onHardwareAcceleration); }",
+    to: 'if (/^(?:1|true|yes|on)$/i.test((process.env.STREMIO_SKIP_HW_PROBE || "").trim())) { onHardwareAcceleration([]); } else { hwAccelProfiler(port, onHardwareAcceleration); }',
   },
   {
     name: "ignore favicon path lookups",
@@ -87,12 +94,12 @@ const COSMETIC_PATCHES = [
             var casting = new (__webpack_require__(944))(executables);
             enginefs.router.use("/casting/", casting.middleware);
         }`,
-    to: `        })), !process.env.CASTING_DISABLED && "android" !== process.platform) {
+    to: `        })), !/^(?:1|true|yes|on)$/i.test((process.env.CASTING_DISABLED || "").trim()) && "android" !== process.platform) {
             console.log("Enabling casting...");
             var casting = new (__webpack_require__(944))(executables);
             enginefs.router.use("/casting/", casting.middleware);
         }
-        process.env.CASTING_DISABLED && enginefs.router.get("/casting", (function(req, res) {
+        /^(?:1|true|yes|on)$/i.test((process.env.CASTING_DISABLED || "").trim()) && enginefs.router.get("/casting", (function(req, res) {
             res.writeHead(200, {
                 "Content-Type": "application/json; charset=utf-8"
             }), res.end("[]");

@@ -55,6 +55,14 @@ class TestCometGatewayConfig:
         with pytest.raises(RuntimeError, match="Invalid COMET_GATEWAY_HOST_PORT"):
             CometGatewayConfig.from_env(tmp_path)
 
+    def test_rejects_short_token_length(self, tmp_path: Path) -> None:
+        (tmp_path / ".env").write_text(
+            "COMET_ENABLED=1\nCOMET_GATEWAY_TOKEN_LENGTH=4\n", encoding="utf-8"
+        )
+
+        with pytest.raises(RuntimeError, match="COMET_GATEWAY_TOKEN_LENGTH"):
+            CometGatewayConfig.from_env(tmp_path)
+
 
 class TestCometGatewayManager:
     def test_add_first_token_makes_it_default(self, tmp_path: Path) -> None:
@@ -117,15 +125,17 @@ class TestCometGatewayManager:
         rendered = manager.render_nginx_conf()
 
         assert f"listen {COMET_GATEWAY_CONTAINER_PORT};" in rendered
-        assert (
-            'location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$)|admin(?:/|$))" {' in rendered
-        )
+        assert 'location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$))" {' in rendered
+        assert "admin" not in rendered.split('location ~ "^/(?:configure')[1].split("\n", 1)[0]
         assert "location = / {" in rendered
         assert "proxy_pass $comet_upstream$request_uri;" in rendered
         assert "location / {" in rendered
         assert 'return 403 "Forbidden\\n";' in rendered
         assert "/comet/$gateway_token" in rendered
-        assert "proxy_pass $comet_upstream$comet_uri$is_args$args;" in rendered
+        assert "proxy_pass $comet_upstream$raw_comet_uri;" in rendered
+        assert (
+            "return 301 $pass_x_forwarded_proto://$redirect_host/comet/$gateway_token/;" in rendered
+        )
 
     def test_render_tokens_map_marks_known_tokens_valid(self, tmp_path: Path) -> None:
         manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
@@ -284,6 +294,48 @@ class GatewayReloadTests:
         assert runner.calls[-1][-2:] == ["-s", "reload"]
         assert "-t" in runner.calls[0]
 
+    def test_render_nginx_blocks_admin_and_kodi_and_forwards_encoded_paths(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        manager = CometGatewayManager(make_comet_gateway_config(tmp_path))
+        manager.add_token("Shared Addon")
+        rendered = manager.render_nginx_conf()
+
+        allowlist_header = [
+            line for line in rendered.splitlines() if "location ~" in line and "configure" in line
+        ][0]
+        allowlist_re = re.compile(allowlist_header.split('"', 2)[1])
+        assert allowlist_re.match("/configure")
+        assert allowlist_re.match("/static/app.js")
+        assert allowlist_re.match("/health")
+        assert not allowlist_re.match("/admin")
+        assert not allowlist_re.match("/admin/login")
+        assert not allowlist_re.match("/kodi/get_manifest/123456")
+
+        token_guard_match = re.search(
+            r'if \(\$comet_uri ~\* "([^"]+)"\) \{\s*return 403 "Forbidden\\n";',
+            rendered,
+        )
+        assert token_guard_match is not None
+        token_guard_re = re.compile(token_guard_match.group(1), re.IGNORECASE)
+        assert token_guard_re.match("/admin")
+        assert token_guard_re.match("/admin/dashboard")
+        assert token_guard_re.match("//admin/")
+        assert token_guard_re.match("/kodi/get_manifest/123456")
+        assert token_guard_re.match("/kodi")
+        assert not token_guard_re.match("/manifest.json")
+        assert not token_guard_re.match("/playback/123")
+
+        assert "map $request_uri $raw_comet_uri {" in rendered
+        assert 'if ($raw_comet_uri = "") {\n                return 400;\n            }' in rendered
+        assert "proxy_pass $comet_upstream$raw_comet_uri;" in rendered
+        assert (
+            "return 301 $pass_x_forwarded_proto://$redirect_host/comet/$gateway_token/;" in rendered
+        )
+        assert "~*^\\s*https(?:[\\s,]|$) https;" in rendered
+        assert "token_re" not in rendered and "[A-Za-z0-9_-]+" in rendered
+
     def test_reload_refuses_when_the_container_sees_a_stale_map(self, tmp_path: Path) -> None:
         # A file bind mount keeps the old inode: nginx would reload the old
         # tokens and a revoked token would keep working.
@@ -294,6 +346,15 @@ class GatewayReloadTests:
         ):
             manager.reload_nginx()
         assert not any(call[-2:] == ["-s", "reload"] for call in runner.calls)
+
+    def test_reload_refuses_when_container_not_running(self, tmp_path: Path) -> None:
+        manager, runner = self._manager(tmp_path, "match")
+        with (
+            mock.patch.object(manager, "service_container_id", return_value=None),
+            pytest.raises(RuntimeError, match="not running"),
+        ):
+            manager.reload_nginx()
+        assert runner.calls == []
 
 
 def test_access_log_masks_every_path_but_the_gateway_admin_ones(tmp_path: Path) -> None:
@@ -312,8 +373,11 @@ def test_access_log_masks_every_path_but_the_gateway_admin_ones(tmp_path: Path) 
             if match := regex.match(request):
                 if value == "$request":
                     return request
+                groups = match.groupdict()
                 return (
-                    value.strip('"').replace("${mrh}", match["mrh"]).replace("${mrt}", match["mrt"])
+                    value.strip('"')
+                    .replace("${mrh}", groups.get("mrh", ""))
+                    .replace("${mrt}", groups.get("mrt", ""))
                 )
         return request
 
@@ -322,7 +386,22 @@ def test_access_log_masks_every_path_but_the_gateway_admin_ones(tmp_path: Path) 
     )
     assert masked("GET /eyJrZXkiOiJzZWNyZXQifQ==/manifest.json HTTP/1.1") == "GET /*** HTTP/1.1"
     assert masked("GET /configure HTTP/1.1") == "GET /configure HTTP/1.1"
+    assert masked("GET /configure?secret=pw HTTP/1.1") == "GET /configure HTTP/1.1"
+    assert masked("GET /admin HTTP/1.1") == "GET /*** HTTP/1.1"
+    assert masked("GET /kodi/get_manifest/123456 HTTP/1.1") == "GET /*** HTTP/1.1"
     assert masked("GET / HTTP/1.1") == "GET / HTTP/1.1"
+    assert masked("GET /?token=secret HTTP/1.1") == "GET / HTTP/1.1"
+    for leaky in (
+        "GET /configure/../comet/AbCdEfGh/secret/manifest.json HTTP/1.1",
+        "GET /configure/%2e%2e/comet/AbCdEfGh/secret HTTP/1.1",
+        "GET /configure/%2e%2e/%63omet/AbCdEfGh/secret HTTP/1.1",
+        "GET /configure/.. HTTP/1.1",
+        "GET /configure?next=%2Fcomet%2FAbCdEfGh HTTP/1.1",
+        "GET /comet/AbCdEfGh",
+    ):
+        result = masked(leaky)
+        assert "AbCdEfGh" not in result
+        assert "secret" not in result
 
 
 def _nginx_maps(text: str) -> dict[tuple[str, str], dict[str, str]]:

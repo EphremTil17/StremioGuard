@@ -22,8 +22,15 @@ from unittest import mock
 from stremioguard.comet import manager as manager_mod
 from stremioguard.comet.manager import CometManager
 from stremioguard.comet.state import CandidateDigest, CometState
+from stremioguard.config import CometConfig
 
-from .conftest import FakeRunner, completed, make_comet_config, make_comet_gateway_config
+from .conftest import (
+    FakeRunner,
+    completed,
+    compose_args_prefix,
+    make_comet_config,
+    make_comet_gateway_config,
+)
 from .test_comet import _write_lock, _write_upstream_patch_sources
 
 SHA_LATEST = "sha256:" + "1" * 64
@@ -185,13 +192,17 @@ class ValidateDigestPipelineTests(unittest.TestCase):
     ->manifest-read wiring, with extract_image_source stubbed to a fixture dir
     (FakeRunner cannot simulate `docker cp`'s filesystem side effects)."""
 
+    def _pull_runner(self, cfg: CometConfig) -> FakeRunner:
+        cmd = ["docker", "pull", f"{cfg.image}@{SHA_OTHER}"]
+        return FakeRunner({tuple(cmd): completed(cmd)})
+
     def test_empty_source_reports_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
             empty_source = tmp_path / "empty-source"
             empty_source.mkdir()
-            manager = CometManager(cfg, FakeRunner({}))
+            manager = CometManager(cfg, self._pull_runner(cfg))
             with mock.patch.object(
                 manager_mod,
                 "extract_image_source",
@@ -206,11 +217,18 @@ class ValidateDigestPipelineTests(unittest.TestCase):
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
             _write_valid_sources_without_torrentio(cfg)
-            manager = CometManager(cfg, FakeRunner({}))
-            with mock.patch.object(
-                manager_mod,
-                "extract_image_source",
-                side_effect=lambda runner, image_ref: _stub_extract(cfg.repo_dir),
+            manager = CometManager(cfg, self._pull_runner(cfg))
+            with (
+                mock.patch.object(
+                    manager_mod,
+                    "extract_image_source",
+                    side_effect=lambda runner, image_ref: _stub_extract(cfg.repo_dir),
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "import_smoke_test",
+                    return_value={"status": "passed", "stage": "import", "detail": ""},
+                ),
             ):
                 report = manager._validate_digest(SHA_OTHER)
             self.assertEqual(report["status"], "passed")
@@ -222,7 +240,7 @@ class ValidateDigestPipelineTests(unittest.TestCase):
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
             _write_valid_sources_without_torrentio(cfg)
-            manager = CometManager(cfg, FakeRunner({}))
+            manager = CometManager(cfg, self._pull_runner(cfg))
             with (
                 mock.patch.object(
                     manager_mod,
@@ -247,7 +265,7 @@ class ValidateDigestPipelineTests(unittest.TestCase):
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
             _write_valid_sources_without_torrentio(cfg)
-            manager = CometManager(cfg, FakeRunner({}))
+            manager = CometManager(cfg, self._pull_runner(cfg))
             with (
                 mock.patch.object(
                     manager_mod,
@@ -270,7 +288,7 @@ class ValidateDigestPipelineTests(unittest.TestCase):
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
             _write_valid_sources_without_torrentio(cfg)
-            manager = CometManager(cfg, FakeRunner({}))
+            manager = CometManager(cfg, self._pull_runner(cfg))
             with (
                 mock.patch.object(
                     manager_mod,
@@ -805,7 +823,8 @@ class BundleActivationTests(unittest.TestCase):
         cfg = make_comet_config(tmp_path, patch_episode_pack_results=False)
         _write_lock(cfg.lock_file, commit="deadbeef")
         _write_valid_sources_without_torrentio(cfg)
-        manager = CometManager(cfg, FakeRunner({}))
+        up_cmd = [*compose_args_prefix(tmp_path), "up", "-d", "--no-deps", *cfg.runtime_services]
+        manager = CometManager(cfg, FakeRunner({tuple(up_cmd): completed(up_cmd)}))
         # Render the running image's bundle for real, then record a candidate.
         with self._docker_stubs(manager):
             manager._render_bundle(SHA_LATEST)

@@ -96,20 +96,9 @@ class FakeRunner:
         elif response is not None:
             result = response
         else:
-            if "--status" in args and "--services" in args:
-                # Everything asked about is running, like the inspect default.
-                services = args[args.index("--services") + 1 :]
-                result = subprocess.CompletedProcess(args, 0, "\n".join(services) + "\n", "")
-            elif args[-2:] == ["config", "--services"]:
-                # A Stremio-only project: what `protected_services` reads.
-                services = "use-stremio-start-instead\ngluetun\nstremio\n"
-                result = subprocess.CompletedProcess(args, 0, services, "")
-            elif len(args) >= 3 and args[-3:] == ["ps", "-q", args[-1]]:
-                result = subprocess.CompletedProcess(args, 0, f"{args[-1]}\n", "")
-            elif len(args) >= 4 and args[:4] == ["docker", "inspect", "-f", "{{.State.Running}}"]:
-                result = subprocess.CompletedProcess(args, 0, "true\n", "")
-            else:
-                result = subprocess.CompletedProcess(args, 0, "", "")
+            result = subprocess.CompletedProcess(
+                args, 1, "", f"unstubbed command: {' '.join(args)}"
+            )
 
         if check and result.returncode != 0:
             raise subprocess.CalledProcessError(
@@ -172,6 +161,49 @@ def compose_args_prefix(tmp_path: Path) -> list[str]:
         "-f",
         str(tmp_path / ".stremio" / "docker-compose.bindings.yml"),
     ]
+
+
+def compose_stack_responses(
+    tmp_path: Path,
+    *,
+    containers: tuple[str, ...] = ("gluetun",),
+    running: tuple[str, ...] = (),
+    running_query_services: tuple[str, ...] | None = None,
+    compose_services: tuple[str, ...] | None = None,
+) -> dict[
+    tuple[str, ...],
+    list[subprocess.CompletedProcess[str]] | subprocess.CompletedProcess[str],
+]:
+    """Build explicit Docker/Compose stubs so tests opt in to fake running state."""
+    from stremioguard.config import compose_command
+
+    responses: dict[
+        tuple[str, ...],
+        list[subprocess.CompletedProcess[str]] | subprocess.CompletedProcess[str],
+    ] = {}
+    prefixes: tuple[list[str], ...] = (
+        compose_command(tmp_path),
+        compose_args_prefix(tmp_path),
+    )
+    for prefix in prefixes:
+        for service in containers:
+            ps_cmd = [*prefix, "ps", "-q", service]
+            responses[tuple(ps_cmd)] = completed(ps_cmd, f"{service}\n")
+        if compose_services is not None:
+            cfg_cmd = [*prefix, "config", "--services"]
+            responses[tuple(cfg_cmd)] = completed(cfg_cmd, "\n".join(compose_services) + "\n")
+        query_targets = running_query_services if running_query_services is not None else running
+        if query_targets:
+            status_cmd = [*prefix, "ps", "--status", "running", "--services", *query_targets]
+            responses[tuple(status_cmd)] = completed(
+                status_cmd, "\n".join(s for s in query_targets if s in running) + "\n"
+            )
+    for service in containers:
+        if service in running:
+            responses[("docker", "inspect", "-f", "{{.State.Running}}", service)] = completed(
+                ["docker", "inspect", "-f", "{{.State.Running}}", service], "true\n"
+            )
+    return responses
 
 
 def make_comet_config(tmp_path: Path, **overrides: object) -> CometConfig:

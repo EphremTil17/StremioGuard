@@ -59,7 +59,7 @@ During guided setup, Stremio asks which deployment **tier** you're running:
 - **Tier 1 — LAN + Tailscale only.** No public domain. Init writes `STREMIO_BIND_ADDRS=<host-LAN-IP>,<host-tailscale-IP>` when you choose both addresses and clears `EXTERNAL_BASE_URL`. LAN clients reach Stremio at `http://<host-LAN-IP>:<STREMIO_HOST_PORT>`. Tailnet clients can still reach the raw Tailscale IP directly, but the recommended browser/addon path is Tailscale Serve HTTPS on the node's `*.ts.net` hostname. See [docs/tailscale-runbook.md](docs/tailscale-runbook.md) for the end-to-end Serve flow.
 - **Tier 2 / 3 — reverse-proxied behind a domain.** Init writes the selected bind addresses plus `EXTERNAL_BASE_URL=https://<your-domain>`. You provide the proxy (NPM, Caddy, Traefik, raw nginx); it upstreams to one selected host address on `STREMIO_HOST_PORT` and applies whatever access control fits your threat model. Tier 2 is tailnet-only via a Cloudflare → CGNAT DNS pivot; Tier 3 is publicly routable. The Stremio-side config is identical for both.
 
-`init` is idempotent — re-run it to switch tiers. Start the stack through `./stremio`, which generates a local Compose override from `STREMIO_BIND_ADDRS` publishing Stremio's host port along with Comet's image pin and patched files. Ordinary `docker compose` commands work normally against the base file — `docker compose logs -f`, `ps`, and so on — and Postgres finds its real data directory either way, because that path lives in `docker-compose.yml` rather than in the generated override. Starting with plain `docker compose up` is not harmful, it just runs Comet unpinned and unpatched until the next `./stremio start`. See [docs/secure-access.md](docs/secure-access.md) for the full per-tier runbook, threat model, and verification steps.
+`init` is idempotent — re-run it to switch tiers. Start the stack through `./stremio` (plain `docker compose up` is intentionally blocked by a compose gate service so Comet never comes up unpinned or unpatched). `./stremio start` generates a local Compose override from `STREMIO_BIND_ADDRS` publishing Stremio's host port along with Comet's image pin and patched files. Ordinary inspection commands such as `docker compose logs -f` and `docker compose ps` still work normally against the base file, and Postgres finds its real data directory either way because that path lives in `docker-compose.yml` rather than in the generated override. See [docs/secure-access.md](docs/secure-access.md) for the full per-tier runbook, threat model, and verification steps.
 
 For NordVPN, `init` offers two protocol paths:
 
@@ -222,12 +222,19 @@ The recommended low-friction access model is to protect Comet, not Stremio.
 Users keep their own Stremio accounts, while Comet acts as the token-gated
 addon, stream-discovery, and playback relay.
 
-- Configure/admin stays at `https://comet.example.com/configure` and is
-  protected by Comet's configure password.
+- Configure stays at `https://comet.example.com/configure` and is protected by
+  Comet's configure password; opening `https://comet.example.com/comet/<token>/configure`
+  preserves that token in the generated install/copy links (since configure
+  pages share one configure password and embed the default token, token
+  separation applies to manifest-link recipients without that password). Comet's
+  `/admin` dashboard and `/kodi/...` pairing paths are blocked (`403`) at both
+  top level and under `/comet/<token>/...` — reach `/admin` directly via
+  `COMET_HOST_PORT` on LAN or tailnet (Kodi pairing through the gateway is
+  unsupported).
 - Addon, stream, playback, and debrid-sync routes live under
   `https://comet.example.com/comet/<token>/...`.
-- Raw Comet is published only on `127.0.0.1:COMET_HOST_PORT` for local
-  operator diagnostics.
+- Raw Comet is published only on `COMET_HOST_PORT` on your configured bind
+  addresses for local/tailnet operator access and diagnostics.
 - Public reverse proxies should point at `COMET_GATEWAY_HOST_PORT`, not the raw
   Comet port.
 
@@ -505,7 +512,7 @@ Defense-in-depth notes:
 - Run logs in `logs/` record your home and tunnel IPs, so the directory is owner-only (0700) and each run log is 0600.
 - Comet never offers direct-torrent (P2P) streams here, whatever its configure page says: Stremio would play them with the TV's or phone's own torrent engine, on its own connection, outside the VPN. Everything plays through debrid and Comet's proxy instead. Uncached results are marked with an amber `🔸` on their media-type line (`🔸 WEB-DL`); cached ones are unmarked.
 - Comet's own startup log printed half of every secret it masked (the TorBox key, passwords, the public API token). A required patch makes it print `********` instead; see [docs/comet-patches.md](docs/comet-patches.md).
-- The gateway's access log keeps only its own admin paths (`/`, `/configure`, `/static/`, `/health`, `/admin`) readable and masks every other request path, so a raw Comet addon URL sent to it is not recorded.
+- The gateway's access log keeps only clean public UI/health paths (`/`, `/configure`, `/static/`, `/health`, with query strings stripped) readable and masks `/comet/...`, `%`, `/..`, and all other request paths so raw Comet addon URLs are not recorded. (`/admin` and `/kodi/...` paths are blocked at both top level and under `/comet/<token>/...`.)
 - Restarting gluetun mid-session (e.g., `docker compose restart gluetun`) leaves Stremio running but network-isolated until the watchdog's next tick stops it. Expected behavior of the netns-share model.
 
 ## Inbound access threat model

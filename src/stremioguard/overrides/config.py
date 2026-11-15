@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from stremioguard.overrides._patching import replace_first_matching
+
 
 def render_config_override(repo_dir: Path) -> str:
     config_file = repo_dir / "comet" / "api" / "endpoints" / "config.py"
@@ -13,7 +15,7 @@ def render_config_override(repo_dir: Path) -> str:
     if "_forwarded_prefix(" not in content:
         helper = """
 def _forwarded_prefix(request: Request) -> str:
-    prefix = request.headers.get("x-forwarded-prefix", "").strip().rstrip("/")
+    prefix = request.headers.get("x-forwarded-prefix", "").split(",", 1)[0].strip().rstrip("/")
     if not prefix:
         return ""
     return prefix if prefix.startswith("/") else f"/{prefix}"
@@ -35,7 +37,10 @@ def _sanitize_next_url_for_request(request: Request, next_url: str | None):
 
 
 def _is_secure_request(request: Request) -> bool:
-    return (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    if forwarded_proto in ("http", "https"):
+        return forwarded_proto == "https"
+    return request.url.scheme == "https"
 
 
 """
@@ -89,5 +94,13 @@ def _is_secure_request(request: Request) -> bool:
         ),
     }
     for before, after in replacements.items():
-        content = content.replace(before, after)
+        content = replace_first_matching(
+            content,
+            ((before, after),),
+            error=(
+                "Unable to apply managed Comet config-prefix patch; upstream "
+                f"call site changed: {before}"
+            ),
+            expected=1,
+        )
     return content

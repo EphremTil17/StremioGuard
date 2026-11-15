@@ -559,7 +559,9 @@ class GluetunGuard:
         return None
 
     def public_ip_via_gluetun(self) -> str | None:
-        container_id = self.service_container_id("gluetun") or ""
+        container_id = self.service_container_id("gluetun")
+        if not container_id:
+            return None
         for url in self.config.ip_check_urls:
             result = self.runner.run(
                 [
@@ -842,7 +844,7 @@ class GluetunGuard:
         self.check_vpn_lockout(allow_recovery=allow_recovery)
         self.check_bind_addresses()
 
-        comet_config = CometConfig.from_env(self.config.root_dir)
+        comet_config = CometConfig.from_env(self.config.root_dir, env_file=self._env_path)
         if comet_config.enabled:
             from stremioguard.comet import CometManager
 
@@ -971,18 +973,63 @@ class GluetunGuard:
             if service not in {"gluetun", COMPOSE_GATE_SERVICE}
         ]
 
+    def _docker_stop_service(self, service: str) -> None:
+        container_id = self.service_container_id(service)
+        if not container_id:
+            return
+        try:
+            self.runner.run(
+                ["docker", "stop", "-t", "5", container_id],
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
+        except subprocess.SubprocessError as error:
+            self.warn(f"Direct `docker stop` failed for {service} ({container_id[:12]}): {error}")
+
     def stop_active_services(self, services: list[str] | None = None) -> bool:
         """Stop ``services`` (default: all protected) and return whether that was verified."""
         if services is None:
-            services = self.protected_services()
+            try:
+                services = self.protected_services()
+            except subprocess.SubprocessError as error:
+                self.warn(
+                    f"Could not read protected services from Compose ({error}); "
+                    "falling back to configured runtime services."
+                )
+                try:
+                    services = self.enabled_runtime_services()
+                except (RuntimeError, ValueError):
+                    services = [
+                        "stremio",
+                        "comet-gateway",
+                        "comet",
+                        "stremthru",
+                        "comet-postgres",
+                    ]
         running = self.running_services(services)
         if running == set():
             return True
         # Unknown state: stop everything named rather than guess.
         running_services = [s for s in services if running is None or s in running]
         self.log(f"Stopping active services: {', '.join(running_services)}.")
-        result = self.compose("stop", *running_services, check=False)
-        if result.returncode == 0 and self.services_confirmed_stopped(running_services):
+        compose_ok = False
+        try:
+            result = self.compose("stop", *running_services, check=False)
+            compose_ok = result.returncode == 0
+        except subprocess.SubprocessError as error:
+            self.warn(f"`docker compose stop` failed ({error}); falling back to `docker stop`.")
+        if compose_ok and self.services_confirmed_stopped(running_services):
+            self.success("Active services are stopped.")
+            return True
+        still_running = self.running_services(running_services)
+        fallback_targets = (
+            running_services
+            if still_running is None
+            else [s for s in running_services if s in still_running]
+        )
+        for service in fallback_targets:
+            self._docker_stop_service(service)
+        if self.services_confirmed_stopped(running_services):
             self.success("Active services are stopped.")
             return True
         self.warn(f"Failed to confirm shutdown of services: {', '.join(running_services)}.")
@@ -992,13 +1039,7 @@ class GluetunGuard:
         self.log("Stopping gluetun VPN container.")
         result = self.compose("stop", "gluetun", check=False)
         if self.container_running(["gluetun"]) or result.returncode != 0:
-            container_id = self.service_container_id("gluetun")
-            if container_id:
-                self.runner.run(
-                    ["docker", "stop", "-t", "5", container_id],
-                    check=False,
-                    timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
-                )
+            self._docker_stop_service("gluetun")
             if self.container_running(["gluetun"]):
                 self.warn(
                     "FATAL: Gluetun VPN container could not be stopped. "

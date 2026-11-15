@@ -353,3 +353,10 @@ def test_write_env_settings_replaces_the_last_assignment_and_keeps_export(
     assert env.env_file_value(path, "KEY") == "new value"
     assert env.env_file_value(path, "ADDED") == "a # b"
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_env_settings_keeps_keys_starting_with_export_unprefixed(tmp_path: Path) -> None:
+    path = _dotenv(tmp_path, "export_mode=old\n")
+    env.write_env_settings(path, {"export_mode": "new"})
+    assert path.read_text(encoding="utf-8").splitlines() == ["export_mode=new"]
+    assert env.env_file_value(path, "export_mode") == "new"

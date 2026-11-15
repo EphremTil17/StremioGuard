@@ -17,6 +17,7 @@ from stremioguard.cli.commands import comet_core as comet_core_mod
 from stremioguard.comet import CometManager
 from stremioguard.comet import manager as manager_mod
 from stremioguard.comet_gateway import CometGatewayConfig, CometGatewayManager
+from stremioguard.config import compose_command
 from stremioguard.env import env_file_value
 from stremioguard.overrides import write_override_bundle
 from stremioguard.publishing import render_stack_compose_override
@@ -25,6 +26,7 @@ from .conftest import (
     TEST_COMET_DIGEST,
     FakeRunner,
     completed,
+    compose_stack_responses,
     make_comet_config,
     make_config,
     record_test_digest,
@@ -170,6 +172,18 @@ def _write_upstream_patch_sources(cfg) -> None:
         "        )\n"
         "        formatted_title = format_title_fn(formatted_components)\n"
         "        for service in []:\n"
+        "            _name = _build_stream_name(\n"
+        "                False,\n"
+        "                service,\n"
+        "                resolution,\n"
+        '                status="C" if is_cached else "U",\n'
+        "            )\n"
+        "            _p2p = _build_stream_name(\n"
+        "                False,\n"
+        '                "torrent",\n'
+        "                resolution,\n"
+        '                status="P2P",\n'
+        "            )\n"
         "            the_stream = {\n"
         '                "name": stream_name,\n'
         '                "description": formatted_title,\n'
@@ -202,6 +216,14 @@ def _write_upstream_patch_sources(cfg) -> None:
         'async def configure_login(request: Request, next_url: str = "/configure"):\n'
         "    if False:\n"
         "        return RedirectResponse(_sanitize_next_url(next_url), status_code=303)\n"
+        "    if True:\n"
+        "        response = RedirectResponse(_sanitize_next_url(next_url), status_code=303)\n"
+        "        response.set_cookie(\n"
+        '            key="comet_admin",\n'
+        '            value="1",\n'
+        '            secure=request.url.scheme == "https",\n'
+        "        )\n"
+        "        return response\n"
         "    return _render_configure_login(\n"
         "        request,\n"
         '        next_url=_sanitize_next_url(next_url), error="Invalid password"\n'
@@ -216,6 +238,11 @@ def _write_upstream_patch_sources(cfg) -> None:
         '          const stremioApiPrefix = {{ (stremioApiPrefix or "") | tojson }};\n'
         "          function getManifestUrl(settings, forInstall = false) {\n"
         "            const host = window.location.host;\n"
+        "            if (!settings) {\n"
+        "              return forInstall\n"
+        "                ? `stremio://${host}${stremioApiPrefix}/manifest.json`\n"
+        "                : `${window.location.origin}${stremioApiPrefix}/manifest.json`;\n"
+        "            }\n"
         "            const settingsString = btoa(JSON.stringify(settings));\n"
         "            return forInstall\n"
         "              ? `stremio://${host}${stremioApiPrefix}/${settingsString}/manifest.json`\n"
@@ -223,6 +250,9 @@ def _write_upstream_patch_sources(cfg) -> None:
         "${settingsString}/manifest.json`;\n"
         "          }\n"
         "          function getKodiManifestUrl(settings) {\n"
+        "            if (!settings) {\n"
+        "              return `${window.location.origin}${stremioApiPrefix}/manifest.json`;\n"
+        "            }\n"
         "            const settingsString = btoa(JSON.stringify(settings));\n"
         "            return `${window.location.origin}${stremioApiPrefix}/"
         "${settingsString}/manifest.json`;\n"
@@ -799,6 +829,9 @@ class CometManagerTests(unittest.TestCase):
             cfg = make_comet_config(tmp_path)
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(
+                        tmp_path, containers=(cfg.service_name,), running=(cfg.service_name,)
+                    ),
                     (
                         "docker",
                         "inspect",
@@ -835,6 +868,11 @@ class CometManagerTests(unittest.TestCase):
             )
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(
+                        tmp_path,
+                        containers=("gluetun", cfg.service_name),
+                        running=(cfg.service_name,),
+                    ),
                     ("git", "-C", str(cfg.repo_dir), "rev-parse", "HEAD"): completed(
                         ["git", "rev-parse"], "deadbeef\n"
                     ),
@@ -922,6 +960,11 @@ class CometManagerTests(unittest.TestCase):
             )
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(
+                        tmp_path,
+                        containers=("gluetun", cfg.service_name),
+                        running=(cfg.service_name,),
+                    ),
                     ("git", "-C", str(cfg.repo_dir), "rev-parse", "HEAD"): completed(
                         ["git", "rev-parse"], "deadbeef\n"
                     ),
@@ -1078,6 +1121,9 @@ class CompatibilityTests(unittest.TestCase):
                 "image_digest": "sha256:image",
                 "source_commit": "commit",
                 "patch_fingerprint": "patches",
+                "result_format_style": cfg.result_format_style,
+                "patch_episode_pack_results": cfg.patch_episode_pack_results,
+                "gateway_enabled": cfg.gateway_enabled,
                 "stage": "import",
             }
             cfg.state_dir.mkdir(parents=True, exist_ok=True)
@@ -1103,6 +1149,9 @@ class CompatibilityTests(unittest.TestCase):
                 "image_digest": "sha256:image",
                 "source_commit": "commit",
                 "patch_fingerprint": "patches",
+                "result_format_style": cfg.result_format_style,
+                "patch_episode_pack_results": cfg.patch_episode_pack_results,
+                "gateway_enabled": cfg.gateway_enabled,
                 "stage": "import",
             }
             cfg.state_dir.mkdir(parents=True, exist_ok=True)
@@ -1119,6 +1168,57 @@ class CompatibilityTests(unittest.TestCase):
             self.assertFalse(
                 manager._compatibility_cache_valid("sha256:image", "commit", "patches")
             )
+
+    def test_compatibility_cache_invalidated_when_render_settings_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            (tmp_path / ".env").write_text(
+                "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=1\n", encoding="utf-8"
+            )
+            cfg = make_comet_config(
+                tmp_path,
+                result_format_style="emoji",
+                patch_episode_pack_results=False,
+                gateway_enabled=True,
+            )
+            manager = CometManager(cfg, FakeRunner({}))
+            cache = {
+                "status": "passed",
+                "image": cfg.image,
+                "image_digest": "sha256:image",
+                "source_commit": "commit",
+                "patch_fingerprint": "patches",
+                "result_format_style": "plain",
+                "patch_episode_pack_results": False,
+                "gateway_enabled": True,
+                "stage": "import",
+            }
+            cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
+            self.assertFalse(
+                manager._compatibility_cache_valid("sha256:image", "commit", "patches")
+            )
+            cache["result_format_style"] = "emoji"
+            (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
+            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "commit", "patches"))
+
+    def test_render_runtime_env_quotes_secrets_with_special_characters(self) -> None:
+        from stremioguard.env import read_env_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            cfg = make_comet_config(
+                tmp_path,
+                configure_page_password="p@ss #with 'quotes' and $var",
+                torbox_api_key="tb key #2",
+                default_debrid_apikey="rd key $x",
+            )
+            manager = CometManager(cfg, FakeRunner({}))
+            manager.write_runtime_env()
+            parsed = read_env_file(cfg.runtime_env_file)
+            self.assertEqual(parsed["CONFIGURE_PAGE_PASSWORD"], "p@ss #with 'quotes' and $var")
+            self.assertEqual(parsed["TORBOX_API_KEY"], "tb key #2")
+            self.assertEqual(parsed["PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY"], "rd key $x")
 
 
 class PlaybackProbeTests(unittest.TestCase):
@@ -1229,6 +1329,65 @@ class CometCliTests(unittest.TestCase):
         ):
             comet_core_mod.comet_install()
         self.assertEqual(ctx.exception.exit_code, 1)
+
+    def test_cli_comet_stop_refuses_while_watchdog_running_and_stops_when_inactive(self) -> None:
+        from stremioguard.cli import supervisor as supervisor_mod
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            (temp_root / ".env").write_text(
+                "COMET_ENABLED=1\nSTREMIO_ENABLED=0\n", encoding="utf-8"
+            )
+            with (
+                mock.patch.object(comet_core_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(supervisor_mod, "watchdog_running", return_value=True),
+                mock.patch.object(comet_core_mod, "_comet_manager") as manager_fn,
+                mock.patch.object(comet_core_mod, "fail", side_effect=typer.Exit(1)) as fail_mock,
+                self.assertRaises(typer.Exit),
+            ):
+                comet_core_mod.comet_stop()
+            self.assertIn("./stremio stop", fail_mock.call_args[0][0])
+            manager_fn.return_value.stop.assert_not_called()
+
+            (temp_root / ".env").write_text(
+                "COMET_ENABLED=1\nSTREMIO_ENABLED=1\n", encoding="utf-8"
+            )
+            with (
+                mock.patch.object(comet_core_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(supervisor_mod, "watchdog_running", return_value=True),
+                mock.patch.object(comet_core_mod, "_comet_manager") as manager_fn,
+                mock.patch.object(comet_core_mod, "fail", side_effect=typer.Exit(1)) as fail_mock,
+                self.assertRaises(typer.Exit),
+            ):
+                comet_core_mod.comet_stop()
+            self.assertIn("COMET_ENABLED=0", fail_mock.call_args[0][0])
+            self.assertIn("./stremio start", fail_mock.call_args[0][0])
+            manager_fn.return_value.stop.assert_not_called()
+
+            with (
+                mock.patch.object(comet_core_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(supervisor_mod, "watchdog_running", return_value=None),
+                mock.patch.object(comet_core_mod, "_comet_manager") as manager_fn,
+                mock.patch.object(comet_core_mod, "fail", side_effect=typer.Exit(1)) as fail_mock,
+                self.assertRaises(typer.Exit),
+            ):
+                comet_core_mod.comet_stop()
+            self.assertIn("./stremio stop", fail_mock.call_args[0][0])
+            manager_fn.return_value.stop.assert_not_called()
+
+            with (
+                mock.patch.object(supervisor_mod, "_systemctl", side_effect=RuntimeError("no bus")),
+                mock.patch.object(supervisor_mod.shutil, "which", return_value="/bin/systemctl"),
+            ):
+                self.assertIsNone(supervisor_mod.watchdog_running())
+
+            with (
+                mock.patch.object(comet_core_mod, "ROOT_DIR", temp_root),
+                mock.patch.object(supervisor_mod, "watchdog_running", return_value=False),
+                mock.patch.object(comet_core_mod, "_comet_manager") as manager_fn,
+            ):
+                comet_core_mod.comet_stop()
+            manager_fn.return_value.stop.assert_called_once()
 
     def test_prompt_debrid_provider_accepts_numeric_choice(self) -> None:
         with (
@@ -1521,8 +1680,18 @@ class StremThruAndScraperTests(unittest.TestCase):
 
     def test_comet_restarts_never_touch_gluetun(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            runner = FakeRunner({})
-            manager = CometManager(make_comet_config(Path(directory)), runner)
+            tmp_path = Path(directory)
+            up_cmd = compose_command(
+                tmp_path,
+                "up",
+                "-d",
+                "--no-deps",
+                "comet-postgres",
+                "stremthru",
+                "comet",
+            )
+            runner = FakeRunner({tuple(up_cmd): completed(up_cmd)})
+            manager = CometManager(make_comet_config(tmp_path), runner)
             with mock.patch.object(manager, "write_stack_override_file"):
                 manager._up()
             self.assertEqual(
@@ -1603,3 +1772,167 @@ def test_compose_keeps_the_stremthru_feature_comet_plays_through() -> None:
     features = re.search(r'STREMTHRU_FEATURE: "([^"]+)"', compose)
     assert features is not None
     assert "-torz" not in features.group(1).split(",")
+
+
+def _node_binary() -> str | None:
+    import shutil
+
+    found = shutil.which("node")
+    if found:
+        return found
+    local_node = Path.home() / ".local" / "bin" / "node"
+    return str(local_node) if local_node.is_file() else None
+
+
+def test_configure_template_preserves_request_token_in_node() -> None:
+    import subprocess
+
+    from stremioguard.overrides.template import render_configure_template_override
+
+    node = _node_binary()
+    if node is None:
+        raise unittest.SkipTest("node not installed")
+
+    with tempfile.TemporaryDirectory() as directory:
+        cfg = make_comet_config(Path(directory))
+        _write_upstream_patch_sources(cfg)
+        rendered = render_configure_template_override(
+            cfg.repo_dir, "https://comet.example.com/comet/defaultTok"
+        )
+
+    snippet = rendered.replace(
+        'const stremioApiPrefix = {{ (stremioApiPrefix or "") | tojson }};',
+        "",
+    )
+    script = f"""
+    const stremioApiPrefix = "";
+    const settings = {{ debrid: "rd" }};
+    function testPath(pathname) {{
+      globalThis.window = {{
+        location: {{
+          origin: "https://comet.example.com",
+          host: "comet.example.com",
+          pathname,
+        }},
+      }};
+      {snippet}
+      return {{
+        copy: getManifestUrl(settings, false),
+        install: getManifestUrl(settings, true),
+        defaultCopy: getManifestUrl(null, false),
+        kodi: getKodiManifestUrl(settings),
+      }};
+    }}
+    console.log(JSON.stringify({{
+      secondToken: testPath("/comet/secondTok/configure"),
+      editSecondToken: testPath("/comet/secondTok/oldB64Config/configure"),
+      rootConfigure: testPath("/configure"),
+      editRootConfigure: testPath("/oldB64Config/configure"),
+    }}));
+    """
+    proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+    result = json.loads(proc.stdout)
+    assert "/comet/secondTok/" in result["secondToken"]["copy"]
+    assert "/comet/secondTok/" in result["secondToken"]["install"]
+    assert "/comet/secondTok/" in result["secondToken"]["defaultCopy"]
+    assert "/comet/secondTok/" in result["secondToken"]["kodi"]
+    assert "defaultTok" not in json.dumps(result["secondToken"])
+    assert result["editSecondToken"]["copy"].startswith(
+        "https://comet.example.com/comet/secondTok/"
+    )
+    assert result["editSecondToken"]["install"].startswith(
+        "stremio://comet.example.com/comet/secondTok/"
+    )
+    assert result["editSecondToken"]["kodi"].startswith(
+        "https://comet.example.com/comet/secondTok/"
+    )
+    assert "oldB64Config" not in json.dumps(result["editSecondToken"])
+    assert "defaultTok" not in json.dumps(result["editSecondToken"])
+    assert "/comet/defaultTok/" in result["rootConfigure"]["copy"]
+    assert "/comet/defaultTok/" in result["rootConfigure"]["install"]
+    assert "/comet/defaultTok/" in result["editRootConfigure"]["copy"]
+    assert "oldB64Config" not in result["editRootConfigure"]["copy"]
+
+
+def test_override_renderers_fail_closed_on_drifted_anchors() -> None:
+    from stremioguard.overrides.config import render_config_override
+    from stremioguard.overrides.formatter import render_formatter_override
+    from stremioguard.overrides.stream import render_stream_override
+    from stremioguard.overrides.template import render_configure_template_override
+
+    with tempfile.TemporaryDirectory() as directory:
+        cfg = make_comet_config(Path(directory))
+        _write_upstream_patch_sources(cfg)
+
+        config_path = cfg.repo_dir / "comet" / "api" / "endpoints" / "config.py"
+        config_orig = config_path.read_text(encoding="utf-8")
+        config_path.write_text(
+            config_orig.replace('secure=request.url.scheme == "https",', "secure=False,"),
+            encoding="utf-8",
+        )
+        with unittest.TestCase().assertRaises(RuntimeError):
+            render_config_override(cfg.repo_dir)
+        config_path.write_text(config_orig, encoding="utf-8")
+
+        fmt_path = cfg.repo_dir / "comet" / "utils" / "formatting.py"
+        fmt_orig = fmt_path.read_text(encoding="utf-8")
+        fmt_path.write_text(fmt_orig.replace('"seeders": "Seeders: {}",', ""), encoding="utf-8")
+        with unittest.TestCase().assertRaises(RuntimeError):
+            render_formatter_override(cfg.repo_dir, "plain")
+        fmt_path.write_text(fmt_orig, encoding="utf-8")
+
+        tpl_path = cfg.repo_dir / "comet" / "templates" / "index.html"
+        tpl_orig = tpl_path.read_text(encoding="utf-8")
+        tpl_path.write_text(
+            tpl_orig.replace("`stremio://${host}${stremioApiPrefix}/manifest.json`", '"/bad"'),
+            encoding="utf-8",
+        )
+        with unittest.TestCase().assertRaises(RuntimeError):
+            render_configure_template_override(cfg.repo_dir, "https://comet.example.com/comet/tok")
+        tpl_path.write_text(tpl_orig, encoding="utf-8")
+
+        stream_path = cfg.repo_dir / "comet" / "api" / "endpoints" / "stream.py"
+        stream_orig = stream_path.read_text(encoding="utf-8")
+        stream_path.write_text(
+            stream_orig.replace('status="P2P",', 'status="X",'), encoding="utf-8"
+        )
+        with unittest.TestCase().assertRaises(RuntimeError):
+            render_stream_override(cfg.repo_dir)
+
+
+def test_stremio_patch_server_js_runtime_guards() -> None:
+    import subprocess
+
+    node = _node_binary()
+    if node is None:
+        raise unittest.SkipTest("node not installed")
+
+    patch_js = Path(__file__).resolve().parent.parent / "docker" / "stremio" / "patch-server.js"
+    subprocess.run([node, "--check", str(patch_js)], check=True)
+    text = patch_js.read_text(encoding="utf-8")
+    assert "/^(?:1|true|yes|on)$/i.test((process.env.STREMIO_SKIP_HW_PROBE" in text
+    assert "/^(?:1|true|yes|on)$/i.test((process.env.CASTING_DISABLED" in text
+    assert 'mediaURL.startsWith(externalBase + "/")' in text
+    assert "configuredServerUrl || detectedServerUrl || protocol + req.headers.host" in text
+
+    # Verify normalizeMediaURL boundary behavior in node.
+    expr = (
+        text.split("normalizeMediaURL = ", 1)[1].split("return mediaURL;\n        };", 1)[0]
+        + "return mediaURL;\n        };"
+    ).replace(r"\\/", r"\/")
+    probe = f"""
+    process.env.INTERNAL_MEDIA_BASE_URL = "http://127.0.0.1:11470";
+    process.env.EXTERNAL_BASE_URL = "https://stremio.example.com";
+    const forwardedValue = v => "string" == typeof v ? v.split(",")[0].trim() : "";
+    const forwardedPrefix = () => "";
+    const requestExternalOrigin = () => "https://stremio.example.com";
+    const normalizeMediaURL = {expr}
+    console.log(JSON.stringify({{
+      sameOrigin: normalizeMediaURL("https://stremio.example.com/stream/1", null, ""),
+      lookalikeHost: normalizeMediaURL("https://stremio.example.com.evil.com/stream/1", null, ""),
+    }}));
+    """
+    proc = subprocess.run([node, "-e", probe], capture_output=True, text=True, check=True)
+    out = json.loads(proc.stdout)
+    assert out["sameOrigin"] == "http://127.0.0.1:11470/stream/1"
+    assert out["lookalikeHost"] == "https://stremio.example.com.evil.com/stream/1"

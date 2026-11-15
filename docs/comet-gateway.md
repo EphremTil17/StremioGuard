@@ -23,7 +23,8 @@ https://comet.example.com/comet/<token>/<config>/stream/...
 https://comet.example.com/comet/<token>/<config>/playback/...
 ```
 
-Direct public addon paths are blocked by the gateway:
+Direct public addon paths and unauthenticated internal endpoints are blocked by
+the gateway (`403`):
 
 ```text
 https://comet.example.com/manifest.json
@@ -33,7 +34,14 @@ https://comet.example.com/<config>/stream/...
 https://comet.example.com/playback/...
 https://comet.example.com/<config>/playback/...
 https://comet.example.com/debrid-sync/...
+https://comet.example.com/admin
+https://comet.example.com/kodi/...
 ```
+
+Comet's `/admin` dashboard should be accessed directly via `COMET_HOST_PORT` on
+LAN/tailnet rather than through the public gateway (`/admin` and `/kodi/...` are
+blocked with `403` both at top level and under `/comet/<token>/...`). Kodi
+pairing through the gateway is unsupported.
 
 ## Why This Exists
 
@@ -72,15 +80,19 @@ Create a shared token:
 ./stremio comet token add "Shared Addon"
 ```
 
-The first token becomes the default token used by Comet's configure-page
-copy/install buttons. You can switch the default later:
+The first token becomes the default token used by root `/configure` copy/install
+buttons (while `/comet/<token>/configure` preserves that specific token in its
+copy/install links). Note that every configure page—including `/comet/<token>/configure`—sits
+behind Comet's single shared configure password and embeds the default token for
+root `/configure` links, so token separation holds for people who receive a
+manifest link without the configure password. You can switch the default later:
 
 ```bash
 ./stremio comet token use <id>
 ```
 
 Treat the token like a password: anyone who has it can use the corresponding
-addon path. Keep the default length or increase it; do not lower
+addon path. Keep the default length or increase it (minimum 8); do not lower
 `COMET_GATEWAY_TOKEN_LENGTH` for an internet-facing deployment. Tokens do not
 expire automatically, so rotate or revoke them when a device/user no longer
 needs access.
@@ -163,17 +175,23 @@ The generated nginx config rate-limits abuse paths without ever throttling
 authenticated playback:
 
 - Requests carrying an invalid gateway token are rewritten to an internal
-  location that rejects them in the access phase, rate-limited per client IP
-  (5 r/s, burst 10). Valid tokens never enter that location, so bursty range
-  requests during seeks are unaffected.
-- Human-paced pages (`/configure`, `/static/`, `/health`, `/admin`, and the
-  root page) are limited per client IP at 10 r/s (burst 20), which throttles
-  configure-password brute force.
+  location that rejects them in the access phase, rate-limited at 5 r/s (burst
+  10). Behind rootless Docker or a reverse proxy, every client arrives from the
+  same address, so each limiter shares one bucket rather than limiting per end
+  client IP. Valid tokens never enter that location, so bursty range requests
+  during seeks are unaffected.
+- Human-paced public pages (`/configure`, `/static/`, `/health`, and the root
+  page) share a 10 r/s (burst 20) limit, which throttles configure-password brute
+  force. `/admin` and `/kodi/...` paths (including under `/comet/<token>/...`)
+  are blocked and return `403`.
 - Everything else falls through to a `403` limited at 5 r/s (burst 3).
 
 Access logs record a masked request line: the entire path after `/comet/` —
 the token and the base64 config blob after it, which can embed debrid API
-keys — is replaced with `***`, so neither secret ever lands in `access.log`.
+keys — is replaced with `***`, any request line containing `%` or `/..`
+(traversal or encoded variants) is masked to `***`, and query strings on
+`/configure`, `/static/`, `/health`, and `/` are stripped so tokens, configs,
+and secrets are not recorded in `access.log`.
 
 nginx itself appends the raw request line to every error-log entry made while
 serving a request, so the generated config sets `error_log … crit`: upstream

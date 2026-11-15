@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from stremioguard.overrides._patching import replace_first_matching
+
 
 def render_configure_template_override(
     repo_dir: Path,
@@ -27,25 +29,38 @@ def render_configure_template_override(
             const segments = window.location.pathname.split("/").filter(Boolean);
             const configureIndex = segments.lastIndexOf("configure");
             const cometIndex = segments.indexOf("comet");
-            if (cometIndex < 0 || configureIndex < 0 || cometIndex >= configureIndex) {
+            if (cometIndex < 0 || configureIndex <= cometIndex + 1) {
               return "";
             }
-            return "/" + segments.slice(0, cometIndex + 1).join("/");
+            return "/" + segments.slice(0, cometIndex + 2).join("/");
           }
 
           function getCometPublicBase() {
+            const cometMountPath = getCometMountPath();
+            if (cometMountPath) {
+              if (cometConfiguredPublicBase && !cometConfiguredPublicBase.startsWith("/")) {
+                return `${new URL(cometConfiguredPublicBase).origin}${cometMountPath}`;
+              }
+              return `${window.location.origin}${cometMountPath}`;
+            }
             if (cometConfiguredPublicBase) {
               if (cometConfiguredPublicBase.startsWith("/")) {
                 return `${window.location.origin}${cometConfiguredPublicBase}`;
               }
               return cometConfiguredPublicBase;
             }
-            return `${window.location.origin}${getCometMountPath()}`;
+            return window.location.origin;
           }
 
           function getCometInstallBase(host, cometMountPath) {
-            if (!cometConfiguredPublicBase) {
+            if (cometMountPath) {
+              if (cometConfiguredPublicBase && !cometConfiguredPublicBase.startsWith("/")) {
+                return `${new URL(cometConfiguredPublicBase).host}${cometMountPath}`;
+              }
               return `${host}${cometMountPath}`;
+            }
+            if (!cometConfiguredPublicBase) {
+              return host;
             }
             if (cometConfiguredPublicBase.startsWith("/")) {
               return `${host}${cometConfiguredPublicBase}`;
@@ -67,25 +82,47 @@ def render_configure_template_override(
     host_replacement = (
         "            const host = window.location.host;\n"
         "            const cometMountPath = getCometMountPath();\n"
-        "            const cometPublicBase = getCometPublicBase();\n"
         "            const cometInstallBase = getCometInstallBase(host, cometMountPath);"
     )
-    if host_replacement not in content:
-        content = content.replace(host_line, host_replacement)
-    content = content.replace(
-        "`stremio://${host}${stremioApiPrefix}/manifest.json`",
-        "`stremio://${cometInstallBase}${stremioApiPrefix}/manifest.json`",
+    content = replace_first_matching(
+        content,
+        ((host_line, host_replacement),),
+        error=(
+            "Unable to apply managed Comet configure-template patch; upstream "
+            "host variable marker has changed."
+        ),
+        expected=1,
     )
-    content = content.replace(
-        "`stremio://${host}${stremioApiPrefix}/${settingsString}/manifest.json`",
-        "`stremio://${cometInstallBase}${stremioApiPrefix}/${settingsString}/manifest.json`",
+    url_replacements: tuple[tuple[str, str, int | None], ...] = (
+        (
+            "`stremio://${host}${stremioApiPrefix}/manifest.json`",
+            "`stremio://${cometInstallBase}${stremioApiPrefix}/manifest.json`",
+            1,
+        ),
+        (
+            "`stremio://${host}${stremioApiPrefix}/${settingsString}/manifest.json`",
+            "`stremio://${cometInstallBase}${stremioApiPrefix}/${settingsString}/manifest.json`",
+            1,
+        ),
+        (
+            "`${window.location.origin}${stremioApiPrefix}/manifest.json`",
+            "`${getCometPublicBase()}${stremioApiPrefix}/manifest.json`",
+            None,
+        ),
+        (
+            "`${window.location.origin}${stremioApiPrefix}/${settingsString}/manifest.json`",
+            "`${getCometPublicBase()}${stremioApiPrefix}/${settingsString}/manifest.json`",
+            None,
+        ),
     )
-    content = content.replace(
-        "`${window.location.origin}${stremioApiPrefix}/manifest.json`",
-        "`${cometPublicBase}${stremioApiPrefix}/manifest.json`",
-    )
-    content = content.replace(
-        "`${window.location.origin}${stremioApiPrefix}/${settingsString}/manifest.json`",
-        "`${cometPublicBase}${stremioApiPrefix}/${settingsString}/manifest.json`",
-    )
+    for before, after, expected in url_replacements:
+        content = replace_first_matching(
+            content,
+            ((before, after),),
+            error=(
+                "Unable to apply managed Comet configure-template patch; upstream "
+                f"manifest URL template changed: {before}"
+            ),
+            expected=expected,
+        )
     return content

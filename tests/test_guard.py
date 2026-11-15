@@ -16,7 +16,13 @@ from stremioguard import guard as guard_mod
 from stremioguard import preflight as preflight_mod
 from stremioguard.guard import GluetunGuard, PublicIPAssessment
 
-from .conftest import FakeRunner, completed, compose_args_prefix, make_config
+from .conftest import (
+    FakeRunner,
+    completed,
+    compose_args_prefix,
+    compose_stack_responses,
+    make_config,
+)
 
 GLUETUN_HEALTH_INSPECT = (
     "docker",
@@ -92,9 +98,10 @@ class GluetunGuardTests(unittest.TestCase):
             tmp_path = Path(directory)
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(tmp_path),
                     GLUETUN_HEALTH_INSPECT: completed(
                         list(GLUETUN_HEALTH_INSPECT), f"healthy|{GLUETUN_STARTED_AT}\n"
-                    )
+                    ),
                 }
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
@@ -116,9 +123,10 @@ class GluetunGuardTests(unittest.TestCase):
             tmp_path = Path(directory)
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(tmp_path),
                     GLUETUN_HEALTH_INSPECT: completed(
                         list(GLUETUN_HEALTH_INSPECT), f"starting|{GLUETUN_STARTED_AT}\n"
-                    )
+                    ),
                 }
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
@@ -132,12 +140,13 @@ class GluetunGuardTests(unittest.TestCase):
             tmp_path = Path(directory)
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(tmp_path),
                     GLUETUN_HEALTH_INSPECT: completed(
                         list(GLUETUN_HEALTH_INSPECT),
                         "",
                         "Error: No such object: gluetun\n",
                         returncode=1,
-                    )
+                    ),
                 }
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
@@ -156,9 +165,10 @@ class GluetunGuardTests(unittest.TestCase):
             docker_logs_args = ("docker", "logs", "--tail", "20", "gluetun")
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(tmp_path),
                     docker_logs_args: completed(
                         list(docker_logs_args), stdout="stdout line\n", stderr="stderr line\n"
-                    )
+                    ),
                 }
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
@@ -247,7 +257,12 @@ class GluetunGuardTests(unittest.TestCase):
                 "1",
                 "https://example.test/ip",
             )
-            runner = FakeRunner({exec_call: completed(list(exec_call), "203.0.113.20\n")})
+            runner = FakeRunner(
+                {
+                    **compose_stack_responses(tmp_path),
+                    exec_call: completed(list(exec_call), "203.0.113.20\n"),
+                }
+            )
             guard = GluetunGuard(make_config(tmp_path), runner)
             self.assertEqual(guard.public_ip_via_gluetun(), "203.0.113.20")
             self.assertIn(list(exec_call), runner.calls)
@@ -441,8 +456,10 @@ class GluetunGuardTests(unittest.TestCase):
                 encoding="utf-8",
             )
             env_inspect = ("docker", "inspect", "--format", "{{json .Config.Env}}", "gluetun")
+            up_cmd = [*compose_args_prefix(tmp_path), "up", "-d", "gluetun"]
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(tmp_path),
                     GLUETUN_HEALTH_INSPECT: completed(
                         list(GLUETUN_HEALTH_INSPECT), f"healthy|{GLUETUN_STARTED_AT}\n"
                     ),
@@ -451,6 +468,7 @@ class GluetunGuardTests(unittest.TestCase):
                         '["PATH=/bin","OPENVPN_ENDPOINT_IP=203.0.113.7",'
                         '"WIREGUARD_ENDPOINT_IP=","VPN_TYPE=openvpn","SERVER_COUNTRIES=Canada"]\n',
                     ),
+                    tuple(up_cmd): completed(up_cmd),
                 }
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
@@ -525,7 +543,11 @@ class GluetunGuardTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         tmp_path = Path(directory.name)
         (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
-        guard = GluetunGuard(make_config(tmp_path), runner)
+        cfg = make_config(tmp_path)
+        for suffix in (["pull", "gluetun"], ["up", "-d", "gluetun"]):
+            cmd = [*compose_args_prefix(tmp_path), *suffix]
+            runner.responses.setdefault(tuple(cmd), completed(cmd))
+        guard = GluetunGuard(cfg, runner)
         with (
             mock.patch.object(guard, "require_commands"),
             mock.patch.object(guard, "check_bind_addresses"),
@@ -850,7 +872,19 @@ class DaemonIdentityTests(unittest.TestCase):
             tmp_path = Path(directory)
             env_path = tmp_path / ".env"
             env_path.write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
-            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            guard = GluetunGuard(
+                make_config(tmp_path),
+                FakeRunner(
+                    {
+                        ("docker", "compose", "version"): completed(
+                            ["docker", "compose", "version"]
+                        ),
+                        ("docker", "ps", "--format", "{{.ID}}"): completed(
+                            ["docker", "ps", "--format", "{{.ID}}"]
+                        ),
+                    }
+                ),
+            )
             guard.write_vpn_lockout(
                 reason="recovery_budget_exhausted", outage_duration_seconds=300.0
             )
@@ -877,13 +911,14 @@ class DaemonIdentityTests(unittest.TestCase):
     def test_state_aware_stop_active_services(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
+            prefix = compose_args_prefix(tmp_path)
+            stop_cmd = [*prefix, "stop", "stremio"]
+            runner = FakeRunner({tuple(stop_cmd): completed(stop_cmd)})
             guard = GluetunGuard(make_config(tmp_path), runner)
 
             # When containers are NOT running, compose stop is skipped
             with mock.patch.object(guard, "running_services", return_value=set()):
                 self.assertTrue(guard.stop_active_services(["stremio"]))
-            prefix = compose_args_prefix(tmp_path)
             self.assertNotIn([*prefix, "stop", "stremio"], runner.calls)
 
             # When containers ARE running, compose stop is executed
@@ -900,9 +935,21 @@ class DaemonIdentityTests(unittest.TestCase):
     def test_stop_and_restart_gluetun_methods(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
-            guard = GluetunGuard(make_config(tmp_path), runner)
             prefix = compose_args_prefix(tmp_path)
+            logs_cmd = ["docker", "logs", "--tail", "60", "gluetun"]
+            stop_cmd = [*prefix, "stop", "gluetun"]
+            restart_cmd = [*prefix, "restart", "gluetun"]
+            up_cmd = [*prefix, "up", "-d", "--no-deps", "--force-recreate", "gluetun"]
+            runner = FakeRunner(
+                {
+                    **compose_stack_responses(tmp_path),
+                    tuple(logs_cmd): completed(logs_cmd),
+                    tuple(stop_cmd): completed(stop_cmd),
+                    tuple(restart_cmd): completed(restart_cmd),
+                    tuple(up_cmd): completed(up_cmd),
+                }
+            )
+            guard = GluetunGuard(make_config(tmp_path), runner)
 
             guard.stop_gluetun()
             self.assertIn([*prefix, "stop", "gluetun"], runner.calls)
@@ -986,18 +1033,24 @@ class DaemonIdentityTests(unittest.TestCase):
                 mock_success.assert_not_called()
 
     def _running_query(self, tmp_path: Path, *services: str) -> tuple[str, ...]:
-        return (*compose_args_prefix(tmp_path), "ps", "--status", "running", "-q", *services)
+        return (
+            *compose_args_prefix(tmp_path),
+            "ps",
+            "--status",
+            "running",
+            "--services",
+            *services,
+        )
 
     def test_stop_active_services_warns_when_container_still_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             runner = FakeRunner(
-                {self._running_query(tmp_path, "stremio"): completed([], stdout="abc123\n")}
+                {self._running_query(tmp_path, "stremio"): completed([], stdout="stremio\n")}
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
 
             with (
-                mock.patch.object(guard, "container_running", return_value=True),
                 mock.patch.object(guard, "warn") as mock_warn,
                 mock.patch.object(guard, "success") as mock_success,
             ):
@@ -1016,13 +1069,15 @@ class DaemonIdentityTests(unittest.TestCase):
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
 
-            with mock.patch.object(guard, "container_running", return_value=False):
-                self.assertFalse(guard.stop_active_services(["stremio"]))
+            self.assertFalse(guard.stop_active_services(["stremio"]))
 
     def test_stop_active_services_confirms_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            stop_cmd = [*compose_args_prefix(tmp_path), "stop", "stremio"]
+            guard = GluetunGuard(
+                make_config(tmp_path), FakeRunner({tuple(stop_cmd): completed(stop_cmd)})
+            )
 
             with (
                 mock.patch.object(guard, "running_services", side_effect=[{"stremio"}, set()]),
@@ -1096,15 +1151,6 @@ class DaemonIdentityTests(unittest.TestCase):
                 "SERVER_CITIES=Denver\n",
                 encoding="utf-8",
             )
-            runner = FakeRunner({})
-            guard = GluetunGuard(make_config(tmp_path), runner)
-            with mock.patch(
-                "stremioguard.resolver.resolve_nordvpn_endpoint",
-                return_value=("us-new.nordvpn.com", "203.0.113.99"),
-            ) as mock_resolve:
-                self.assertTrue(guard.restart_gluetun())
-            mock_resolve.assert_called_once()
-            self.assertTrue(mock_resolve.call_args[1]["force_refresh"])
             up_call = [
                 *compose_args_prefix(tmp_path),
                 "up",
@@ -1113,6 +1159,15 @@ class DaemonIdentityTests(unittest.TestCase):
                 "--force-recreate",
                 "gluetun",
             ]
+            runner = FakeRunner({tuple(up_call): completed(up_call)})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            with mock.patch(
+                "stremioguard.resolver.resolve_nordvpn_endpoint",
+                return_value=("us-new.nordvpn.com", "203.0.113.99"),
+            ) as mock_resolve:
+                self.assertTrue(guard.restart_gluetun())
+            mock_resolve.assert_called_once()
+            self.assertTrue(mock_resolve.call_args[1]["force_refresh"])
             self.assertIn(up_call, runner.calls)
             self.assertNotIn([*compose_args_prefix(tmp_path), "restart", "gluetun"], runner.calls)
             env = runner.envs[runner.calls.index(up_call)]
@@ -1123,9 +1178,6 @@ class DaemonIdentityTests(unittest.TestCase):
     def test_restart_gluetun_relaxed_clears_endpoint_ips(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
-            guard = GluetunGuard(make_config(tmp_path), runner)
-            self.assertTrue(guard.restart_gluetun_relaxed())
             up_call = [
                 *compose_args_prefix(tmp_path),
                 "up",
@@ -1134,6 +1186,9 @@ class DaemonIdentityTests(unittest.TestCase):
                 "--force-recreate",
                 "gluetun",
             ]
+            runner = FakeRunner({tuple(up_call): completed(up_call)})
+            guard = GluetunGuard(make_config(tmp_path), runner)
+            self.assertTrue(guard.restart_gluetun_relaxed())
             env = runner.envs[runner.calls.index(up_call)]
             assert env is not None
             for key in (
@@ -1335,7 +1390,13 @@ class EgressAssessmentTests(unittest.TestCase):
 
 
 def test_running_check_is_one_query_and_unknown_is_not_running(tmp_path: Path) -> None:
-    runner = FakeRunner({})
+    runner = FakeRunner(
+        compose_stack_responses(
+            tmp_path,
+            running=("comet", "stremthru"),
+            running_query_services=("comet", "stremthru"),
+        )
+    )
     guard = GluetunGuard(make_config(tmp_path), runner)
     assert guard.container_running(["comet", "stremthru"]) is True
     assert len(runner.calls) == 1
@@ -1464,6 +1525,7 @@ def test_stale_namespace_services_flags_only_running_services_on_an_old_namespac
     inspect = _namespace_inspect(*services)
     runner = FakeRunner(
         {
+            **compose_stack_responses(tmp_path, containers=tuple(services)),
             inspect: completed(
                 list(inspect),
                 # Started before gluetun did: joined the namespace gluetun had then.
@@ -1476,7 +1538,7 @@ def test_stale_namespace_services_flags_only_running_services_on_an_old_namespac
                 "comet-postgres|true|2026-11-11T10:00:06Z|container:gluetun-new\n"
                 # Started 50ms after gluetun; ".55Z" < ".5Z" as raw strings.
                 "stremthru|true|2026-11-11T10:00:05.55Z|container:gluetun-new\n",
-            )
+            ),
         }
     )
     guard = GluetunGuard(make_config(tmp_path), runner)
@@ -1489,12 +1551,22 @@ def test_stale_namespace_services_flags_only_running_services_on_an_old_namespac
 def test_stale_namespace_services_is_unknown_when_docker_cannot_answer(tmp_path: Path) -> None:
     gluetun = guard_mod.GluetunState("gluetun-new", "healthy", "2026-11-11T10:00:05Z")
     inspect = _namespace_inspect("stremio")
-    failing = FakeRunner({inspect: completed(list(inspect), "", "daemon gone", returncode=1)})
+    failing = FakeRunner(
+        {
+            **compose_stack_responses(tmp_path, containers=("stremio",)),
+            inspect: completed(list(inspect), "", "daemon gone", returncode=1),
+        }
+    )
     assert (
         GluetunGuard(make_config(tmp_path), failing).stale_namespace_services(["stremio"], gluetun)
         is None
     )
-    malformed = FakeRunner({inspect: completed(list(inspect), "stremio|true\n")})
+    malformed = FakeRunner(
+        {
+            **compose_stack_responses(tmp_path, containers=("stremio",)),
+            inspect: completed(list(inspect), "stremio|true\n"),
+        }
+    )
     assert (
         GluetunGuard(make_config(tmp_path), malformed).stale_namespace_services(
             ["stremio"], gluetun
@@ -1546,6 +1618,7 @@ def test_running_endpoint_is_not_reused_after_a_location_change(tmp_path: Path) 
     state_inspect = ("docker", "inspect", "--format", guard_mod.GLUETUN_STATE_FORMAT, "gluetun")
     runner = FakeRunner(
         {
+            **compose_stack_responses(tmp_path),
             state_inspect: completed(list(state_inspect), "healthy|2026-11-11T10:00:00Z\n"),
             env_inspect: completed(
                 list(env_inspect),
@@ -1570,14 +1643,20 @@ def test_stale_namespace_services_is_unknown_when_the_two_queries_disagree(
     inspect = _namespace_inspect("stremio")
     other = FakeRunner(
         {
+            **compose_stack_responses(tmp_path, containers=("stremio",)),
             inspect: completed(
                 list(inspect), "someone-else|true|2026-11-11T10:00:06Z|container:gluetun-new\n"
-            )
+            ),
         }
     )
     guard = GluetunGuard(make_config(tmp_path), other)
     assert guard.stale_namespace_services(["stremio"], gluetun) is None
-    silent = FakeRunner({inspect: completed(list(inspect), "\n")})
+    silent = FakeRunner(
+        {
+            **compose_stack_responses(tmp_path, containers=("stremio",)),
+            inspect: completed(list(inspect), "\n"),
+        }
+    )
     assert (
         GluetunGuard(make_config(tmp_path), silent).stale_namespace_services(["stremio"], gluetun)
         is None
@@ -1591,8 +1670,67 @@ def test_frozen_guard_never_rebuilds_from_the_working_tree(tmp_path: Path) -> No
         (True, ["up", "-d", "--no-deps", "stremio"]),
         (False, ["up", "-d", "--no-deps", "--build", "stremio"]),
     ):
-        runner = FakeRunner({})
-        guard = GluetunGuard(make_config(tmp_path), runner, frozen=frozen)
+        cfg = make_config(tmp_path)
+        cmd = [*compose_args_prefix(tmp_path), *expected]
+        runner = FakeRunner({tuple(cmd): completed(cmd)})
+        guard = GluetunGuard(cfg, runner, frozen=frozen)
         with mock.patch.object(guard, "write_compose_override"):
             assert guard.start_services(["stremio"], build=True, check=False) is True
-        assert runner.calls[-1] == [*compose_args_prefix(tmp_path), *expected]
+        assert runner.calls[-1] == cmd
+
+
+def test_public_ip_via_gluetun_skips_exec_without_container(tmp_path: Path) -> None:
+    runner = FakeRunner({})
+    guard = GluetunGuard(make_config(tmp_path), runner)
+    assert guard.public_ip_via_gluetun() is None
+    assert not any(call[:2] == ["docker", "exec"] for call in runner.calls)
+
+
+def test_stop_active_services_falls_back_to_docker_stop_when_compose_fails(tmp_path: Path) -> None:
+    from stremioguard.config import compose_command
+
+    cfg = make_config(tmp_path)
+    cfg_cmd = compose_command(tmp_path, "config", "--services")
+    stop_cmd = compose_command(tmp_path, "stop", "stremio")
+    ps_stremio = compose_command(tmp_path, "ps", "-q", "stremio")
+    status_cmd = compose_command(tmp_path, "ps", "--status", "running", "--services", "stremio")
+
+    docker_stopped = False
+
+    def boom_on_compose(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal docker_stopped
+        if args == cfg_cmd:
+            raise subprocess.SubprocessError("yaml broken")
+        if args == stop_cmd:
+            return completed(args, returncode=1, stderr="compose stop failed")
+        if args == ps_stremio:
+            return completed(args, stdout="stremio-cid\n")
+        if args == ["docker", "stop", "-t", "5", "stremio-cid"]:
+            docker_stopped = True
+            return completed(args)
+        if args == status_cmd:
+            return completed(args, stdout="" if docker_stopped else "stremio\n")
+        return completed(args)
+
+    runner = FakeRunner({})
+
+    def run_side_effect(
+        args: list[str], *, check: bool = False, **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        res = boom_on_compose(args)
+        if check and res.returncode != 0:
+            raise subprocess.CalledProcessError(res.returncode, args, res.stdout, res.stderr)
+        return res
+
+    runner.run = run_side_effect  # type: ignore[method-assign]
+    calls: list[list[str]] = []
+    orig = runner.run
+
+    def tracking(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return orig(args, **kwargs)  # type: ignore[arg-type]
+
+    runner.run = tracking  # type: ignore[method-assign]
+    guard = GluetunGuard(cfg, runner)
+    assert guard.stop_active_services() is True
+    assert ["docker", "stop", "-t", "5", "stremio-cid"] in calls

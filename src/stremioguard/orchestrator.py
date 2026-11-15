@@ -26,7 +26,7 @@ from stremioguard.config import (
     docker_daemon_help,
     docker_permission_help,
 )
-from stremioguard.env import ensure_directory
+from stremioguard.env import atomic_write_text, ensure_directory
 from stremioguard.guard import (
     GluetunGuard,
     GluetunState,
@@ -504,17 +504,19 @@ class Orchestrator:
             f"gluetun is restarted. Line: {evidence}"
         )
 
-    def _restart_gluetun(self, *, relaxed: bool) -> None:
+    def _restart_gluetun(self, *, relaxed: bool) -> bool:
+        restarted = (
+            self.guard.restart_gluetun_relaxed() if relaxed else self.guard.restart_gluetun()
+        )
+        if not restarted:
+            return False
         self.restart_generation += 1
-        if relaxed:
-            self.guard.restart_gluetun_relaxed()
-        else:
-            self.guard.restart_gluetun()
         # The next rejection scan starts after the restart. Scanning from the
         # start of this check would attribute a line the OLD process logged
         # just before it was restarted to the new one, and confirm a
         # rejection that was only ever seen once.
         self.last_auth_check_wall = time.time()
+        return True
 
     def _reconcile_namespace(self, gluetun: GluetunState | None, services: list[str]) -> None:
         """Restart services left on a network namespace gluetun no longer has.
@@ -624,7 +626,7 @@ class Orchestrator:
             # Incremental bounded log check since previous probe
             check_since = self.last_auth_check_wall or self.outage_start_wall
             self.last_auth_check_wall = now_wall
-            self._note_auth_rejection(g.gluetun_auth_evidence(since_epoch=check_since))
+            self._note_auth_rejection(g.gluetun_auth_evidence(lines=200, since_epoch=check_since))
 
             elapsed = now_mono - self.outage_started_at
             if elapsed >= budget:
@@ -830,8 +832,8 @@ class Orchestrator:
             if previous and previous != ip:
                 g.warn(f"Overwriting existing home IP baseline {previous} with {ip}.")
 
-        g.config.home_ip_file.parent.mkdir(parents=True, exist_ok=True)
-        g.config.home_ip_file.write_text(f"{ip}\n", encoding="utf-8")
+        ensure_directory(g.config.home_ip_file.parent)
+        atomic_write_text(g.config.home_ip_file, f"{ip}\n", mode=0o600)
         g.log(f"Saved {ip} to {g.config.home_ip_file}.")
 
     def fail_safe(self) -> None:

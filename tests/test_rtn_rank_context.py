@@ -83,6 +83,18 @@ async def stream(request):
         )
         formatted_title = format_title_fn(formatted_components)
         for service in debrid_services:
+            _name = _build_stream_name(
+                False,
+                service,
+                resolution,
+                status="C" if is_cached else "U",
+            )
+            _p2p = _build_stream_name(
+                False,
+                "torrent",
+                resolution,
+                status="P2P",
+            )
             the_stream = {
                 "name": stream_name,
                 "description": formatted_title,

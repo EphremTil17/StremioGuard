@@ -527,7 +527,7 @@ class CometConfig:
         )
         gateway_public_base_url = env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL") or None
         gateway_token_length = env_int_value(
-            env_file, "COMET_GATEWAY_TOKEN_LENGTH", 8, minimum=4, maximum=32
+            env_file, "COMET_GATEWAY_TOKEN_LENGTH", 8, minimum=8, maximum=32
         )
         log_canary_globs = tuple(
             item.strip()

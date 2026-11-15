@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from stremioguard.overrides._patching import replace_first_matching
+
 
 def render_formatter_override(repo_dir: Path, result_format_style: str) -> str | None:
     if result_format_style == "emoji":
@@ -102,7 +104,15 @@ def _strip_redundant_hdr_tokens(info: str) -> str:
         '    "languages": "Languages: {}",': '    "languages": "{}",',
     }
     for before, after in replacements.items():
-        rendered = rendered.replace(before, after)
+        rendered = replace_first_matching(
+            rendered,
+            ((before, after),),
+            error=(
+                "Unable to apply managed Comet formatter patch; upstream plain "
+                f"style entry changed: {before}"
+            ),
+            expected=1,
+        )
 
     replacement_format_title = """def format_title(components: dict):
     lines = []

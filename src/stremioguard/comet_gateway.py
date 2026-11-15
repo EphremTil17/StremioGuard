@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import secrets
 import urllib.parse
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -120,10 +123,24 @@ class CometGatewayManager:
             key=lambda tid: str(tokens[tid].get("created", "")),
         )[0]
 
-    # ── Token CRUD ─────────────────────────────────────────────────
+    @contextmanager
+    def _token_lock(self) -> Iterator[None]:
+        ensure_directory(self.config.state_dir)
+        lock_path = self.config.tokens_file.with_suffix(".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-    def add_token(self, label: str, *, make_default: bool = False) -> tuple[str, str]:
-        state = self.load_state()
+    def _create_token_in_state(
+        self,
+        state: dict[str, object],
+        label: str,
+        *,
+        make_default: bool,
+    ) -> tuple[str, str]:
         tokens = state["tokens"]  # type: ignore[assignment]
         assert isinstance(tokens, dict)
         token_id = secrets.token_hex(3)
@@ -138,53 +155,70 @@ class CometGatewayManager:
         }
         if make_default or not state.get("default"):
             state["default"] = token_id
-        self.save_state(state)
-        self.write_nginx_configs()
         return token_id, token_value
 
+    # ── Token CRUD ─────────────────────────────────────────────────
+
+    def add_token(self, label: str, *, make_default: bool = False) -> tuple[str, str]:
+        with self._token_lock():
+            state = self.load_state()
+            token_id, token_value = self._create_token_in_state(
+                state, label, make_default=make_default
+            )
+            self.save_state(state)
+            self.write_nginx_configs()
+            return token_id, token_value
+
     def revoke_token(self, token_id: str) -> str:
-        state = self.load_state()
-        tokens = state["tokens"]  # type: ignore[assignment]
-        assert isinstance(tokens, dict)
-        if token_id not in tokens:
-            raise KeyError(f"Token ID {token_id!r} not found")
-        entry = tokens[token_id]
-        assert isinstance(entry, dict)
-        label = str(entry.get("label", ""))
-        del tokens[token_id]
-        if state.get("default") == token_id:
-            state["default"] = self._oldest_token_id(tokens)  # type: ignore[arg-type]
-        self.save_state(state)
-        self.write_nginx_configs()
-        return label
+        with self._token_lock():
+            state = self.load_state()
+            tokens = state["tokens"]  # type: ignore[assignment]
+            assert isinstance(tokens, dict)
+            if token_id not in tokens:
+                raise KeyError(f"Token ID {token_id!r} not found")
+            entry = tokens[token_id]
+            assert isinstance(entry, dict)
+            label = str(entry.get("label", ""))
+            del tokens[token_id]
+            if state.get("default") == token_id:
+                state["default"] = self._oldest_token_id(tokens)  # type: ignore[arg-type]
+            self.save_state(state)
+            self.write_nginx_configs()
+            return label
 
     def rotate_token(self, token_id: str) -> tuple[str, str]:
-        state = self.load_state()
-        tokens = state["tokens"]  # type: ignore[assignment]
-        assert isinstance(tokens, dict)
-        if token_id not in tokens:
-            raise KeyError(f"Token ID {token_id!r} not found")
-        entry = tokens[token_id]
-        assert isinstance(entry, dict)
-        label = str(entry.get("label", ""))
-        was_default = state.get("default") == token_id
-        del tokens[token_id]
-        state["default"] = self._oldest_token_id(tokens) if was_default else state.get("default")
-        self.save_state(state)
-        return self.add_token(label, make_default=was_default)
+        with self._token_lock():
+            state = self.load_state()
+            tokens = state["tokens"]  # type: ignore[assignment]
+            assert isinstance(tokens, dict)
+            if token_id not in tokens:
+                raise KeyError(f"Token ID {token_id!r} not found")
+            entry = tokens[token_id]
+            assert isinstance(entry, dict)
+            label = str(entry.get("label", ""))
+            was_default = state.get("default") == token_id
+            del tokens[token_id]
+            state["default"] = (
+                self._oldest_token_id(tokens) if was_default else state.get("default")
+            )
+            new_id, new_value = self._create_token_in_state(state, label, make_default=was_default)
+            self.save_state(state)
+            self.write_nginx_configs()
+            return new_id, new_value
 
     def use_token(self, token_id: str) -> str:
-        state = self.load_state()
-        tokens = state["tokens"]  # type: ignore[assignment]
-        assert isinstance(tokens, dict)
-        if token_id not in tokens:
-            raise KeyError(f"Token ID {token_id!r} not found")
-        state["default"] = token_id
-        self.save_state(state)
-        self.write_nginx_configs()
-        entry = tokens[token_id]
-        assert isinstance(entry, dict)
-        return str(entry.get("label", ""))
+        with self._token_lock():
+            state = self.load_state()
+            tokens = state["tokens"]  # type: ignore[assignment]
+            assert isinstance(tokens, dict)
+            if token_id not in tokens:
+                raise KeyError(f"Token ID {token_id!r} not found")
+            state["default"] = token_id
+            self.save_state(state)
+            self.write_nginx_configs()
+            entry = tokens[token_id]
+            assert isinstance(entry, dict)
+            return str(entry.get("label", ""))
 
     def list_tokens(self) -> list[dict[str, str]]:
         state = self.load_state()
@@ -258,9 +292,14 @@ class CometGatewayManager:
         return "\n".join(lines) + "\n"
 
     def render_nginx_conf(self) -> str:
-        # Tokens are always generated at exactly token_length, so match that
-        # precisely; the tokens.map lookup is the authoritative gate either way.
-        token_re = f"[A-Za-z0-9_-]{{{self.config.token_length}}}"
+        # Accept any URL-safe token length here so previously issued tokens keep
+        # routing through the tokens.map lookup even if COMET_GATEWAY_TOKEN_LENGTH
+        # changes; tokens.map is the authoritative gate.
+        token_re = "[A-Za-z0-9_-]+"
+        public_mask_rule = (
+            r"~^(?<mrh>\S+\s/(?:configure(?:/[^\s?]*)?|static/[^\s?]*|health))"
+            r'(?:\?\S*)?(?<mrt>\s+\S+)$ "${mrh}${mrt}";'
+        )
         return f"""\
 # Generated by ./stremio; do not edit by hand.
 worker_processes 1;
@@ -301,13 +340,15 @@ http {{
     # line carries the gateway token AND the base64 Comet config blob, which
     # can embed debrid API keys, so everything up to the protocol field is
     # replaced. Any other path is masked too (a raw Comet addon URL sent here
-    # is refused but would otherwise be logged whole); only the gateway's own
-    # admin paths stay readable. First matching regex wins.
+    # is refused but would otherwise be logged whole); only the public gateway
+    # UI/health paths stay readable (with query strings stripped). First matching regex wins.
     map $request $request_masked {{
-        ~^(?<mrh>\\S+\\s/comet/)\\S+(?<mrt>.*)$ "${{mrh}}***${{mrt}}";
-        "~^\\S+\\s/(?:configure|static/|health|admin)" $request;
-        "~^\\S+\\s/\\s" $request;
-        ~^(?<mrh>\\S+\\s/)\\S+(?<mrt>.*)$ "${{mrh}}***${{mrt}}";
+        ~^(?<mrh>\\S+\\s\\S*/comet/).+?(?<mrt>\\s+HTTP/\\S+)$ "${{mrh}}***${{mrt}}";
+        ~^(?<mrh>\\S+\\s)\\S*(?:%|/\\.\\.).*?(?<mrt>\\s+HTTP/\\S+)$ "${{mrh}}***${{mrt}}";
+        {public_mask_rule}
+        ~^(?<mrh>\\S+\\s/)(?:\\?\\S*)?(?<mrt>\\s+\\S+)$ "${{mrh}}${{mrt}}";
+        ~^(?<mrh>\\S+\\s/).+?(?<mrt>\\s+HTTP/\\S+)$ "${{mrh}}***${{mrt}}";
+        ~^(?<mrh>\\S+\\s).+$ "${{mrh}}***";
         default $request;
     }}
 
@@ -317,8 +358,22 @@ http {{
     access_log /var/log/nginx/access.log main;
 
     map $http_x_forwarded_proto $pass_x_forwarded_proto {{
-        default $http_x_forwarded_proto;
-        ""      $scheme;
+        ~*^\\s*https(?:[\\s,]|$) https;
+        ~*^\\s*http(?:[\\s,]|$)  http;
+        default                  $scheme;
+    }}
+
+    map $http_host $redirect_host {{
+        default $http_host;
+        ""      $host;
+    }}
+
+    # Preserve raw percent-encoding (e.g. %20 in /playback/...) and query params
+    # when forwarding behind /comet/<token>, because nginx decodes regex URI
+    # captures and proxy_pass with variables does not re-encode whitespace.
+    map $request_uri $raw_comet_uri {{
+        ~^/comet/{token_re}(?<rcu>/.*)$ $rcu;
+        default "";
     }}
 
     server {{
@@ -330,8 +385,14 @@ http {{
             if ($token_valid = 0) {{
                 rewrite ^ /__sg_invalid_token last;
             }}
+            if ($comet_uri ~* "^/+(?:admin|kodi)(?:/|$)") {{
+                return 403 "Forbidden\\n";
+            }}
+            if ($raw_comet_uri = "") {{
+                return 400;
+            }}
 
-            proxy_pass $comet_upstream$comet_uri$is_args$args;
+            proxy_pass $comet_upstream$raw_comet_uri;
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";
@@ -349,7 +410,7 @@ http {{
 
         location ~ "^/comet/(?<gateway_token>{token_re})$" {{
             if ($token_valid = 0) {{ rewrite ^ /__sg_invalid_token last; }}
-            return 301 $scheme://$host/comet/$gateway_token/;
+            return 301 $pass_x_forwarded_proto://$redirect_host/comet/$gateway_token/;
         }}
 
         location = /__sg_invalid_token {{
@@ -358,7 +419,7 @@ http {{
             deny all;
         }}
 
-        location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$)|admin(?:/|$))" {{
+        location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$))" {{
             limit_req zone=gateway_admin burst=20 nodelay;
             proxy_pass $comet_upstream$request_uri;
             proxy_http_version 1.1;
@@ -440,7 +501,9 @@ http {{
         the in-container hash is compared before claiming success.
         """
         self.write_nginx_configs()
-        container_id = self.service_container_id() or ""
+        container_id = self.service_container_id()
+        if not container_id:
+            raise RuntimeError("Comet gateway container is not running; cannot reload nginx.")
         nginx = ["docker", "exec", container_id, "nginx", "-c", f"{GATEWAY_CONFIG_DIR}/nginx.conf"]
         self.runner.run([*nginx, "-t"], check=True)
         expected = hashlib.sha256(self.config.tokens_map_file.read_bytes()).hexdigest()

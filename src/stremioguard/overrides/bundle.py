@@ -164,14 +164,29 @@ def _validate_rtn_rank_display_contract(state_dir: Path) -> None:
 
     media_search = (state_dir / "media_search.py").read_text(encoding="utf-8")
     stream = (state_dir / "stream.py").read_text(encoding="utf-8")
-    expected = (
-        "rtn_ranks: dict[str, int]",
-        "for info_hash, ranked_torrent in torrent_manager.ranked_torrents.items()",
-        "info_hash: ranked_torrent.rank",
-        "search_result.rtn_ranks.get(info_hash)",
-        'f"{_sg_size} • R:{_sg_rank}"',
+    expected_per_file = (
+        (
+            media_search,
+            (
+                "rtn_ranks: dict[str, int]",
+                "for info_hash, ranked_torrent in torrent_manager.ranked_torrents.items()",
+                "info_hash: ranked_torrent.rank",
+            ),
+        ),
+        (
+            stream,
+            (
+                "search_result.rtn_ranks.get(info_hash)",
+                'f"{_sg_size} • R:{_sg_rank}"',
+            ),
+        ),
     )
-    missing = [fragment for fragment in expected if fragment not in media_search + stream]
+    missing = [
+        fragment
+        for text, fragments in expected_per_file
+        for fragment in fragments
+        if fragment not in text
+    ]
     if missing:
         raise RuntimeError(
             "Required RTN rank display contract is incomplete: " + ", ".join(missing)

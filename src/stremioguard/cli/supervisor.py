@@ -459,6 +459,16 @@ def start_watchdog(context: RunContext, *, units_changed: bool) -> None:
     logger.success(f"Watchdog running under systemd as {WATCHDOG_UNIT} (PID {after.main_pid}).")
 
 
+def watchdog_running() -> bool | None:
+    """Whether the supervised watchdog systemd unit is active, or ``None`` if unreachable."""
+    if shutil.which("systemctl") is None:
+        return None
+    try:
+        return unit_state(WATCHDOG_UNIT).running
+    except RuntimeError:
+        return None
+
+
 def require_supervised_stack() -> None:
     """Refuse a Comet-only lifecycle command outside a watched, unlocked stack.
 
@@ -468,10 +478,12 @@ def require_supervised_stack() -> None:
     """
     if (STATE_DIR / LOCKOUT_FILE_NAME).exists():
         fail("A lockout is active; recover with `./stremio restart` or `./stremio unlock` first.")
-    try:
-        running = shutil.which("systemctl") is not None and unit_state(WATCHDOG_UNIT).running
-    except RuntimeError:
-        running = False
+    running = watchdog_running()
+    if running is None:
+        fail(
+            f"Could not query systemd user manager to verify {WATCHDOG_UNIT}; refusing to "
+            "modify Comet without active watchdog supervision."
+        )
     if not running:
         fail(
             f"The watchdog ({WATCHDOG_UNIT}) is not running. Use `./stremio start`, which "

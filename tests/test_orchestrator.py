@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import time
 import unittest
@@ -20,6 +21,7 @@ from .conftest import (
     FakeRunner,
     completed,
     compose_args_prefix,
+    compose_stack_responses,
     make_comet_config,
     make_comet_gateway_config,
     make_config,
@@ -35,13 +37,27 @@ GLUETUN_HEALTH_INSPECT = (
 )
 
 
+def _setup_responses(
+    tmp_path: Path, *services: str, reset: bool = True
+) -> dict[
+    tuple[str, ...], list[subprocess.CompletedProcess[str]] | subprocess.CompletedProcess[str]
+]:
+    prefix = compose_args_prefix(tmp_path)
+    commands: list[list[str]] = [
+        ["docker", "compose", "version"],
+        [*prefix, "build", *services],
+        [*prefix, "up", "-d", "--no-deps", *services],
+    ]
+    if reset:
+        commands.append([*prefix, "down", "--remove-orphans", "--timeout", "10"])
+    return {tuple(cmd): completed(cmd) for cmd in commands}
+
+
 class OrchestratorTests(unittest.TestCase):
     def test_setup_resets_builds_and_starts_compose_instance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner(
-                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
-            )
+            runner = FakeRunner(_setup_responses(tmp_path, "stremio"))
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
@@ -59,9 +75,7 @@ class OrchestratorTests(unittest.TestCase):
     def test_setup_active_services_skips_comet_advisory_when_comet_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner(
-                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
-            )
+            runner = FakeRunner(_setup_responses(tmp_path, "stremio"))
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
@@ -77,9 +91,7 @@ class OrchestratorTests(unittest.TestCase):
     def test_setup_active_services_runs_comet_advisory_check_after_up(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner(
-                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
-            )
+            runner = FakeRunner(_setup_responses(tmp_path))
             cfg = make_config(tmp_path, stremio_enabled=False)
             guard = GluetunGuard(cfg, runner)
             orch = Orchestrator(guard)
@@ -112,9 +124,7 @@ class OrchestratorTests(unittest.TestCase):
         for canary_error in (None, RuntimeError("proxy unreachable")):
             with self.subTest(error=canary_error), tempfile.TemporaryDirectory() as directory:
                 tmp_path = Path(directory)
-                runner = FakeRunner(
-                    {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
-                )
+                runner = FakeRunner(_setup_responses(tmp_path))
                 guard = GluetunGuard(make_config(tmp_path, stremio_enabled=False), runner)
                 orch = Orchestrator(guard)
                 comet_cfg = make_comet_config(tmp_path, enabled=True, gateway_enabled=True)
@@ -143,9 +153,7 @@ class OrchestratorTests(unittest.TestCase):
         # turn a successful start into a failed one.
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner(
-                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
-            )
+            runner = FakeRunner(_setup_responses(tmp_path))
             cfg = make_config(tmp_path, stremio_enabled=False)
             guard = GluetunGuard(cfg, runner)
             orch = Orchestrator(guard)
@@ -173,7 +181,12 @@ class OrchestratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             ps_args = (*compose_args_prefix(tmp_path), "ps", "-a", "-q", "stremio")
-            runner = FakeRunner({ps_args: completed(list(ps_args), "")})
+            runner = FakeRunner(
+                {
+                    **_setup_responses(tmp_path, "stremio", reset=False),
+                    ps_args: completed(list(ps_args), ""),
+                }
+            )
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
@@ -219,7 +232,14 @@ class OrchestratorTests(unittest.TestCase):
     def test_watch_once_stops_stremio_when_gluetun_unhealthy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
+            runner = FakeRunner(
+                compose_stack_responses(
+                    tmp_path,
+                    containers=("gluetun", "stremio"),
+                    running=("stremio",),
+                    compose_services=("use-stremio-start-instead", "gluetun", "stremio"),
+                )
+            )
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
@@ -234,7 +254,14 @@ class OrchestratorTests(unittest.TestCase):
     def test_watch_once_stops_stremio_when_ip_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
+            runner = FakeRunner(
+                compose_stack_responses(
+                    tmp_path,
+                    containers=("gluetun", "stremio"),
+                    running=("stremio",),
+                    compose_services=("use-stremio-start-instead", "gluetun", "stremio"),
+                )
+            )
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
@@ -452,9 +479,10 @@ class OrchestratorTests(unittest.TestCase):
             tmp_path = Path(directory)
             runner = FakeRunner(
                 {
+                    **compose_stack_responses(tmp_path),
                     GLUETUN_HEALTH_INSPECT: completed(
                         list(GLUETUN_HEALTH_INSPECT), "healthy|2026-11-11T10:00:00Z\n"
-                    )
+                    ),
                 }
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
@@ -499,7 +527,7 @@ class OrchestratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             runner = FakeRunner(
-                {("docker", "compose", "version"): completed(["docker", "compose", "version"])}
+                _setup_responses(tmp_path, "comet-postgres", "stremthru", "comet", "comet-gateway")
             )
             # Create a Stremio-disabled config
             cfg = make_config(tmp_path, stremio_enabled=False)
@@ -546,7 +574,15 @@ class OrchestratorTests(unittest.TestCase):
     def test_watch_once_stops_comet_only_services_when_gluetun_unhealthy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
+            comet_services = ("comet-postgres", "stremthru", "comet", "comet-gateway")
+            runner = FakeRunner(
+                compose_stack_responses(
+                    tmp_path,
+                    containers=("gluetun", *comet_services),
+                    running=comet_services,
+                    compose_services=("use-stremio-start-instead", "gluetun", *comet_services),
+                )
+            )
             cfg = make_config(tmp_path, stremio_enabled=False)
             guard = GluetunGuard(cfg, runner)
 
@@ -621,7 +657,14 @@ class OrchestratorTests(unittest.TestCase):
     def test_watch_once_unknown_debounce(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
+            runner = FakeRunner(
+                compose_stack_responses(
+                    tmp_path,
+                    containers=("gluetun", "stremio"),
+                    running=("stremio",),
+                    compose_services=("use-stremio-start-instead", "gluetun", "stremio"),
+                )
+            )
             guard = GluetunGuard(make_config(tmp_path, public_ip_failure_threshold=3), runner)
             orch = Orchestrator(guard)
 
@@ -663,7 +706,14 @@ class OrchestratorTests(unittest.TestCase):
     def test_watch_once_unsafe_stops_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
+            runner = FakeRunner(
+                compose_stack_responses(
+                    tmp_path,
+                    containers=("gluetun", "stremio"),
+                    running=("stremio",),
+                    compose_services=("use-stremio-start-instead", "gluetun", "stremio"),
+                )
+            )
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
@@ -683,7 +733,14 @@ class OrchestratorTests(unittest.TestCase):
     def test_watch_stremio_loop_exception_survival(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            runner = FakeRunner({})
+            runner = FakeRunner(
+                {
+                    ("docker", "compose", "version"): completed(["docker", "compose", "version"]),
+                    ("docker", "ps", "--format", "{{.ID}}"): completed(
+                        ["docker", "ps", "--format", "{{.ID}}"]
+                    ),
+                }
+            )
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
@@ -711,7 +768,19 @@ class OrchestratorTests(unittest.TestCase):
     def test_watch_stremio_loop_escapes_exit_78(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
+            guard = GluetunGuard(
+                make_config(tmp_path),
+                FakeRunner(
+                    {
+                        ("docker", "compose", "version"): completed(
+                            ["docker", "compose", "version"]
+                        ),
+                        ("docker", "ps", "--format", "{{.ID}}"): completed(
+                            ["docker", "ps", "--format", "{{.ID}}"]
+                        ),
+                    }
+                ),
+            )
             orch = Orchestrator(guard)
 
             with (
@@ -1025,12 +1094,12 @@ class OrchestratorTests(unittest.TestCase):
                 # Tick 2: t=1010 -> incremental check since 1000, updates cursor to 1010
                 current_time = 1010.0
                 orch.watch_once()
-                self.assertEqual(auth_calls, [(200, 400.0), (50, 1000.0)])
+                self.assertEqual(auth_calls, [(200, 400.0), (200, 1000.0)])
 
                 # Tick 3: t=1020 -> incremental check since 1010
                 current_time = 1020.0
                 orch.watch_once()
-                self.assertEqual(auth_calls, [(200, 400.0), (50, 1000.0), (50, 1010.0)])
+                self.assertEqual(auth_calls, [(200, 400.0), (200, 1000.0), (200, 1010.0)])
 
     def test_hybrid_failover_escalates_on_region_only_filter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1333,7 +1402,14 @@ class SupervisedWatchdogTests(unittest.TestCase):
 
     def test_protected_services_come_from_compose_not_dotenv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            guard = GluetunGuard(make_config(Path(directory)), FakeRunner({}))
+            tmp_path = Path(directory)
+            runner = FakeRunner(
+                compose_stack_responses(
+                    tmp_path,
+                    compose_services=("use-stremio-start-instead", "gluetun", "stremio"),
+                )
+            )
+            guard = GluetunGuard(make_config(tmp_path), runner)
             self.assertEqual(guard.protected_services(), ["stremio"])
 
     def test_deferred_recovery_hands_the_lockout_to_the_watchdog(self) -> None:
@@ -1380,6 +1456,11 @@ def test_gluetun_identity_change_restarts_a_stale_service(tmp_path: Path) -> Non
     t1, t2 = "2026-11-11T10:00:00.5Z", "2026-11-11T11:00:00Z"
     runner = FakeRunner(
         {
+            **compose_stack_responses(
+                tmp_path,
+                containers=("gluetun", "stremio"),
+                compose_services=("use-stremio-start-instead", "gluetun", "stremio"),
+            ),
             GLUETUN_HEALTH_INSPECT: [
                 completed(list(GLUETUN_HEALTH_INSPECT), f"healthy|{started}\n")
                 for started in (t1, t1, t2)
@@ -1447,6 +1528,11 @@ def test_gluetun_identity_change_restarts_a_stale_service(tmp_path: Path) -> Non
 def test_unverifiable_namespace_keeps_identity_unverified(tmp_path: Path) -> None:
     runner = FakeRunner(
         {
+            **compose_stack_responses(
+                tmp_path,
+                containers=("gluetun", "stremio"),
+                compose_services=("use-stremio-start-instead", "gluetun", "stremio"),
+            ),
             GLUETUN_HEALTH_INSPECT: completed(
                 list(GLUETUN_HEALTH_INSPECT), "healthy|2026-11-11T10:00:00Z\n"
             ),
@@ -1777,3 +1863,28 @@ def test_restart_moves_the_auth_scan_cursor_past_the_restart(tmp_path: Path) -> 
         orch._restart_gluetun(relaxed=False)
     assert orch.restart_generation == 1
     assert orch.last_auth_check_wall == 1042.0
+
+
+def test_failed_restart_does_not_increment_generation_or_trip_false_auth_lockout(
+    tmp_path: Path,
+) -> None:
+    guard, orch = _leak_orchestrator(tmp_path)
+    orch.outage_started_at = 900.0
+    orch.outage_start_wall = 900.0
+    orch.restart_generation = 0
+    with (
+        mock.patch.object(guard, "gluetun_healthy", return_value=False),
+        mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
+        mock.patch.object(
+            guard,
+            "gluetun_auth_evidence",
+            return_value="AUTH error from server A",
+        ),
+        mock.patch.object(guard, "restart_gluetun", return_value=False),
+        mock.patch.object(orchestrator_mod.time, "monotonic", return_value=920.0),
+        mock.patch.object(orchestrator_mod.time, "time", return_value=920.0),
+    ):
+        orch._note_auth_rejection("AUTH error from server A")
+        orch.watch_once()
+    assert orch.restart_generation == 0
+    assert not guard.config.vpn_lockout_file.exists()

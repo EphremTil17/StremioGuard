@@ -21,11 +21,19 @@ def render_stream_override(repo_dir: Path) -> str:
     if "_display_resolution_label(" not in content:
         helper = r"""
 def _forwarded_external_base(request) -> str:
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    forwarded_host = request.headers.get("x-forwarded-host")
-    forwarded_prefix = request.headers.get("x-forwarded-prefix", "")
-    if forwarded_proto and forwarded_host:
-        prefix = forwarded_prefix.rstrip("/")
+    forwarded_proto = (
+        (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+    )
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+    forwarded_prefix = (
+        (request.headers.get("x-forwarded-prefix") or "").split(",", 1)[0].strip().rstrip("/")
+    )
+    if forwarded_proto in ("http", "https") and forwarded_host:
+        prefix = (
+            forwarded_prefix
+            if not forwarded_prefix or forwarded_prefix.startswith("/")
+            else f"/{forwarded_prefix}"
+        )
         return f"{forwarded_proto}://{forwarded_host}{prefix}"
     return f"{request.url.scheme}://{request.url.netloc}"
 
@@ -175,17 +183,14 @@ def _display_primary_label(resolution, formatted_components: dict | None = None)
         ),
     }
     for before, after in call_replacements.items():
-        if after in content:
-            continue
-        if before not in content:
-            continue
         content = replace_first_matching(
             content,
             ((before, after),),
             error=(
                 "Unable to apply managed Comet stream-name patch; upstream "
-                "stream call shape has changed."
+                f"stream call shape changed: {before.strip()}"
             ),
+            expected=1,
         )
 
     # Comet now hands this endpoint a MediaSearchResult. Its scalar rank map

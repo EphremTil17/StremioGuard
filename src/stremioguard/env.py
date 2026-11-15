@@ -130,6 +130,18 @@ def _plain_value_safe(value: str) -> bool:
     return not re.search(r"\s#", value)
 
 
+def render_env_value(value: str) -> str:
+    """Format a dotenv value for ``write_env_settings``, preserving plain safe values."""
+    return value if _plain_value_safe(value) else format_env_value(value)
+
+
+def render_strict_env_value(value: str) -> str:
+    """Format a generated dotenv value, quoting whenever whitespace or metacharacters appear."""
+    if not value or re.fullmatch(r"[A-Za-z0-9_.:/@+=,-]+", value):
+        return value
+    return format_env_value(value)
+
+
 def write_env_setting(env_path: Path, key: str, value: str) -> None:
     write_env_settings(env_path, {key: value})
 
@@ -144,7 +156,7 @@ def write_env_settings(env_path: Path, settings: Mapping[str, str]) -> None:
     for key, value in settings.items():
         if "\n" in value or "\r" in value:
             raise ValueError(f"{key} cannot contain a line break")
-        rendered = value if _plain_value_safe(value) else format_env_value(value)
+        rendered = render_env_value(value)
         target = None
         for index, line in enumerate(lines):
             match = _KEY_PATTERN.match(line.strip())
@@ -153,7 +165,7 @@ def write_env_settings(env_path: Path, settings: Mapping[str, str]) -> None:
         if target is None:
             lines.append(f"{key}={rendered}")
         else:
-            prefix = "export " if lines[target].lstrip().startswith("export") else ""
+            prefix = "export " if re.match(r"^\s*export\s+", lines[target]) else ""
             lines[target] = f"{prefix}{key}={rendered}"
     atomic_write_text(env_path, "\n".join(lines) + "\n", mode=0o600)
 

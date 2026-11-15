@@ -9,7 +9,7 @@ from stremioguard.cli import supervisor
 from stremioguard.cli.commands.general import is_interactive
 from stremioguard.cli.context import ROOT_DIR, _comet_manager
 from stremioguard.comet import CometManager, prompt_comet_setup
-from stremioguard.config import CometConfig, compose_command
+from stremioguard.config import CometConfig, Config, compose_command
 from stremioguard.env import env_file_value, fail
 
 
@@ -58,6 +58,33 @@ def comet_start() -> None:
 
 def comet_stop() -> None:
     """Stop the Comet stack."""
+    running = supervisor.watchdog_running()
+    if running is None:
+        fail(
+            "Could not verify whether the watchdog is running (systemd user manager is "
+            "unavailable); refusing to stop Comet alone because an active watchdog would "
+            "restart it. Run `./stremio stop` or retry with the systemd user bus reachable."
+        )
+    if running:
+        try:
+            stremio_enabled = Config.from_env(ROOT_DIR).stremio_enabled
+        except (RuntimeError, ValueError):
+            stremio_enabled = None
+        if stremio_enabled is False:
+            fail(
+                "The watchdog is running and would immediately restart Comet. "
+                "Use `./stremio stop` to stop the stack."
+            )
+        if stremio_enabled is True:
+            fail(
+                "The watchdog is running and would immediately restart Comet. "
+                "To drop Comet while keeping Stremio running, set COMET_ENABLED=0 in .env "
+                "and run `./stremio start` (or run `./stremio stop` to stop the whole stack)."
+            )
+        fail(
+            "The watchdog is running and would immediately restart Comet. "
+            "Run `./stremio stop` (or set COMET_ENABLED=0 and run `./stremio start`)."
+        )
     manager = _comet_manager()
     manager.stop()
 
