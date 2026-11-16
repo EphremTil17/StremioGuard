@@ -1,3 +1,28 @@
+configs:
+  # Blocks Docker's embedded DNS (127.0.0.11), which is otherwise reachable over
+  # `-o lo` and forwards outside the tunnel (including single-label names
+  # forwarded by gluetun's own local DNS server). Gluetun executes every line of
+  # `/iptables/post-rules.txt` and refuses to start if any rule fails; a
+  # content change requires bumping the `-vN` suffix because Compose does not
+  # recreate a container when only a config's content changes.
+  gluetun-post-rules-v1:
+    content: |
+      iptables -I OUTPUT -d 127.0.0.11/32 -j REJECT
+
+  # Enforces SCRAM-SHA-256 on all TCP clients (127.0.0.1 and ::1) inside the
+  # shared gluetun namespace, overriding any `trust` rules in the existing
+  # data directory's pg_hba.conf. The Unix socket stays `trust` because it
+  # exists only inside the comet-postgres container, serves as the operator's
+  # recovery path, and is used by the image's init scripts. Bump the `-vN`
+  # suffix on any content change because Compose does not recreate a container
+  # when only config content changes.
+  comet-postgres-hba-v1:
+    content: |
+      # TYPE  DATABASE  USER  ADDRESS       METHOD
+      local   all       all                 trust
+      host    all       all   127.0.0.1/32  scram-sha-256
+      host    all       all   ::1/128       scram-sha-256
+
 services:
   # A gate, not a service. `docker compose up` on its own produces a stack with
   # no published ports, an unconfigured Comet, no public-IP leak check and no
@@ -34,14 +59,17 @@ services:
     # Pinned by digest like every other image here; Dependabot proposes bumps.
     # This is the container the kill switch lives in, and the watchdog depends
     # on details of it (its healthcheck, `wget`, its log wording, the control
-    # server route), so a new release is something to review, not something a
-    # start should pick up on its own.
+    # server route, and `/iptables/post-rules.txt`), so a new release is
+    # something to review, not something a start should pick up on its own.
     image: qmcgaw/gluetun:v3.41.3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    configs:
+      - source: gluetun-post-rules-v1
+        target: /iptables/post-rules.txt
     # Only gluetun's settings from .env, written by ./stremio on every start.
     # StremioGuard's own keys (all its secrets live under COMET_) never reach
     # the VPN container's environment.
@@ -49,6 +77,8 @@ services:
       - path: ./.stremio/gluetun.env
         required: false
     environment:
+      DNS_KEEP_NAMESERVER: "off"
+      FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT: "on"
       HTTP_CONTROL_SERVER_ADDRESS: 127.0.0.1:18080
       HTTP_CONTROL_SERVER_LOG: "${HTTP_CONTROL_SERVER_LOG:-off}"
       UPDATER_PERIOD: "${UPDATER_PERIOD:-480h}"
@@ -70,6 +100,8 @@ services:
         STREMIO_APPLY_PATCHES: ${STREMIO_APPLY_PATCHES:-1}
     image: stremioguard-stremio:local
     restart: "no"
+    cap_drop:
+      - NET_RAW
     shm_size: "2gb"
     environment:
       - NO_CORS=1
@@ -94,6 +126,8 @@ services:
     # revived by Docker before the watchdog has re-verified the VPN path. The
     # watchdog auto-starts the Comet trio once gluetun is healthy.
     restart: "no"
+    cap_drop:
+      - NET_RAW
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -112,6 +146,8 @@ services:
     # Pinned by digest. Majors stay manual: they need a data-directory upgrade.
     image: postgres:18.6-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
     restart: "no"
+    cap_drop:
+      - NET_RAW
     # The data directory lives here, in the base file, so that no way of
     # starting this service can miss it. It used to be supplied only by the
     # generated override, which meant a plain `docker compose up` gave Postgres
@@ -122,6 +158,9 @@ services:
     # removes the failure mode entirely.
     volumes:
       - ./.stremio/comet/postgres-data:/var/lib/postgresql/
+    configs:
+      - source: comet-postgres-hba-v1
+        target: /etc/postgresql/pg_hba.conf
     # Credentials come from a generated file so no password is hardcoded here.
     # `required: false` keeps every Compose command working before `./stremio
     # init` has generated it; Postgres then refuses to initialize a *new*
@@ -150,6 +189,10 @@ services:
       - "work_mem=8MB"
       - "-c"
       - "max_connections=100"
+      - "-c"
+      - "hba_file=/etc/postgresql/pg_hba.conf"
+      - "-c"
+      - "listen_addresses=127.0.0.1"
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -168,6 +211,8 @@ services:
     # Pinned by digest; Dependabot proposes bumps.
     image: muniftanjim/stremthru:0.105.4@sha256:947cfcb2601c67f2f21eb11bd1ea1e555889cec9e0b347cefd0c63754b9c641a
     restart: "no"
+    cap_drop:
+      - NET_RAW
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -203,6 +248,8 @@ services:
   comet:
     image: ${COMET_IMAGE:-g0ldyy/comet}
     restart: "no"
+    cap_drop:
+      - NET_RAW
     environment:
       DATABASE_TYPE: postgresql
     network_mode: "service:gluetun"

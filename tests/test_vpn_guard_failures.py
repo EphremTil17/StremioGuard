@@ -259,10 +259,12 @@ def test_ac4_hour_long_probe_timeout_outage_does_not_lock_out_and_recovers(
             capture: bool = True,
             timeout: float | None = None,
             env: dict[str, str] | None = None,
+            input: str | None = None,
         ) -> subprocess.CompletedProcess[str]:
             self.calls.append(args)
             self.envs.append(env)
             self.timeouts.append(timeout)
+            self.inputs.append(input)
             if args == exec_probe:
                 if not probe_recovered["ok"]:
                     raise subprocess.TimeoutExpired(args, timeout or 3)
@@ -310,6 +312,9 @@ def test_ac4_hour_long_probe_timeout_outage_does_not_lock_out_and_recovers(
                 "-O-",
                 "http://127.0.0.1:18080/v1/publicip/ip",
             ): completed([], "", returncode=1),
+            ("docker", "exec", "gluetun", "iptables", "-S", "OUTPUT"): completed(
+                [], f"-P OUTPUT DROP\n{guard_mod.DNS_BLOCK_RULE}\n-A OUTPUT -o lo -j ACCEPT\n"
+            ),
         }
     )
 
@@ -464,6 +469,7 @@ def test_ac6_leak_matrix_same_family_and_ipv4_mapped_normalization(tmp_path: Pat
         guard = GluetunGuard(cfg, FakeRunner({}))
         warnings: list[str] = []
         with (
+            mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
             mock.patch.object(guard, "public_ip_via_control_server", return_value=None),
             mock.patch.object(guard, "public_ip_via_gluetun", return_value=egress),
             mock.patch.object(guard, "public_ip", return_value=host),
@@ -620,10 +626,12 @@ def test_ac8_unknown_running_state_stops_all_and_never_auto_starts(tmp_path: Pat
             capture: bool = True,
             timeout: float | None = None,
             env: dict[str, str] | None = None,
+            input: str | None = None,
         ) -> subprocess.CompletedProcess[str]:
             self.calls.append(args)
             self.envs.append(env)
             self.timeouts.append(timeout)
+            self.inputs.append(input)
             if args == status_cmd:
                 if confirm_result["ok"]:
                     return completed(args, "")
@@ -673,10 +681,12 @@ def test_ac8_unknown_running_state_stops_all_and_never_auto_starts(tmp_path: Pat
             capture: bool = True,
             timeout: float | None = None,
             env: dict[str, str] | None = None,
+            input: str | None = None,
         ) -> subprocess.CompletedProcess[str]:
             self.calls.append(args)
             self.envs.append(env)
             self.timeouts.append(timeout)
+            self.inputs.append(input)
             if args == status_cmd:
                 if ps_mode["mode"] == "timeout":
                     raise subprocess.TimeoutExpired(args, timeout or 30)
@@ -775,6 +785,7 @@ def test_ac10_bounded_teardown_and_failsafe_unit_timeout(
                 capture: bool = True,
                 timeout: float | None = None,
                 env: dict[str, str] | None = None,
+                input: str | None = None,
             ) -> subprocess.CompletedProcess[str]:
                 assert timeout is not None, f"Unbounded Docker call (timeout=None): {args}"
                 sim_clock["now"] += timeout
@@ -818,6 +829,7 @@ def test_ac10_bounded_teardown_and_failsafe_unit_timeout(
             capture: bool = True,
             timeout: float | None = None,
             env: dict[str, str] | None = None,
+            input: str | None = None,
         ) -> subprocess.CompletedProcess[str]:
             assert timeout is not None, f"Unbounded Docker call (timeout=None): {args}"
             slow_clock["now"] += timeout
@@ -879,9 +891,12 @@ def test_ac10_bounded_teardown_and_failsafe_unit_timeout(
             capture: bool = True,
             timeout: float | None = None,
             env: dict[str, str] | None = None,
+            input: str | None = None,
         ) -> subprocess.CompletedProcess[str]:
             seen_timeouts.append(timeout)
-            return super().run(args, check=check, capture=capture, timeout=timeout, env=env)
+            return super().run(
+                args, check=check, capture=capture, timeout=timeout, env=env, input=input
+            )
 
     prefix = compose_args_prefix(tmp_path)
     rec = _RecordRunner(
@@ -1739,7 +1754,14 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
 
         class _FaultRunner(FakeRunner):
             def __init__(self, exc: BaseException) -> None:
-                super().__init__({ps_gluetun: completed(list(ps_gluetun), "gluetun-cid\n")})
+                super().__init__(
+                    {
+                        ps_gluetun: completed(list(ps_gluetun), "gluetun-cid\n"),
+                        ("docker", "exec", "gluetun-cid", "iptables", "-S", "OUTPUT"): completed(
+                            [], f"-P OUTPUT DROP\n{guard_mod.DNS_BLOCK_RULE}\n"
+                        ),
+                    }
+                )
                 self._exc = exc
 
             def run(
@@ -1750,6 +1772,7 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
                 capture: bool = True,
                 timeout: float | None = None,
                 env: dict[str, str] | None = None,
+                input: str | None = None,
             ) -> subprocess.CompletedProcess[str]:
                 if args == control_cmd:
                     self.calls.append(args)
@@ -1757,7 +1780,9 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
                 if args == egress_cmd:
                     self.calls.append(args)
                     return completed(args, "203.0.113.20\n")
-                return super().run(args, check=check, capture=capture, timeout=timeout, env=env)
+                return super().run(
+                    args, check=check, capture=capture, timeout=timeout, env=env, input=input
+                )
 
         runner = _FaultRunner(fault)
         guard = GluetunGuard(cfg, runner)
@@ -1779,6 +1804,9 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
         "    sys.exit(0)\n"
         "if 'exec' in args and any('18080' in a for a in args):\n"
         "    sys.stdout.buffer.write(b'\\xff\\xfe\\n')\n"
+        "    sys.exit(0)\n"
+        "if 'exec' in args and 'iptables' in args:\n"
+        f"    sys.stdout.buffer.write(b'-P OUTPUT DROP\\n{guard_mod.DNS_BLOCK_RULE}\\n')\n"
         "    sys.exit(0)\n"
         "if 'exec' in args:\n"
         "    sys.stdout.buffer.write(b'203.0.113.20\\n')\n"

@@ -49,10 +49,13 @@ class _PsOverrideRunner:
         capture: bool = True,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         if args == compose_command(self._root_dir, "ps", "-q", "gluetun"):
             return subprocess.CompletedProcess(args, 0, f"{self._container_id}\n", "")
-        return self._real.run(args, check=check, capture=capture, timeout=timeout, env=env)
+        return self._real.run(
+            args, check=check, capture=capture, timeout=timeout, env=env, input=input
+        )
 
 
 def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

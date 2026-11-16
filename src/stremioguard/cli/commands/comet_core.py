@@ -9,15 +9,22 @@ from stremioguard.cli import supervisor
 from stremioguard.cli.commands.general import is_interactive
 from stremioguard.cli.context import ROOT_DIR, _comet_manager
 from stremioguard.comet import CometManager, prompt_comet_setup
+from stremioguard.comet.database import rotate_postgres_password
 from stremioguard.config import CometConfig, Config, compose_command
 from stremioguard.env import env_file_value, fail
+from stremioguard.stacklock import required_stack_lock
+
+ROTATE_LOCK_WAIT_SECONDS = 60
 
 
 def comet_install(
     deep: bool = typer.Option(
         False,
         "--deep",
-        help="Also boot the candidate image ephemerally and check /health before accepting it.",
+        help=(
+            "Also boot the candidate image ephemerally with no network access and "
+            "check /health before accepting it."
+        ),
     ),
 ) -> None:
     """Clone/pin Comet and write local runtime configuration."""
@@ -141,6 +148,37 @@ def comet_vendor_sync() -> None:
     logger.success("Synced Comet vendor checkout.")
 
 
+def comet_rotate_db_password() -> None:
+    """Rotate Comet's Postgres password offline (requires the stack to be stopped)."""
+    try:
+        manager = _comet_manager()
+    except (RuntimeError, ValueError) as error:
+        fail(str(error))
+    if not manager.config.enabled:
+        fail("Comet is disabled (`COMET_ENABLED=0`); cannot rotate its Postgres password.")
+    running = supervisor.watchdog_running()
+    if running is None:
+        fail(
+            "Could not verify whether the watchdog is running (systemd user manager is "
+            "unavailable); refusing to rotate the Postgres password because an active "
+            "watchdog could start Postgres during rotation."
+        )
+    if running:
+        fail(
+            "The watchdog is running and could restart Postgres during rotation. "
+            "Run `./stremio stop` first."
+        )
+    try:
+        with required_stack_lock(
+            ROOT_DIR,
+            wait_seconds=ROTATE_LOCK_WAIT_SECONDS,
+            purpose="rotate the Comet Postgres password",
+        ):
+            rotate_postgres_password(manager)
+    except RuntimeError as error:
+        fail(str(error))
+
+
 def register(app: typer.Typer) -> None:
     app.command("install")(comet_install)
     app.command("start")(comet_start)
@@ -150,4 +188,5 @@ def register(app: typer.Typer) -> None:
     app.command("log-canary")(comet_log_canary)
     app.command("probe-playback")(comet_probe_playback)
     app.command("logs")(comet_logs)
+    app.command("rotate-db-password")(comet_rotate_db_password)
     app.command("vendor-sync", hidden=True)(comet_vendor_sync)

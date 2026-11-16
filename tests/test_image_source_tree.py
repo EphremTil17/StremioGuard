@@ -37,6 +37,7 @@ class _CpFixtureRunner:
         capture: bool = True,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
         if args[:2] == ["docker", "create"]:

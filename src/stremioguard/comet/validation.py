@@ -7,16 +7,15 @@ render+compile stage in `comet/manager.py` (plan Phase 6).
   defaults every field, so no environment stub is required for a clean
   import — verified empirically against `g0ldyy/comet:latest`.
 - Ephemeral boot (`--deep`, opt-in): actually starts a throwaway candidate
-  container on an isolated bridge network (no published ports, sqlite
-  defaults — no postgres needed), polls `/health`, fetches `/manifest.json`,
-  then tears down. This is the paranoid pre-promotion check, never part of
-  the default validation path.
+  container with `--network none` (no network access, sqlite defaults — no
+  postgres needed), polls `/health`, fetches `/manifest.json`, then tears down.
+  This is the paranoid pre-promotion check, never part of the default
+  validation path.
 """
 
 from __future__ import annotations
 
 import json
-import secrets
 import subprocess
 import time
 from pathlib import Path, PurePosixPath
@@ -189,6 +188,13 @@ def import_smoke_test(
     return {"status": "passed", "stage": "import", "detail": ""}
 
 
+def _ephemeral_probe_script(url: str) -> str:
+    return (
+        "import urllib.request; "
+        f"print(urllib.request.urlopen({url!r}, timeout=4).read().decode('utf-8', 'replace'))"
+    )
+
+
 def ephemeral_boot_check(
     runner: Runner,
     image_ref: str,
@@ -198,27 +204,15 @@ def ephemeral_boot_check(
     timeout_seconds: int = EPHEMERAL_BOOT_TIMEOUT_SECONDS,
     poll_interval_seconds: float = EPHEMERAL_BOOT_POLL_INTERVAL_SECONDS,
 ) -> dict[str, object]:
-    """Start a throwaway candidate container on an isolated bridge network
-    (no published ports, scratch sqlite config — no postgres required), poll
-    `/health`, fetch `/manifest.json`, then tear down both the container and
-    the network. Opt-in (`--deep`): a real boot is slow and makes an
-    outbound network call (anime-mapping refresh), so this never runs as
-    part of the default validation path.
+    """Start a throwaway candidate container with `--network none` (no network
+    access, scratch sqlite config — no postgres required), poll `/health`,
+    fetch `/manifest.json`, then tear down the container. Opt-in (`--deep`):
+    the candidate boots with no network access and creates no Docker network.
 
     Returns {"status": "passed"|"failed", "stage": "deep", "detail": str}.
     """
-    network_name = f"stremioguard-comet-deep-{secrets.token_hex(4)}"
     container_id: str | None = None
     try:
-        created = runner.run(["docker", "network", "create", network_name], check=False)
-        if created.returncode != 0:
-            detail = (created.stderr or created.stdout or "unknown docker error").strip()
-            return {
-                "status": "failed",
-                "stage": "deep",
-                "detail": f"network create failed: {detail}",
-            }
-
         # No --entrypoint override: the whole point of the deep check is to
         # boot the exact artifact compose will run. Re-implementing the
         # image's entrypoint by hand here would silently drift the moment
@@ -228,7 +222,7 @@ def ephemeral_boot_check(
             "run",
             "-d",
             "--network",
-            network_name,
+            "none",
             *_override_mount_args(outputs, bundle_dir),
             image_ref,
         ]
@@ -248,29 +242,33 @@ def ephemeral_boot_check(
                 "detail": "docker run produced no container ID",
             }
 
+        python_command = image_python_command(runner, image_ref)
+        health_probe_cmd = [
+            "docker",
+            "exec",
+            container_id,
+            *python_command,
+            "-c",
+            _ephemeral_probe_script("http://127.0.0.1:8000/health"),
+        ]
         deadline = time.monotonic() + timeout_seconds
         healthy = False
         while time.monotonic() < deadline:
             try:
-                health = runner.run(
-                    [
-                        "docker",
-                        "exec",
-                        container_id,
-                        "wget",
-                        "-qO-",
-                        "http://127.0.0.1:8000/health",
-                    ],
-                    check=False,
-                    timeout=5,
-                )
+                health = runner.run(health_probe_cmd, check=False, timeout=5)
             except subprocess.TimeoutExpired:
-                time.sleep(poll_interval_seconds)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(poll_interval_seconds, remaining))
                 continue
             if health.returncode == 0 and '"status":"ok"' in (health.stdout or "").replace(" ", ""):
                 healthy = True
                 break
-            time.sleep(poll_interval_seconds)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval_seconds, remaining))
 
         if not healthy:
             logs = runner.run(["docker", "logs", "--tail", "60", container_id], check=False)
@@ -287,9 +285,9 @@ def ephemeral_boot_check(
                     "docker",
                     "exec",
                     container_id,
-                    "wget",
-                    "-qO-",
-                    "http://127.0.0.1:8000/manifest.json",
+                    *python_command,
+                    "-c",
+                    _ephemeral_probe_script("http://127.0.0.1:8000/manifest.json"),
                 ],
                 check=False,
                 timeout=5,
@@ -308,9 +306,8 @@ def ephemeral_boot_check(
             }
         return {"status": "passed", "stage": "deep", "detail": ""}
     finally:
-        # Captured: these teardown commands echo the container ID / network
-        # name, which is noise interactively and corrupts machine-readable
-        # stdout (the Phase 7 validator prints its JSON report there).
+        # Captured: this teardown command echoes the container ID, which is
+        # noise interactively and corrupts machine-readable stdout (the Phase 7
+        # validator prints its JSON report there).
         if container_id:
             runner.run(["docker", "rm", "-f", container_id], check=False)
-        runner.run(["docker", "network", "rm", network_name], check=False)

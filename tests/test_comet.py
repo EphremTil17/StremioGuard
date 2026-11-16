@@ -615,14 +615,21 @@ class CometManagerTests(unittest.TestCase):
             manager._write_postgres_env("preset-password")
             self.assertEqual(manager._resolve_postgres_password(), "preset-password")
 
-    def test_resolve_postgres_password_keeps_legacy_when_data_dir_predates_env(self) -> None:
+    def test_resolve_postgres_password_fails_closed_without_env_and_warns_on_legacy(self) -> None:
+        """AC-17 (INV-8, D9): initialized data dir without postgres.env raises RuntimeError."""
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
-            # Simulate a legacy data dir initialized before postgres.env existed.
             cfg.postgres_data_dir.mkdir(parents=True, exist_ok=True)
             (cfg.postgres_data_dir / "PG_VERSION").write_text("18\n", encoding="utf-8")
             manager = CometManager(cfg, FakeRunner({}))
+            with self.assertRaises(RuntimeError) as ctx:
+                manager._resolve_postgres_password()
+            self.assertIn("postgres.env", str(ctx.exception))
+            self.assertIn("rotate-db-password", str(ctx.exception))
+            self.assertFalse(manager.postgres_env_file().exists())
+
+            manager._write_postgres_env("comet")
             with mock.patch.object(manager, "warn") as warn:
                 first = manager._resolve_postgres_password()
                 second = manager._resolve_postgres_password()

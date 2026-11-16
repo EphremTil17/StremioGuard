@@ -346,16 +346,19 @@ def _mock_runner(*responses: object) -> mock.Mock:
 
 
 class EphemeralBootCheckTests(unittest.TestCase):
+    """AC-10 (INV-5): offline --network none ephemeral boot check and cleanup."""
+
     _OUTPUTS = {"stream.py": "/app/comet/api/endpoints/stream.py"}
 
-    def test_full_success_path_cleans_up_container_and_network(self) -> None:
+    def test_full_success_path_uses_network_none_and_cleans_up_container(self) -> None:
         runner = _mock_runner(
-            completed(["docker", "network", "create"], "", ""),  # network create
             completed(["docker", "run", "-d"], "cid123\n", ""),  # container start
+            completed(
+                ["docker", "image", "inspect"], '["uv","run","python","-m","comet.main"]', ""
+            ),
             completed(["docker", "exec"], '{"status":"ok"}', ""),  # health
             completed(["docker", "exec"], '{"id":"stremio.comet.fast"}', ""),  # manifest
             completed(["docker", "rm", "-f"], "", ""),  # cleanup: container
-            completed(["docker", "network", "rm"], "", ""),  # cleanup: network
         )
         result = ephemeral_boot_check(
             runner, "g0ldyy/comet@sha256:abc", self._OUTPUTS, Path("/bundle")
@@ -363,58 +366,47 @@ class EphemeralBootCheckTests(unittest.TestCase):
         self.assertEqual(result, {"status": "passed", "stage": "deep", "detail": ""})
 
         calls = [call.args[0] for call in runner.run.call_args_list]
-        self.assertEqual(calls[0][:3], ["docker", "network", "create"])
-        self.assertEqual(calls[1][:4], ["docker", "run", "-d", "--network"])
+        self.assertEqual(calls[0][:5], ["docker", "run", "-d", "--network", "none"])
         # The deep boot must run the image's OWN entrypoint — overriding it
         # with a hand-replicated command would drift from upstream silently.
-        self.assertNotIn("--entrypoint", calls[1])
-        self.assertEqual(calls[1][-1], "g0ldyy/comet@sha256:abc")
-        self.assertIn("cid123", calls[-2])  # container rm -f
-        self.assertEqual(calls[-1][:3], ["docker", "network", "rm"])
-
-    def test_network_create_failure_is_reported_and_still_attempts_cleanup(self) -> None:
-        runner = _mock_runner(
-            completed(["docker", "network", "create"], "", "permission denied", returncode=1),
-            completed(["docker", "network", "rm"], "", ""),
-        )
-        result = ephemeral_boot_check(
-            runner, "g0ldyy/comet@sha256:abc", self._OUTPUTS, Path("/bundle")
-        )
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("permission denied", str(result["detail"]))
-        self.assertEqual(runner.run.call_count, 2)
+        self.assertNotIn("--entrypoint", calls[0])
+        self.assertEqual(calls[0][-1], "g0ldyy/comet@sha256:abc")
+        self.assertEqual(calls[2][:6], ["docker", "exec", "cid123", "uv", "run", "python"])
+        self.assertEqual(calls[2][6], "-c")
+        self.assertIn("/health", calls[2][7])
+        self.assertEqual(calls[3][:6], ["docker", "exec", "cid123", "uv", "run", "python"])
+        self.assertEqual(calls[3][6], "-c")
+        self.assertIn("/manifest.json", calls[3][7])
+        self.assertEqual(calls[-1], ["docker", "rm", "-f", "cid123"])
 
     def test_container_start_failure_is_reported(self) -> None:
         runner = _mock_runner(
-            completed(["docker", "network", "create"], "", ""),
             completed(["docker", "run", "-d"], "", "no such image", returncode=1),
-            completed(["docker", "network", "rm"], "", ""),
         )
         result = ephemeral_boot_check(
             runner, "g0ldyy/comet@sha256:abc", self._OUTPUTS, Path("/bundle")
         )
         self.assertEqual(result["status"], "failed")
         self.assertIn("no such image", str(result["detail"]))
+        self.assertEqual(runner.run.call_count, 1)
 
     def test_missing_container_id_is_reported(self) -> None:
         runner = _mock_runner(
-            completed(["docker", "network", "create"], "", ""),
             completed(["docker", "run", "-d"], "", ""),
-            completed(["docker", "network", "rm"], "", ""),
         )
         result = ephemeral_boot_check(
             runner, "g0ldyy/comet@sha256:abc", self._OUTPUTS, Path("/bundle")
         )
         self.assertEqual(result["status"], "failed")
         self.assertIn("no container ID", str(result["detail"]))
+        self.assertEqual(runner.run.call_count, 1)
 
     def test_health_never_becomes_reachable_reports_failure_with_logs(self) -> None:
         runner = _mock_runner(
-            completed(["docker", "network", "create"], "", ""),
             completed(["docker", "run", "-d"], "cid123\n", ""),
+            completed(["docker", "image", "inspect"], '["python","-m","comet.main"]', ""),
             completed(["docker", "logs"], "boot crashed\n", ""),
             completed(["docker", "rm", "-f"], "", ""),
-            completed(["docker", "network", "rm"], "", ""),
         )
         result = ephemeral_boot_check(
             runner, "g0ldyy/comet@sha256:abc", self._OUTPUTS, Path("/bundle"), timeout_seconds=0
@@ -422,17 +414,17 @@ class EphemeralBootCheckTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("never became reachable", str(result["detail"]))
         self.assertIn("boot crashed", str(result["detail"]))
+        self.assertEqual(runner.run.call_args_list[-1].args[0], ["docker", "rm", "-f", "cid123"])
 
     def test_health_check_timeout_expired_is_retried_not_raised(self) -> None:
         runner = mock.Mock()
         runner.run.side_effect = [
-            completed(["docker", "network", "create"], "", ""),
             completed(["docker", "run", "-d"], "cid123\n", ""),
+            completed(["docker", "image", "inspect"], '["python","-m","comet.main"]', ""),
             subprocess.TimeoutExpired(cmd=["docker", "exec"], timeout=5),
             completed(["docker", "exec"], '{"status":"ok"}', ""),
             completed(["docker", "exec"], '{"id":"stremio.comet.fast"}', ""),
             completed(["docker", "rm", "-f"], "", ""),
-            completed(["docker", "network", "rm"], "", ""),
         ]
         result = ephemeral_boot_check(
             runner,
@@ -443,21 +435,22 @@ class EphemeralBootCheckTests(unittest.TestCase):
             poll_interval_seconds=0,
         )
         self.assertEqual(result["status"], "passed")
+        self.assertEqual(runner.run.call_args_list[-1].args[0], ["docker", "rm", "-f", "cid123"])
 
     def test_manifest_unreachable_after_healthy_boot_is_reported(self) -> None:
         runner = _mock_runner(
-            completed(["docker", "network", "create"], "", ""),
             completed(["docker", "run", "-d"], "cid123\n", ""),
+            completed(["docker", "image", "inspect"], '["python","-m","comet.main"]', ""),
             completed(["docker", "exec"], '{"status":"ok"}', ""),
             completed(["docker", "exec"], "", "not found", returncode=1),
             completed(["docker", "rm", "-f"], "", ""),
-            completed(["docker", "network", "rm"], "", ""),
         )
         result = ephemeral_boot_check(
             runner, "g0ldyy/comet@sha256:abc", self._OUTPUTS, Path("/bundle")
         )
         self.assertEqual(result["status"], "failed")
         self.assertIn("manifest.json was not reachable", str(result["detail"]))
+        self.assertEqual(runner.run.call_args_list[-1].args[0], ["docker", "rm", "-f", "cid123"])
 
 
 class ValidatorScriptTests(unittest.TestCase):

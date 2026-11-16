@@ -76,6 +76,7 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
         self.timeouts: list[float | None] = []
+        self.inputs: list[str | None] = []
 
     def run(
         self,
@@ -85,10 +86,12 @@ class FakeRunner:
         capture: bool = True,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
         self.envs.append(env)
         self.timeouts.append(timeout)
+        self.inputs.append(input)
         key = tuple(args)
         response = self.responses.get(key)
         if isinstance(response, list):

@@ -17,7 +17,7 @@ Python verifier (./stremio → stremioguard.orchestrator)
 └── stops stremio if either fails
 ```
 
-The kill switch is gluetun's built-in firewall (`FIREWALL=on`). Traffic that does not exit through the VPN tunnel is dropped at the kernel layer, not by a Python polling loop. The verifier is layer 2: it confirms gluetun is healthy and that the egress IP is not your home IP, and stops Stremio if either check fails.
+The kill switch is gluetun's built-in firewall, which is always on (`FIREWALL` is ignored by gluetun v3.41; StremioGuard pins `FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT=on` and `DNS_KEEP_NAMESERVER=off`). Traffic that does not exit through the VPN tunnel is dropped at the kernel layer (see [Security notes](#security-notes) for the exact boundary), not by a Python polling loop. The verifier is layer 2: it confirms gluetun is healthy, that the Docker DNS block is active at the top of gluetun's `OUTPUT` chain, and that the egress IP is not your home IP, and stops Stremio if any check fails.
 
 ## VPN provider support
 
@@ -182,6 +182,7 @@ Comet commands:
 ./stremio comet probe-playback --url 'http://<comet-host>:18000/.../playback/...'
 ./stremio comet logs
 ./stremio comet update [check [--deep]|apply|rollback]
+./stremio comet rotate-db-password
 ./stremio comet stop
 ```
 
@@ -192,7 +193,7 @@ To ensure absolute configuration coherence and prevent upstream Comet updates fr
 1. **Digest Pinning:** After initial resolution, the stack runs Comet from a specific image digest (e.g., `g0ldyy/comet@sha256:...`) instead of a floating tag. The first resolution evaluates the current upstream `:latest` image against the managed patch suite and persists the accepted digest; the maintainer-tested lock digest is the fallback when required compatibility fails. This is a reproducibility and compatibility control, not a provenance/signature verification policy.
 2. **Advisory Start-Time Checks:** Once every 24 hours, running `./stremio start` or `./stremio restart` triggers a throttled check against the upstream `:latest` registry tag. If an update is available, it prints a single notification line without blocking startup.
 3. **Comet Update Suite:**
-   - `./stremio comet update check`: Resolves the remote registry digest, extracts the code, compiles it in isolation, runs a mandatory container-isolated `import-smoke` check (importing every patched module, scanning all code objects for undefined names, and probing the ASGI app to prove `StremioGuardResponseGuard` is outermost, strips P2P entries, and blocks torznab), and logs a feature diff (applied/skipped patches). Use `--deep` to run an ephemeral boot test.
+   - `./stremio comet update check`: Resolves the remote registry digest, extracts the code, compiles it in isolation, runs a mandatory container-isolated `import-smoke` check (importing every patched module, scanning all code objects for undefined names, and probing the ASGI app to prove `StremioGuardResponseGuard` is outermost, strips P2P entries, and blocks torznab), and logs a feature diff (applied/skipped patches). Use `--deep` to run an ephemeral boot test with no network access.
    - `./stremio comet update apply`: Promotes the validated candidate digest to active state and restarts the Comet stack.
    - `./stremio comet update rollback`: Reverts to the previous active digest.
 
@@ -508,9 +509,18 @@ uv run pyright
 
 ## Security notes
 
-The primary kill switch is **gluetun's in-kernel firewall** (`FIREWALL=on`). With `network_mode: service:gluetun`, Stremio has no other network egress: if the VPN tunnel is down, gluetun's iptables rules drop everything that does not exit through the tunnel, and Stremio simply has no internet. The Python verifier is layer 2 — it catches the cases where gluetun is up but unhealthy, where the egress IP unexpectedly matches your home IP, or where an `EXPECTED_VPN_IP` constraint fails.
+The primary kill switch is **gluetun's in-kernel firewall**, which is always on (`FIREWALL` is not a gluetun v3.41 setting; `docker-compose.yml` pins `FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT=on` and `DNS_KEEP_NAMESERVER=off`). With `network_mode: service:gluetun`, the exact egress boundary is:
+
+- What can still leave outside `tun0`: the VPN endpoint's IP and port, and gluetun's own Docker bridge subnet (no other containers are attached to that bridge in this stack; set `FIREWALL_OUTBOUND_SUBNETS` only if you intentionally allow LAN discovery).
+- What is blocked, and how: Docker's embedded DNS (`127.0.0.11`, which would otherwise forward outside the tunnel directly or via gluetun's own DNS forwarder) is rejected by `/iptables/post-rules.txt` (`gluetun-post-rules-v1`), which is verified at the top of gluetun's `OUTPUT` chain by `./stremio start`, `./stremio restart`, and the watchdog before it starts or resumes protected services (`./stremio comet start`, `./stremio comet update apply`, and `./stremio comet update rollback` start Comet directly and rely on the running watchdog, which holds services stopped while the block cannot be verified); raw `AF_PACKET` sockets are blocked by `cap_drop: [NET_RAW]` on every namespace service (`stremio`, `comet-gateway`, `comet-postgres`, `stremthru`, `comet`).
+- Consequence: single-label names (Docker service names and bare LAN hostnames) do not resolve inside gluetun's namespace.
+
+The Python verifier is layer 2 — it catches the cases where gluetun is up but unhealthy, where the Docker DNS block is missing from `OUTPUT`, where the egress IP unexpectedly matches your home IP, or where an `EXPECTED_VPN_IP` constraint fails.
 
 Defense-in-depth notes:
+
+- Comet's Postgres (`comet-postgres`) requires SCRAM-SHA-256 password authentication for every TCP client (`127.0.0.1` and `::1`) via a Compose-managed `pg_hba.conf` (`hba_file=/etc/postgresql/pg_hba.conf`) and listens on `127.0.0.1` only (`listen_addresses=127.0.0.1`). The Unix socket inside the `comet-postgres` container stays `trust`, serving as the operator's recovery path and for the image's init scripts.
+- `./stremio comet rotate-db-password` rotates the `comet` database password offline in single-user mode and requires the stack to be stopped (`./stremio stop`) first. Installs created before this change keep the legacy `comet` password until rotated, and `./stremio start` warns when it is still in use.
 
 - LAN discovery for Stremio (e.g., Chromecast, DLNA) is blocked by default. Set `FIREWALL_OUTBOUND_SUBNETS=192.168.x.0/24` in `.env` to allow your specific LAN range.
 - The host-level WSL connection itself is no longer routed through any VPN by default. Anything outside this Docker setup uses your home connection. Choose split tunneling at the WSL/Windows layer if you want broader coverage.

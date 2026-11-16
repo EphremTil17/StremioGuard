@@ -70,8 +70,11 @@ class _RecordingRunner(SubprocessRunner):
         capture: bool = True,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        result = super().run(args, check=check, capture=capture, timeout=timeout, env=env)
+        result = super().run(
+            args, check=check, capture=capture, timeout=timeout, env=env, input=input
+        )
         if args[:2] == ["docker", "create"] and result.returncode == 0:
             cid = (result.stdout or "").strip()
             if cid:

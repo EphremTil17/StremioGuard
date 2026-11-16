@@ -60,6 +60,7 @@ class NamedDockerRunner(Runner):
         capture: bool = True,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         forwarded = list(args)
         if self._drop_mount and len(forwarded) >= 2 and forwarded[:2] == ["docker", "run"]:
@@ -85,7 +86,9 @@ class NamedDockerRunner(Runner):
                 extra.extend(["--network", "none"])
             forwarded = [forwarded[0], forwarded[1], *extra, *forwarded[2:]]
 
-        return self._inner.run(forwarded, check=check, capture=capture, timeout=timeout, env=env)
+        return self._inner.run(
+            forwarded, check=check, capture=capture, timeout=timeout, env=env, input=input
+        )
 
 
 @pytest.fixture()

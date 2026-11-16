@@ -317,21 +317,22 @@ class CometManager:
         if env_path.exists():
             existing = env_file_value(env_path, "POSTGRES_PASSWORD")
             if existing:
+                if existing == "comet" and not self._warned_legacy_postgres:
+                    self.warn(
+                        "Postgres is using the legacy 'comet' password. "
+                        "Run `./stremio stop`, `./stremio comet rotate-db-password`, "
+                        "then `./stremio start` to replace it."
+                    )
+                    self._warned_legacy_postgres = True
                 return existing
-        # Postgres bakes its password into the data directory at first init, so a
-        # data dir that predates postgres.env was created with the legacy
-        # 'comet' password and cannot be rotated in place. Keep it and tell the
-        # user how to adopt a generated password.
         data_dir = self.config.postgres_data_dir
         if data_dir.exists() and any(data_dir.iterdir()):
-            if not self._warned_legacy_postgres:
-                self.warn(
-                    "Postgres data was initialized with the legacy 'comet' password. "
-                    "To adopt a generated password, run `./stremio comet stop`, delete "
-                    f"{data_dir}, then start again."
-                )
-                self._warned_legacy_postgres = True
-            return "comet"
+            raise RuntimeError(
+                f"Postgres data directory {data_dir} is already initialized, but "
+                f"{env_path} is missing or has no POSTGRES_PASSWORD. "
+                f"Restore {env_path} from a backup, or run `./stremio stop`, then "
+                "`./stremio comet rotate-db-password`."
+            )
         return secrets.token_urlsafe(18)
 
     def _write_postgres_env(self, password: str) -> None:

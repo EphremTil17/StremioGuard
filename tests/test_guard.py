@@ -278,6 +278,7 @@ class GluetunGuardTests(unittest.TestCase):
             cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
             guard = GluetunGuard(cfg, FakeRunner({}))
             with (
+                mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
                 mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
                 mock.patch.object(guard, "public_ip", return_value=None),
             ):
@@ -290,6 +291,7 @@ class GluetunGuardTests(unittest.TestCase):
             cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
             guard = GluetunGuard(cfg, FakeRunner({}))
             with (
+                mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
                 mock.patch.object(guard, "public_ip_via_gluetun", return_value="198.51.100.10"),
                 mock.patch.object(guard, "public_ip", return_value=None),
             ):
@@ -305,6 +307,7 @@ class GluetunGuardTests(unittest.TestCase):
             guard = GluetunGuard(cfg, FakeRunner({}))
             warnings: list[str] = []
             with (
+                mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
                 mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
                 mock.patch.object(guard, "public_ip", return_value=None),
                 mock.patch.object(guard, "warn", side_effect=warnings.append),
@@ -325,6 +328,7 @@ class GluetunGuardTests(unittest.TestCase):
             guard = GluetunGuard(cfg, FakeRunner({}))
             warnings: list[str] = []
             with (
+                mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
                 mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
                 mock.patch.object(guard, "public_ip", return_value=None),
                 mock.patch.object(guard, "warn", side_effect=warnings.append),
@@ -1247,11 +1251,12 @@ class EgressAssessmentTests(unittest.TestCase):
             mock.patch.object(guard, "public_ip_via_gluetun", return_value=egress),
             mock.patch.object(guard, "public_ip", return_value=host),
             mock.patch.object(guard, "warn", side_effect=warnings.append),
+            mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
         )
         return patches, warnings
 
     def _assess(self, guard: GluetunGuard, patches, **kwargs: bool) -> PublicIPAssessment:
-        with patches[0], patches[1], patches[2], patches[3]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
             return guard.public_ip_assessment(**kwargs)
 
     def test_stale_control_snapshot_stays_safe_and_warns_once(self) -> None:
@@ -1290,7 +1295,7 @@ class EgressAssessmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             guard = self._guard(Path(directory))
             patches, _ = self._probes(guard)
-            with patches[0], patches[1], patches[2] as host_probe, patches[3]:
+            with patches[0], patches[1], patches[2] as host_probe, patches[3], patches[4]:
                 guard.public_ip_assessment()
             host_probe.assert_called_once_with(version=4)
 
@@ -1298,7 +1303,7 @@ class EgressAssessmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             guard = self._guard(Path(directory))
             patches, _ = self._probes(guard, egress=None)
-            with patches[0], patches[1] as egress_probe, patches[2], patches[3]:
+            with patches[0], patches[1] as egress_probe, patches[2], patches[3], patches[4]:
                 self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNKNOWN)
                 self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNKNOWN)
             self.assertEqual(egress_probe.call_count, 2)
@@ -1339,6 +1344,7 @@ class EgressAssessmentTests(unittest.TestCase):
                 patches[1] as egress_probe,
                 patches[2],
                 patches[3],
+                patches[4],
                 mock.patch.object(
                     guard_mod.time, "monotonic", side_effect=[1000.0, 1299.0, 1300.0]
                 ),
@@ -1357,6 +1363,7 @@ class EgressAssessmentTests(unittest.TestCase):
                     "public_ip_via_control_server",
                     side_effect=[self.SNAPSHOT, "203.0.113.200"],
                 ),
+                mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
                 mock.patch.object(guard, "public_ip_via_gluetun", return_value=self.EGRESS) as p,
                 mock.patch.object(guard, "public_ip", return_value=self.HOST),
                 mock.patch.object(guard, "warn"),
@@ -1369,7 +1376,7 @@ class EgressAssessmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             guard = self._guard(Path(directory), egress_probe_interval_seconds=300)
             patches, _ = self._probes(guard)
-            with patches[0], patches[1] as egress_probe, patches[2], patches[3]:
+            with patches[0], patches[1] as egress_probe, patches[2], patches[3], patches[4]:
                 guard.public_ip_assessment()
                 guard.public_ip_assessment(force_probe=True)
             self.assertEqual(egress_probe.call_count, 2)
@@ -1378,7 +1385,7 @@ class EgressAssessmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             guard = self._guard(Path(directory), egress_probe_interval_seconds=300)
             patches, _ = self._probes(guard, egress=self.HOST)
-            with patches[0], patches[1] as egress_probe, patches[2], patches[3]:
+            with patches[0], patches[1] as egress_probe, patches[2], patches[3], patches[4]:
                 self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNSAFE_DEFINITIVE)
                 self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNSAFE_DEFINITIVE)
             self.assertEqual(egress_probe.call_count, 2)

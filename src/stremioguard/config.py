@@ -177,6 +177,7 @@ class Runner(Protocol):
         capture: bool = True,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -200,6 +201,7 @@ class SubprocessRunner:
         capture: bool = True,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             args,
@@ -210,6 +212,7 @@ class SubprocessRunner:
             capture_output=capture,
             timeout=timeout,
             env=env,
+            input=input,
         )
 
 

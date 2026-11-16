@@ -47,7 +47,10 @@ def comet_update_check(
     deep: bool = typer.Option(
         False,
         "--deep",
-        help="Also boot the candidate image ephemerally and check /health before recommending it.",
+        help=(
+            "Also boot the candidate image ephemerally with no network access and "
+            "check /health before recommending it."
+        ),
     ),
 ) -> None:
     """Compare the active Comet image against upstream `:latest` and validate

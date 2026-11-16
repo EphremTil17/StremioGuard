@@ -75,6 +75,7 @@ AUTH_REJECTION_MARKERS = (
     "incorrect key size",
 )
 EVIDENCE_LINE_LIMIT = 300
+DNS_BLOCK_RULE = "-A OUTPUT -d 127.0.0.11/32 -j REJECT --reject-with icmp-port-unreachable"
 
 
 @dataclass(frozen=True)
@@ -390,6 +391,8 @@ class GluetunGuard:
         self._warned_snapshot_pair: tuple[str, str] | None = None
         self._egress_warned_at: float | None = None
         self._host_ip_warned_at: float | None = None
+        self._verified_dns_block_identity: tuple[str, str] | None = None
+        self._dns_block_warned_at: float | None = None
 
     def log(self, message: str) -> None:
         logger.info(message)
@@ -909,6 +912,30 @@ class GluetunGuard:
 
         return None
 
+    def namespace_dns_block_active(self) -> bool | None:
+        """Whether gluetun's OUTPUT chain starts with the Docker DNS block."""
+        try:
+            container_id = self.service_container_id("gluetun")
+        except Exception:
+            return None
+        if not container_id:
+            return None
+        try:
+            result = self.runner.run(
+                ["docker", "exec", container_id, "iptables", "-S", "OUTPUT"],
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        for raw_line in (result.stdout or "").splitlines():
+            line = raw_line.strip()
+            if line.startswith("-A OUTPUT"):
+                return line == DNS_BLOCK_RULE
+        return False
+
     def public_ip_assessment(
         self, *, log_observation: bool = False, force_probe: bool = False
     ) -> PublicIPAssessment:
@@ -931,6 +958,32 @@ class GluetunGuard:
             or control_ip != self._verified_control_ip
             or now - self._last_egress_probe_time >= self.config.egress_probe_interval_seconds
         )
+        identity = self.last_gluetun_state.identity if self.last_gluetun_state is not None else None
+        if due or identity is None or identity != self._verified_dns_block_identity:
+            block_active = self.namespace_dns_block_active()
+            if block_active is not True:
+                self._verified_dns_block_identity = None
+                self._verified_egress_ip = None
+                if (
+                    self._dns_block_warned_at is None
+                    or now - self._dns_block_warned_at >= REPEAT_WARNING_SECONDS
+                ):
+                    self._dns_block_warned_at = now
+                    if block_active is False:
+                        self.warn(
+                            "Gluetun's OUTPUT chain does not start with the Docker DNS block "
+                            f"({DNS_BLOCK_RULE}). Ensure docker-compose.yml mounts "
+                            "gluetun-post-rules-v1 at /iptables/post-rules.txt and restart gluetun."
+                        )
+                    else:
+                        self.warn(
+                            "Could not verify Docker DNS block in gluetun's OUTPUT chain; "
+                            "holding protected services stopped."
+                        )
+                return PublicIPAssessment.UNKNOWN
+            self._verified_dns_block_identity = identity
+            self._dns_block_warned_at = None
+
         if not due:
             return PublicIPAssessment.SAFE
 
