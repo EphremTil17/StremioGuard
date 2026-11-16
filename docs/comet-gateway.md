@@ -15,33 +15,66 @@ https://comet.example.com/configure
 
 That page is protected by Comet's configure password.
 
-Addon install/query/playback routes must use the gateway prefix:
+Because StremioGuard requires `CONFIGURE_PAGE_PASSWORD`, Comet mounts all Stremio
+addon routes under `STREMIO_API_PREFIX=/s/<PUBLIC_API_TOKEN>`. Addon
+install/query/playback routes through the gateway therefore use:
 
 ```text
-https://comet.example.com/comet/<token>/<config>/manifest.json
-https://comet.example.com/comet/<token>/<config>/stream/...
-https://comet.example.com/comet/<token>/<config>/playback/...
+https://comet.example.com/comet/<token>/s/<api>/manifest.json
+https://comet.example.com/comet/<token>/s/<api>/<config>/manifest.json
+https://comet.example.com/comet/<token>/s/<api>/stream/<type>/<id>.json
+https://comet.example.com/comet/<token>/s/<api>/<config>/stream/<type>/<id>.json
+https://comet.example.com/comet/<token>/s/<api>/<config>/playback/<hash>/<svc>/<idx>/<season>/<episode>
 ```
 
-Direct public addon paths and unauthenticated internal endpoints are blocked by
-the gateway (`403`):
+Opening `/comet/<token>` or `/comet/<token>/` answers `302` with a relative
+`Location: /comet/<token>/configure` so token-scoped configure pages keep the
+token in their install/copy links.
 
-```text
-https://comet.example.com/manifest.json
-https://comet.example.com/<config>/manifest.json
-https://comet.example.com/stream/...
-https://comet.example.com/<config>/stream/...
-https://comet.example.com/playback/...
-https://comet.example.com/<config>/playback/...
-https://comet.example.com/debrid-sync/...
-https://comet.example.com/admin
-https://comet.example.com/kodi/...
-```
+### Allowed and Blocked Routes
+
+Under `/comet/<token>`, the gateway matches tokens byte-for-byte
+(case-sensitively) and allows only the Stremio addon routes Comet actually serves
+plus the token's configure page, evaluated strictly on the raw `$request_uri`
+path (dot segments, empty segments, `%2F`, `%2E`, `%5C`, `\`, `;`, `#`, and
+case variants are denied):
+
+| Allowed shape under `/comet/<token>` | Comet route |
+| :--- | :--- |
+| `/s/<api>/manifest.json`, `/s/<api>/<config>/manifest.json` | Addon manifest |
+| `/s/<api>/stream/<seg>/<seg>.json`, `/s/<api>/<config>/stream/<seg>/<seg>.json` | Stream search |
+| `/s/<api>/<config>/playback/<seg>/<seg>/<seg>/<seg>/<seg>` (5 segments) | Stream playback |
+| `/configure`, `/<config>/configure`, `/s/<api>/configure`, `/s/<api>/<config>/configure` | Configure page |
+| `/configure/login` | Configure form login POST target |
+
+Everything else under `/comet/<token>/` (and at top level outside the public
+routes `/`, `/configure`, `/configure/...`, `/static/`, `/health`) is denied
+with `403` (`503` when rate-limited) and never reaches Comet, including:
+
+- `/s/<api>/<config>/debrid-sync/...`: blocked deliberately. If a user enables
+  "scrape debrid account torrents", Comet's "Comet Sync" stream entry points at
+  `debrid-sync` and returns `403` through the gateway; Comet's own
+  stream-triggered account sync still runs during normal stream searches.
+- `/s/<api>/torznab/api`: blocked at the gateway so token holders cannot
+  query Comet's Torznab search API.
+- `/s/<api>/manifest` and `/s/<api>/streams`: ChillLink routes are not Stremio
+  addon routes (`./stremio comet token url` also requires `/manifest.json`).
+- `/s/<api>/configure/login`: the configure form posts only to `/configure/login`.
+- Unprefixed `/manifest.json`, `/stream/...`, `/playback/...`: Comet does not
+  serve unprefixed addon routes when `CONFIGURE_PAGE_PASSWORD` is set.
+- `/admin`, `/kodi/...`, `/cometnet/...` (including `/cometnet/ws`), `/metrics`,
+  `/docs`, `/openapi.json`, and `/`: administrative, pairing, federation, or
+  internal endpoints not needed by Stremio clients.
+
+This Comet release has no `catalog`, `meta`, or `subtitles` routes. If a future
+Comet update adds or changes routes, updating the gateway requires a deliberate
+allowlist change in `comet_gateway.py` and re-verifying with the opt-in
+integration suite (`STREMIOGUARD_DOCKER_TESTS=1 uv run pytest tests/test_gateway_integration.py`)
+against the new Comet image digest.
 
 Comet's `/admin` dashboard should be accessed directly via `COMET_HOST_PORT` on
-LAN/tailnet rather than through the public gateway (`/admin` and `/kodi/...` are
-blocked with `403` both at top level and under `/comet/<token>/...`). Kodi
-pairing through the gateway is unsupported.
+LAN/tailnet rather than through the public gateway. Kodi pairing through the
+gateway is unsupported.
 
 ## Why This Exists
 
@@ -51,9 +84,15 @@ authorized users can still install and use the Comet addon.
 
 The gateway helps by:
 
-- requiring a valid token before manifest, stream, playback, or debrid-sync
-  routes reach Comet
-- clearing client IP headers before forwarding to Comet
+- requiring an exact, case-sensitive token and an allowlisted Stremio addon
+  route before manifest, stream, or playback requests reach Comet
+- clearing all 14 client-IP headers from Comet's `IP_PROXY_HEADERS` list
+  (`CF-Connecting-IP`, `True-Client-IP`, `X-Real-IP`, `X-Client-IP`,
+  `DO-Connecting-IP`, `Fastly-Client-IP`, `X-Cluster-Client-IP`,
+  `X-Forwarded-For`, `X-Forwarded`, `Forwarded-For`, `Forwarded`,
+  `X-AppEngine-User-IP`, `CF-Pseudo-IPv4`, `X-AIOStreams-User-IP`) and
+  overwriting `X-Forwarded-Host` and `X-Forwarded-Prefix` on every proxied
+  location so clients cannot steer Comet's client-IP or path-prefix logic
 - keeping Comet, Postgres, and Stremio in the gluetun network namespace
 - publishing raw Comet only on `127.0.0.1:COMET_HOST_PORT` for local operator
   diagnostics
@@ -104,10 +143,10 @@ Point the public Comet domain to the gateway port, not the raw Comet port:
 
 ```nginx
 location / {
-    proxy_set_header Host $host;
+    proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-For "";
     proxy_set_header X-Real-IP "";
-    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Host $http_host;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $http_connection;
@@ -119,8 +158,14 @@ location / {
 Replace `<SERVERIP:18001>` with the host address and
 `COMET_GATEWAY_HOST_PORT` your reverse proxy can reach.
 
-The gateway trusts the origin information the proxy supplies to construct
-secure cookies and playback URLs. Do both of the following:
+The gateway validates `Host` at server level (returning `400` if missing or
+malformed) and preserves `$http_host` — including any non-default port — as both
+`Host` and `X-Forwarded-Host` so Comet playback links keep the port the client
+used. When your public URL uses a non-default port, set `proxy_set_header Host
+$http_host;` (and `X-Forwarded-Host $http_host;`) on the reverse proxy rather
+than `$host`, which strips the port. The gateway trusts the origin information
+the proxy supplies to construct secure cookies and playback URLs. Do both of
+the following:
 
 - restrict `COMET_GATEWAY_HOST_PORT` at the host firewall/security group so
   only the reverse proxy, LAN, or tailnet can reach it as intended;
@@ -142,10 +187,20 @@ explicit so Comet playback URLs stay on the public HTTPS origin.
 ./stremio comet token revoke <id>
 ./stremio comet token use <id>
 ./stremio comet token url <id> --manifest <url>
+./stremio comet gateway-reload
 ```
 
-The `url` command rewrites an existing Comet manifest URL to use another token.
-That is the intended per-user token workflow.
+The `url` command rewrites an existing Comet Stremio manifest URL (ending in
+`/manifest.json`) to use another token. That is the intended per-user token
+workflow.
+
+Token mutations (`add`, `revoke`, `rotate`, `use`) validate `tokens.json`,
+re-render `nginx.conf` and `tokens.map`, and reload the running gateway before
+reporting success (exiting non-zero if reload fails or the gateway's state is
+unknown). `./stremio start` re-renders `nginx.conf`, but does not apply config
+changes to an already-running gateway; run `./stremio comet gateway-reload` (or
+`./stremio restart`) after config or template updates to verify `nginx -t` and
+the in-container sha256 of both `nginx.conf` and `tokens.map` and reload nginx.
 
 ## Verification
 
@@ -154,7 +209,7 @@ After `./stremio start`, useful checks are:
 ```bash
 curl -i https://comet.example.com/manifest.json
 curl -i https://comet.example.com/badtoken/manifest.json
-curl -i https://comet.example.com/comet/<token>/<config>/manifest.json
+curl -i https://comet.example.com/comet/<token>/s/<api>/<config>/manifest.json
 ./stremio comet gateway-logs
 ./stremio comet doctor
 ./stremio comet log-canary
@@ -174,17 +229,22 @@ Expected results:
 The generated nginx config rate-limits abuse paths without ever throttling
 authenticated playback:
 
-- Requests carrying an invalid gateway token are rewritten to an internal
-  location that rejects them in the access phase, rate-limited at 5 r/s (burst
-  10). Behind rootless Docker or a reverse proxy, every client arrives from the
-  same address, so each limiter shares one bucket rather than limiting per end
-  client IP. Valid tokens never enter that location, so bursty range requests
-  during seeks are unaffected.
+- Requests carrying an invalid gateway token (including case-mismatched or
+  percent-encoded tokens) are rewritten to an internal location that rejects
+  them in the access phase with `deny all` (`403`), rate-limited by
+  `gateway_auth` at 5 r/s (burst 10; excess returns `503`). Behind rootless
+  Docker or a reverse proxy, every client arrives from the same address, so each
+  limiter shares one bucket rather than limiting per end client IP. Valid tokens
+  with allowed routes never enter a limiter, so bursty range requests during
+  playback seeks are unaffected.
+- Valid-token requests to disallowed routes under `/comet/<token>/...` rewrite
+  to an internal access-phase location (`deny all`, `403`) rate-limited by
+  `gateway_fail` at 5 r/s (burst 3; excess returns `503`).
 - Human-paced public pages (`/configure`, `/static/`, `/health`, and the root
-  page) share a 10 r/s (burst 20) limit, which throttles configure-password brute
-  force. `/admin` and `/kodi/...` paths (including under `/comet/<token>/...`)
-  are blocked and return `403`.
-- Everything else falls through to a `403` limited at 5 r/s (burst 3).
+  page) share `gateway_admin` at 10 r/s (burst 20), which throttles
+  configure-password brute force.
+- Everything else falls through to `location /` (`deny all`, `403`) limited by
+  `gateway_fail` at 5 r/s (burst 3; excess returns `503`).
 
 Access logs record a masked request line: the entire path after `/comet/` —
 the token and the base64 config blob after it, which can embed debrid API

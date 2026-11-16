@@ -226,13 +226,20 @@ addon, stream-discovery, and playback relay.
   Comet's configure password; opening `https://comet.example.com/comet/<token>/configure`
   preserves that token in the generated install/copy links (since configure
   pages share one configure password and embed the default token, token
-  separation applies to manifest-link recipients without that password). Comet's
-  `/admin` dashboard and `/kodi/...` pairing paths are blocked (`403`) at both
-  top level and under `/comet/<token>/...` — reach `/admin` directly via
-  `COMET_HOST_PORT` on LAN or tailnet (Kodi pairing through the gateway is
-  unsupported).
-- Addon, stream, playback, and debrid-sync routes live under
-  `https://comet.example.com/comet/<token>/...`.
+  separation applies to manifest-link recipients without that password).
+- Under `/comet/<token>/...`, tokens match case-sensitively and only Stremio
+  addon routes (`/s/<api>/manifest.json`, `/s/<api>/stream/...`,
+  `/s/<api>/<config>/playback/...`) plus the token configure/login routes are
+  allowed; `debrid-sync` (meaning Comet Sync streams fail with `403` while
+  stream-triggered account sync still runs), `torznab/api`, ChillLink, `/admin`,
+  `/kodi/...`, `/cometnet/...`, and traversal/encoded variants are blocked (`403`
+  / `503` when rate-limited). Reach `/admin` directly via `COMET_HOST_PORT` on
+  LAN or tailnet (Kodi pairing through the gateway is unsupported).
+- The gateway clears all 14 Comet client-IP headers and client-supplied
+  `X-Forwarded-Prefix`/`X-Forwarded-Host`, and preserves `$http_host` (including
+  non-default ports). `./stremio start` re-renders `nginx.conf` without applying
+  it to an already-running gateway; run `./stremio comet gateway-reload` to
+  apply changes live.
 - Raw Comet is published only on `COMET_HOST_PORT` on your configured bind
   addresses for local/tailnet operator access and diagnostics.
 - Public reverse proxies should point at `COMET_GATEWAY_HOST_PORT`, not the raw
@@ -512,7 +519,7 @@ Defense-in-depth notes:
 - Run logs in `logs/` record your home and tunnel IPs, so the directory is owner-only (0700) and each run log is 0600.
 - Comet never offers direct-torrent (P2P) streams here, whatever its configure page says: Stremio would play them with the TV's or phone's own torrent engine, on its own connection, outside the VPN. Everything plays through debrid and Comet's proxy instead. Uncached results are marked with an amber `🔸` on their media-type line (`🔸 WEB-DL`); cached ones are unmarked.
 - Comet's own startup log printed half of every secret it masked (the TorBox key, passwords, the public API token). A required patch makes it print `********` instead; see [docs/comet-patches.md](docs/comet-patches.md).
-- The gateway's access log keeps only clean public UI/health paths (`/`, `/configure`, `/static/`, `/health`, with query strings stripped) readable and masks `/comet/...`, `%`, `/..`, and all other request paths so raw Comet addon URLs are not recorded. (`/admin` and `/kodi/...` paths are blocked at both top level and under `/comet/<token>/...`.)
+- The gateway's access log keeps only clean public UI/health paths (`/`, `/configure`, `/static/`, `/health`, with query strings stripped) readable and masks `/comet/...`, `%`, `/..`, and all other request paths so raw Comet addon URLs, tokens, API tokens, and config blobs are not recorded (`302`, `400`, `403`, and `503` lines included). Non-addon paths under `/comet/<token>/...`, `/admin`, `/kodi/...`, and `/cometnet/...` are blocked at the gateway.
 - Restarting gluetun mid-session (e.g., `docker compose restart gluetun`) leaves Stremio running but network-isolated until the watchdog's next tick stops it. Expected behavior of the netns-share model.
 
 ## Inbound access threat model

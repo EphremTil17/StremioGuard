@@ -5,7 +5,9 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import re
 import secrets
+import subprocess
 import urllib.parse
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,8 +20,10 @@ from loguru import logger
 from stremioguard.config import (
     COMET_GATEWAY_CONTAINER_PORT,
     COMET_PORT,
+    DOCKER_QUERY_TIMEOUT_SECONDS,
     Runner,
     SubprocessRunner,
+    compose_command,
     service_container_id,
 )
 from stremioguard.env import atomic_write_text, ensure_directory
@@ -31,6 +35,28 @@ __all__ = ["COMET_GATEWAY_CONTAINER_PORT", "CometGatewayConfig", "CometGatewayMa
 # files: a file bind mount pins the inode it started with, so an atomically
 # replaced tokens.map would never reach nginx and revoked tokens kept working.
 GATEWAY_CONFIG_DIR = "/etc/nginx/stremioguard"
+
+_TOKEN_VALUE_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,256}\Z")
+_TOKEN_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+# Comet's IP_PROXY_HEADERS from comet/utils/network.py in
+# g0ldyy/comet@sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea.
+_COMET_IP_PROXY_HEADERS = (
+    "CF-Connecting-IP",
+    "True-Client-IP",
+    "X-Real-IP",
+    "X-Client-IP",
+    "DO-Connecting-IP",
+    "Fastly-Client-IP",
+    "X-Cluster-Client-IP",
+    "X-Forwarded-For",
+    "X-Forwarded",
+    "Forwarded-For",
+    "Forwarded",
+    "X-AppEngine-User-IP",
+    "CF-Pseudo-IPv4",
+    "X-AIOStreams-User-IP",
+)
 
 
 @dataclass(frozen=True)
@@ -81,14 +107,39 @@ class CometGatewayManager:
 
     # ── Token storage ──────────────────────────────────────────────
 
+    def _state_error(self, detail: str) -> RuntimeError:
+        return RuntimeError(
+            f"Malformed gateway token state in {self.config.tokens_file} ({detail}); "
+            "fix it, or move the file aside and add the tokens again."
+        )
+
     def load_state(self) -> dict[str, object]:
-        if not self.config.tokens_file.exists():
+        try:
+            content = self.config.tokens_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return {"default": None, "tokens": {}}
-        content = self.config.tokens_file.read_text(encoding="utf-8")
-        data = json.loads(content)
+        except (OSError, UnicodeDecodeError) as error:
+            raise self._state_error(f"unreadable file: {error}") from error
+        if not content.strip():
+            raise self._state_error("file is empty")
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as error:
+            raise self._state_error(f"invalid JSON: {error.msg}") from error
+        if not isinstance(data, dict):
+            raise self._state_error("top-level JSON value must be an object")
+        default_id = data.get("default")
+        if default_id is not None and not isinstance(default_id, str):
+            raise self._state_error("'default' must be null or a string")
+        if "tokens" not in data or not isinstance(data["tokens"], dict):
+            raise self._state_error("'tokens' must be an object")
+        tokens = data["tokens"]
+        for tid, entry in tokens.items():
+            if not isinstance(tid, str) or not isinstance(entry, dict):
+                raise self._state_error("'tokens' must map string IDs to objects")
         return {
-            "default": data.get("default"),
-            "tokens": data.get("tokens", {}),
+            "default": default_id,
+            "tokens": tokens,
         }
 
     def save_state(self, state: dict[str, object]) -> None:
@@ -157,11 +208,31 @@ class CometGatewayManager:
             state["default"] = token_id
         return token_id, token_value
 
+    def _validated_tokens(self, tokens: dict[str, dict[str, object]]) -> list[tuple[str, str]]:
+        validated: list[tuple[str, str]] = []
+        for token_id, entry in tokens.items():
+            if not _TOKEN_ID_PATTERN.fullmatch(token_id):
+                raise RuntimeError(
+                    f"Invalid gateway token ID {token_id!r} in {self.config.tokens_file}; "
+                    "fix it, or move the file aside and add the tokens again."
+                )
+            token = entry.get("token")
+            if not isinstance(token, str) or not _TOKEN_VALUE_PATTERN.fullmatch(token):
+                raise RuntimeError(
+                    f"Invalid gateway token for ID {token_id!r} in {self.config.tokens_file}; "
+                    "fix it, or move the file aside and add the tokens again."
+                )
+            validated.append((token_id, token))
+        return validated
+
     # ── Token CRUD ─────────────────────────────────────────────────
 
     def add_token(self, label: str, *, make_default: bool = False) -> tuple[str, str]:
         with self._token_lock():
             state = self.load_state()
+            tokens = state["tokens"]  # type: ignore[assignment]
+            assert isinstance(tokens, dict)
+            self._validated_tokens(tokens)  # type: ignore[arg-type]
             token_id, token_value = self._create_token_in_state(
                 state, label, make_default=make_default
             )
@@ -174,6 +245,7 @@ class CometGatewayManager:
             state = self.load_state()
             tokens = state["tokens"]  # type: ignore[assignment]
             assert isinstance(tokens, dict)
+            self._validated_tokens(tokens)  # type: ignore[arg-type]
             if token_id not in tokens:
                 raise KeyError(f"Token ID {token_id!r} not found")
             entry = tokens[token_id]
@@ -191,6 +263,7 @@ class CometGatewayManager:
             state = self.load_state()
             tokens = state["tokens"]  # type: ignore[assignment]
             assert isinstance(tokens, dict)
+            self._validated_tokens(tokens)  # type: ignore[arg-type]
             if token_id not in tokens:
                 raise KeyError(f"Token ID {token_id!r} not found")
             entry = tokens[token_id]
@@ -211,6 +284,7 @@ class CometGatewayManager:
             state = self.load_state()
             tokens = state["tokens"]  # type: ignore[assignment]
             assert isinstance(tokens, dict)
+            self._validated_tokens(tokens)  # type: ignore[arg-type]
             if token_id not in tokens:
                 raise KeyError(f"Token ID {token_id!r} not found")
             state["default"] = token_id
@@ -257,8 +331,15 @@ class CometGatewayManager:
         token = str(tokens[token_id].get("token", ""))
         parsed = urllib.parse.urlparse(manifest_url)
         path_parts = [part for part in parsed.path.split("/") if part]
-        if not path_parts or path_parts[-1] not in {"manifest.json", "manifest"}:
-            raise ValueError("Expected a Comet manifest URL ending in manifest.json or manifest")
+        if (
+            not path_parts
+            or path_parts[-1] != "manifest.json"
+            or not parsed.path.endswith("/manifest.json")
+        ):
+            raise ValueError(
+                "Expected a Stremio manifest URL ending in /manifest.json "
+                "(ChillLink /manifest URLs are not served through the gateway)"
+            )
         if path_parts[:1] == ["comet"] and len(path_parts) >= 3:
             comet_path = "/" + "/".join(path_parts[2:])
         else:
@@ -268,26 +349,22 @@ class CometGatewayManager:
     # ── Nginx config generation ────────────────────────────────────
 
     def render_tokens_map(self) -> str:
-        tokens = self.load_tokens()
+        validated = self._validated_tokens(self.load_tokens())
         lines = [
             "# Generated by ./stremio; do not edit by hand.",
             "map $gateway_token $token_valid {",
             "    default 0;",
         ]
-        for entry in tokens.values():
-            token = entry.get("token", "")
-            if token:
-                lines.append(f'    "{token}" 1;')
+        for _, token in validated:
+            lines.append(f'    "~^{token}$" 1;')
         lines.append("}")
         # The token's ID, for the access log. The ID is what `./stremio comet
         # token list` shows and is not a credential, so a request can be
         # attributed to a token (and that token revoked) without the log ever
         # holding the token itself.
         lines.extend(["map $gateway_token $gateway_token_id {", '    default "-";'])
-        for token_id, entry in tokens.items():
-            token = entry.get("token", "")
-            if token:
-                lines.append(f'    "{token}" "{token_id}";')
+        for token_id, token in validated:
+            lines.append(f'    "~^{token}$" "{token_id}";')
         lines.append("}")
         return "\n".join(lines) + "\n"
 
@@ -296,9 +373,15 @@ class CometGatewayManager:
         # routing through the tokens.map lookup even if COMET_GATEWAY_TOKEN_LENGTH
         # changes; tokens.map is the authoritative gate.
         token_re = "[A-Za-z0-9_-]+"
+        api_prefix = r"/s/[A-Za-z0-9_-]+"
+        seg = r"(?!(?:\.\.?)(?:/|$))(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9._~!$&'()*+,=:@-])+"
+        seg_prefix = r"(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9._~!$&'()*+,=:@-])+"
         public_mask_rule = (
             r"~^(?<mrh>\S+\s/(?:configure(?:/[^\s?]*)?|static/[^\s?]*|health))"
             r'(?:\?\S*)?(?<mrt>\s+\S+)$ "${mrh}${mrt}";'
+        )
+        clear_ip_headers = "\n".join(
+            f'            proxy_set_header {header} "";' for header in _COMET_IP_PROXY_HEADERS
         )
         return f"""\
 # Generated by ./stremio; do not edit by hand.
@@ -315,15 +398,39 @@ events {{
 }}
 
 http {{
+    # Extract the token and raw path from $request_uri (never from decoded/normalized $uri)
+    # so percent-encoded or traversal forms never match a token or smuggle a path.
+    map $request_uri $gateway_token {{
+        ~^/comet/(?<gt>{token_re})(?:[/?]|$) $gt;
+        default "";
+    }}
+
+    map $request_uri $raw_comet_path {{
+        ~^/comet/{token_re}(?<rcp>/[^?]*)(?:\\?.*)?$ $rcp;
+        default "";
+    }}
+
+    # Exact addon allowlist (case-sensitive, raw path up to ?).
+    map $raw_comet_path $comet_route_action {{
+        ""  redirect;
+        "/" redirect;
+        "~(?:%(?:2[FfEe]|5[Cc])|[;#\\x5c])" deny;
+        "~^{api_prefix}(?:/{seg})?/manifest\\.json$" proxy;
+        "~^{api_prefix}(?:/{seg})?/stream/{seg}/{seg_prefix}\\.json$" proxy;
+        "~^{api_prefix}/{seg}/playback/{seg}/{seg}/{seg}/{seg}/{seg}$" proxy;
+        "~^(?:{api_prefix})?(?:/{seg})?/configure$" proxy;
+        "~^/configure/login$" proxy;
+        default deny;
+    }}
+
     include {GATEWAY_CONFIG_DIR}/tokens.map;
 
-    # Rate-limit only invalid-token requests. A plain `return 403` inside the
-    # token locations would run in the rewrite phase, BEFORE limit_req's
-    # preaccess phase, so the limiter would never fire; instead invalid tokens
-    # are rewritten to an internal location whose `deny all` rejects in the
-    # access phase, which runs AFTER limit_req. Valid tokens never enter that
-    # location, so authenticated playback (with its bursty range requests
-    # during seeks) is never throttled.
+    # Rate-limit denials without throttling valid token traffic. A plain `return 403`
+    # runs in the rewrite phase, BEFORE limit_req's preaccess phase, so the limiter
+    # would never fire; instead denied requests rewrite to an internal location (or
+    # fall into `location /`) whose `deny all` rejects in the access phase AFTER limit_req.
+    # Valid tokens never enter those locations, so authenticated playback (with its
+    # bursty range requests during seeks) is never throttled.
     #
     # These zones are keyed by client address, but behind rootless Docker's
     # port forwarder (and behind a reverse proxy) every client arrives from
@@ -363,59 +470,60 @@ http {{
         default                  $scheme;
     }}
 
-    map $http_host $redirect_host {{
-        default $http_host;
-        ""      $host;
-    }}
-
-    # Preserve raw percent-encoding (e.g. %20 in /playback/...) and query params
-    # when forwarding behind /comet/<token>, because nginx decodes regex URI
-    # captures and proxy_pass with variables does not re-encode whitespace.
-    map $request_uri $raw_comet_uri {{
-        ~^/comet/{token_re}(?<rcu>/.*)$ $rcu;
-        default "";
+    map $http_host $valid_host {{
+        default 0;
+        "~^(?:[A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])(?::[0-9]{{1,5}})?$" 1;
     }}
 
     server {{
         listen {COMET_GATEWAY_CONTAINER_PORT};
         server_name _;
+        absolute_redirect off;
         set $comet_upstream http://127.0.0.1:{COMET_PORT};
 
-        location ~ "^/comet/(?<gateway_token>{token_re})(?<comet_uri>/.*)$" {{
+        if ($valid_host = 0) {{
+            return 400;
+        }}
+
+        location ^~ /comet/ {{
             if ($token_valid = 0) {{
                 rewrite ^ /__sg_invalid_token last;
             }}
-            if ($comet_uri ~* "^/+(?:admin|kodi)(?:/|$)") {{
-                return 403 "Forbidden\\n";
+            if ($comet_route_action = "redirect") {{
+                return 302 /comet/$gateway_token/configure;
             }}
-            if ($raw_comet_uri = "") {{
+            if ($comet_route_action != "proxy") {{
+                rewrite ^ /__sg_forbidden last;
+            }}
+            if ($raw_comet_path = "") {{
                 return 400;
             }}
 
-            proxy_pass $comet_upstream$raw_comet_uri;
+            proxy_pass $comet_upstream$raw_comet_path$is_args$args;
             proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP "";
-            proxy_set_header X-Forwarded-For "";
+            proxy_set_header Upgrade "";
+            proxy_set_header Host $http_host;
             proxy_set_header X-Forwarded-Proto $pass_x_forwarded_proto;
-            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Host $http_host;
             proxy_set_header X-Forwarded-Prefix /comet/$gateway_token;
+            # Clear all 14 headers from Comet's comet/utils/network.py (IP_PROXY_HEADERS)
+            # at sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea.
+{clear_ip_headers}
             proxy_buffering off;
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
             client_max_body_size 0;
         }}
 
-        location ~ "^/comet/(?<gateway_token>{token_re})$" {{
-            if ($token_valid = 0) {{ rewrite ^ /__sg_invalid_token last; }}
-            return 301 $pass_x_forwarded_proto://$redirect_host/comet/$gateway_token/;
-        }}
-
         location = /__sg_invalid_token {{
             internal;
             limit_req zone=gateway_auth burst=10 nodelay;
+            deny all;
+        }}
+
+        location = /__sg_forbidden {{
+            internal;
+            limit_req zone=gateway_fail burst=3 nodelay;
             deny all;
         }}
 
@@ -425,11 +533,11 @@ http {{
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP "";
-            proxy_set_header X-Forwarded-For "";
+            proxy_set_header Host $http_host;
             proxy_set_header X-Forwarded-Proto $pass_x_forwarded_proto;
-            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Host $http_host;
+            proxy_set_header X-Forwarded-Prefix "";
+{clear_ip_headers}
             proxy_buffering off;
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
@@ -442,11 +550,11 @@ http {{
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP "";
-            proxy_set_header X-Forwarded-For "";
+            proxy_set_header Host $http_host;
             proxy_set_header X-Forwarded-Proto $pass_x_forwarded_proto;
-            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Host $http_host;
+            proxy_set_header X-Forwarded-Prefix "";
+{clear_ip_headers}
             proxy_buffering off;
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
@@ -455,18 +563,20 @@ http {{
 
         location / {{
             limit_req zone=gateway_fail burst=3 nodelay;
-            return 403 "Forbidden\\n";
+            deny all;
         }}
     }}
 }}
 """
 
     def write_nginx_configs(self) -> None:
+        nginx_conf = self.render_nginx_conf()
+        tokens_map = self.render_tokens_map()
         ensure_directory(self.config.state_dir)
         # These files carry live gateway tokens; write them atomically at 0600
         # (the nginx container runs as root and can still read the bind mounts).
-        atomic_write_text(self.config.nginx_conf_file, self.render_nginx_conf(), mode=0o600)
-        atomic_write_text(self.config.tokens_map_file, self.render_tokens_map(), mode=0o600)
+        atomic_write_text(self.config.nginx_conf_file, nginx_conf, mode=0o600)
+        atomic_write_text(self.config.tokens_map_file, tokens_map, mode=0o600)
 
     # ── Compose lifecycle ──────────────────────────────────────────
 
@@ -494,36 +604,67 @@ http {{
         logger.info(f"Public base URL: {self.public_base_url()}")
 
     def reload_nginx(self) -> None:
-        """Apply the token map to the running gateway and prove it landed.
+        """Apply the config and token map to the running gateway and prove they landed.
 
-        A reload only helps if nginx reads the new file; the state directory is
+        A reload only helps if nginx reads the new files; the state directory is
         mounted (not single files, which keep the inode they started with), and
-        the in-container hash is compared before claiming success.
+        the in-container hashes are compared before claiming success.
         """
         self.write_nginx_configs()
         container_id = self.service_container_id()
         if not container_id:
             raise RuntimeError("Comet gateway container is not running; cannot reload nginx.")
         nginx = ["docker", "exec", container_id, "nginx", "-c", f"{GATEWAY_CONFIG_DIR}/nginx.conf"]
-        self.runner.run([*nginx, "-t"], check=True)
-        expected = hashlib.sha256(self.config.tokens_map_file.read_bytes()).hexdigest()
-        seen = self.runner.run(
-            ["docker", "exec", container_id, "sha256sum", f"{GATEWAY_CONFIG_DIR}/tokens.map"],
-            check=True,
-        )
-        if (seen.stdout or "").split(" ", 1)[0] != expected:
-            raise RuntimeError(
-                "The gateway container does not see the updated token map; "
-                "run `./stremio restart` so revoked tokens stop working."
+        self.runner.run([*nginx, "-t"], check=True, timeout=DOCKER_QUERY_TIMEOUT_SECONDS)
+        for filename, host_file in (
+            ("nginx.conf", self.config.nginx_conf_file),
+            ("tokens.map", self.config.tokens_map_file),
+        ):
+            expected = hashlib.sha256(host_file.read_bytes()).hexdigest()
+            container_path = f"{GATEWAY_CONFIG_DIR}/{filename}"
+            seen = self.runner.run(
+                ["docker", "exec", container_id, "sha256sum", container_path],
+                check=True,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
             )
-        self.runner.run([*nginx, "-s", "reload"], check=True)
+            if (seen.stdout or "").split(" ", 1)[0].strip() != expected:
+                raise RuntimeError(
+                    f"The gateway container does not see the updated {filename}; "
+                    "run `./stremio restart` so the running gateway uses the current config."
+                )
+        self.runner.run([*nginx, "-s", "reload"], check=True, timeout=DOCKER_QUERY_TIMEOUT_SECONDS)
 
-    def container_running(self) -> bool:
-        container_id = self.service_container_id()
+    def container_running(self) -> bool | None:
+        """Whether the gateway container is running, or ``None`` if Docker did not answer."""
+        try:
+            ps_result = self.runner.run(
+                compose_command(self.config.root_dir, "ps", "-q", self.config.service_name),
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if ps_result.returncode != 0:
+            return None
+        container_id = next(
+            (line.strip() for line in (ps_result.stdout or "").splitlines() if line.strip()),
+            None,
+        )
         if not container_id:
             return False
-        result = self.runner.run(
-            ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
-            check=False,
-        )
-        return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
+        try:
+            result = self.runner.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        state = (result.stdout or "").strip().lower()
+        if state == "true":
+            return True
+        if state == "false":
+            return False
+        return None
