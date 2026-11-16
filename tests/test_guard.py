@@ -17,6 +17,12 @@ from stremioguard import preflight as preflight_mod
 from stremioguard.guard import GluetunGuard, PublicIPAssessment
 
 from .conftest import (
+    PUBLIC_IPV4_ALT,
+    PUBLIC_IPV4_EGRESS,
+    PUBLIC_IPV4_HOST,
+    PUBLIC_IPV4_SNAPSHOT,
+    PUBLIC_IPV6_EGRESS,
+    PUBLIC_IPV6_HOST,
     FakeRunner,
     completed,
     compose_args_prefix,
@@ -62,16 +68,16 @@ class GluetunGuardTests(unittest.TestCase):
         self.assertIn("`docker` group", help_text)
 
     def test_parse_public_ip_accepts_valid_addresses(self) -> None:
-        self.assertEqual(config_mod.parse_public_ip("203.0.113.20\n"), "203.0.113.20")
-        self.assertEqual(config_mod.parse_public_ip("  198.51.100.10 "), "198.51.100.10")
-        self.assertEqual(config_mod.parse_public_ip("2001:db8::1"), "2001:db8::1")
+        self.assertEqual(config_mod.parse_public_ip(f"{PUBLIC_IPV4_EGRESS}\n"), PUBLIC_IPV4_EGRESS)
+        self.assertEqual(config_mod.parse_public_ip(f"  {PUBLIC_IPV4_HOST} "), PUBLIC_IPV4_HOST)
+        self.assertEqual(config_mod.parse_public_ip(PUBLIC_IPV6_HOST), PUBLIC_IPV6_HOST)
 
     def test_parse_public_ip_rejects_garbage(self) -> None:
         self.assertIsNone(config_mod.parse_public_ip(""))
         self.assertIsNone(config_mod.parse_public_ip("not.an.ip"))
         self.assertIsNone(config_mod.parse_public_ip("999.999.999.999"))
         self.assertIsNone(config_mod.parse_public_ip("::::"))
-        self.assertIsNone(config_mod.parse_public_ip("203.0.113.20 extra"))
+        self.assertIsNone(config_mod.parse_public_ip(f"{PUBLIC_IPV4_EGRESS} extra"))
 
     def test_require_commands_reports_docker_socket_permission_issue(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -258,28 +264,29 @@ class GluetunGuardTests(unittest.TestCase):
                 "wget",
                 "--tries=1",
                 "--timeout=1",
+                *(f"--header={k}: {v}" for k, v in guard_mod.PROBE_REQUEST_HEADERS),
                 "-qO-",
                 "https://example.test/ip",
             )
             runner = FakeRunner(
                 {
                     **compose_stack_responses(tmp_path),
-                    exec_call: completed(list(exec_call), "203.0.113.20\n"),
+                    exec_call: completed(list(exec_call), f"{PUBLIC_IPV4_EGRESS}\n"),
                 }
             )
             guard = GluetunGuard(make_config(tmp_path), runner)
-            self.assertEqual(guard.public_ip_via_gluetun(), "203.0.113.20")
+            self.assertEqual(guard.public_ip_via_gluetun(), PUBLIC_IPV4_EGRESS)
             self.assertIn(list(exec_call), runner.calls)
 
     def test_public_ip_safe_accepts_non_home_ip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_config(tmp_path)
-            cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
+            cfg.home_ip_file.write_text(f"{PUBLIC_IPV4_HOST}\n", encoding="utf-8")
             guard = GluetunGuard(cfg, FakeRunner({}))
             with (
                 mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-                mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS),
                 mock.patch.object(guard, "public_ip", return_value=None),
             ):
                 self.assertTrue(guard.public_ip_safe())
@@ -288,11 +295,11 @@ class GluetunGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_config(tmp_path)
-            cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
+            cfg.home_ip_file.write_text(f"{PUBLIC_IPV4_HOST}\n", encoding="utf-8")
             guard = GluetunGuard(cfg, FakeRunner({}))
             with (
                 mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-                mock.patch.object(guard, "public_ip_via_gluetun", return_value="198.51.100.10"),
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_HOST),
                 mock.patch.object(guard, "public_ip", return_value=None),
             ):
                 self.assertFalse(guard.public_ip_safe())
@@ -301,14 +308,14 @@ class GluetunGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_config(tmp_path)
-            cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
+            cfg.home_ip_file.write_text(f"{PUBLIC_IPV4_HOST}\n", encoding="utf-8")
             old = time.time() - (40 * 24 * 3600)
             os.utime(cfg.home_ip_file, (old, old))
             guard = GluetunGuard(cfg, FakeRunner({}))
             warnings: list[str] = []
             with (
                 mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-                mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS),
                 mock.patch.object(guard, "public_ip", return_value=None),
                 mock.patch.object(guard, "warn", side_effect=warnings.append),
             ):
@@ -324,12 +331,12 @@ class GluetunGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_config(tmp_path)
-            cfg.home_ip_file.write_text("198.51.100.10\n", encoding="utf-8")
+            cfg.home_ip_file.write_text(f"{PUBLIC_IPV4_HOST}\n", encoding="utf-8")
             guard = GluetunGuard(cfg, FakeRunner({}))
             warnings: list[str] = []
             with (
                 mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-                mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20"),
+                mock.patch.object(guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS),
                 mock.patch.object(guard, "public_ip", return_value=None),
                 mock.patch.object(guard, "warn", side_effect=warnings.append),
             ):
@@ -626,11 +633,13 @@ class GluetunGuardTests(unittest.TestCase):
                 "-O-",
                 "http://127.0.0.1:18080/v1/publicip/ip",
             ]
-            runner = FakeRunner({tuple(cmd): completed(cmd, '{"public_ip": "203.0.113.5"}')})
+            runner = FakeRunner(
+                {tuple(cmd): completed(cmd, f'{{"public_ip": "{PUBLIC_IPV4_SNAPSHOT}"}}')}
+            )
             guard = GluetunGuard(make_config(tmp_path), runner)
             with mock.patch.object(guard, "service_container_id", return_value="gluetun-id"):
                 ip = guard.public_ip_via_control_server()
-            self.assertEqual(ip, "203.0.113.5")
+            self.assertEqual(ip, PUBLIC_IPV4_SNAPSHOT)
             self.assertFalse(guard._control_server_failed)
 
     def test_public_ip_via_control_server_401_permanent_fallback(self) -> None:
@@ -1230,9 +1239,9 @@ class EgressAssessmentTests(unittest.TestCase):
     """The live in-tunnel probe is the egress authority; gluetun's control-server
     IP is a once-per-start snapshot and only a change trigger."""
 
-    HOST = "198.51.100.10"
-    EGRESS = "203.0.113.171"
-    SNAPSHOT = "203.0.113.169"
+    HOST = PUBLIC_IPV4_HOST
+    EGRESS = PUBLIC_IPV4_EGRESS
+    SNAPSHOT = PUBLIC_IPV4_SNAPSHOT
 
     def _guard(self, tmp_path: Path, **overrides: object) -> GluetunGuard:
         return GluetunGuard(make_config(tmp_path, **overrides), FakeRunner({}))
@@ -1278,7 +1287,7 @@ class EgressAssessmentTests(unittest.TestCase):
             guard = self._guard(Path(directory))
             patches, warnings = self._probes(guard)
             self._assess(guard, patches, force_probe=True)
-            patches, more = self._probes(guard, egress="203.0.113.172")
+            patches, more = self._probes(guard, egress=PUBLIC_IPV4_ALT)
             self._assess(guard, patches, force_probe=True)
             self.assertEqual(
                 len([w for w in warnings + more if "Gluetun control server reports" in w]), 2
@@ -1361,7 +1370,7 @@ class EgressAssessmentTests(unittest.TestCase):
                 mock.patch.object(
                     guard,
                     "public_ip_via_control_server",
-                    side_effect=[self.SNAPSHOT, "203.0.113.200"],
+                    side_effect=[self.SNAPSHOT, PUBLIC_IPV4_ALT],
                 ),
                 mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
                 mock.patch.object(guard, "public_ip_via_gluetun", return_value=self.EGRESS) as p,
@@ -1400,8 +1409,8 @@ class EgressAssessmentTests(unittest.TestCase):
                 FakeRunner({}),
             )
             answers = {
-                "https://v6.example.test": b"2001:db8::1\n",
-                "https://v4.example.test": b"198.51.100.10\n",
+                "https://v6.example.test": f"{PUBLIC_IPV6_EGRESS}\n".encode(),
+                "https://v4.example.test": f"{PUBLIC_IPV4_HOST}\n".encode(),
             }
 
             class Opener:
@@ -1412,8 +1421,8 @@ class EgressAssessmentTests(unittest.TestCase):
                     return response
 
             with mock.patch.object(guard_mod.urllib.request, "build_opener", return_value=Opener()):
-                self.assertEqual(guard.public_ip(version=4), "198.51.100.10")
-                self.assertEqual(guard.public_ip(), "2001:db8::1")
+                self.assertEqual(guard.public_ip(version=4), PUBLIC_IPV4_HOST)
+                self.assertEqual(guard.public_ip(), PUBLIC_IPV6_EGRESS)
 
 
 def test_running_check_is_one_query_and_unknown_is_none(tmp_path: Path) -> None:

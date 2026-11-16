@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import ssl
+import stat
 import subprocess
 import threading
 import time
@@ -40,7 +41,7 @@ from stremioguard.config import (
     parse_public_ip,
     service_container_id,
 )
-from stremioguard.env import atomic_write_text, env_file_value
+from stremioguard.env import atomic_write_text, env_file_value, read_regular_file
 from stremioguard.preflight import (
     require_docker,
     require_matching_daemon,
@@ -50,6 +51,15 @@ from stremioguard.publishing import StackPublisher
 from stremioguard.resolver import nordvpn_endpoint_env
 
 HOME_IP_STALE_AFTER_SECONDS = 30 * 24 * 3600
+HOME_IP_MAX_BYTES = 256
+# Ordered request headers shared by the host urllib probe and the in-gluetun
+# wget probe so both send the exact same request head apart from Host.
+PROBE_REQUEST_HEADERS: tuple[tuple[str, str], ...] = (
+    ("User-Agent", "Wget/1.25.0"),
+    ("Accept", "*/*"),
+    ("Accept-Encoding", "identity"),
+    ("Connection", "close"),
+)
 # docker-compose.yml's `docker compose up` guard; it is not a protected service.
 COMPOSE_GATE_SERVICE = "use-stremio-start-instead"
 GLUETUN_PULL_TIMEOUT_SECONDS = 180
@@ -766,7 +776,7 @@ class GluetunGuard:
         active_tracker = tracker or _ProbeConnectionTracker(time.monotonic() + timeout_seconds)
         result: list[str | None] = [None]
         done = threading.Event()
-        request = urllib.request.Request(url, headers={"User-Agent": "stremio-vpn-guard/1"})
+        request = urllib.request.Request(url, headers=dict(PROBE_REQUEST_HEADERS))
 
         def _worker() -> None:
             try:
@@ -844,6 +854,7 @@ class GluetunGuard:
                         "wget",
                         "--tries=1",
                         f"--timeout={t}",
+                        *(f"--header={name}: {value}" for name, value in PROBE_REQUEST_HEADERS),
                         "-qO-",
                         url,
                     ],
@@ -1017,17 +1028,13 @@ class GluetunGuard:
         self.last_observed_ip = egress_ip
 
         egress_version = ipaddress.ip_address(egress_ip).version
+        raw_home_bytes = read_regular_file(self.config.home_ip_file, max_bytes=HOME_IP_MAX_BYTES)
         raw_home: str | None = None
-        if self.config.home_ip_file.exists():
+        if raw_home_bytes is not None:
             self._warn_if_home_ip_stale()
-            # A malformed baseline counts as missing, so it cannot stand in for a
-            # failed host probe.
-            try:
-                raw_home = parse_public_ip(
-                    self.config.home_ip_file.read_text(encoding="utf-8", errors="replace")
-                )
-            except OSError:
-                raw_home = None
+            # A malformed or non-public baseline counts as missing, so it cannot
+            # stand in for a failed host probe.
+            raw_home = parse_public_ip(raw_home_bytes.decode("utf-8", errors="replace"))
         home_ip = (
             raw_home
             if raw_home is not None and ipaddress.ip_address(raw_home).version == egress_version
@@ -1097,9 +1104,13 @@ class GluetunGuard:
         return self.public_ip_assessment(log_observation=log_observation) == PublicIPAssessment.SAFE
 
     def home_ip_age_seconds(self) -> float | None:
-        if not self.config.home_ip_file.exists():
+        try:
+            st = os.lstat(self.config.home_ip_file)
+        except OSError:
             return None
-        return max(0.0, time.time() - self.config.home_ip_file.stat().st_mtime)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return max(0.0, time.time() - st.st_mtime)
 
     def _warn_if_home_ip_stale(self) -> None:
         if self._warned_stale_home_ip:

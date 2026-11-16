@@ -125,7 +125,7 @@ def ensure_gluetun_auth_config(root_dir: Path) -> Path:
             return path
         if content == GLUETUN_AUTH_TEMPLATE:
             return path
-    atomic_write_text(path, GLUETUN_AUTH_TEMPLATE, mode=0o644)
+    atomic_write_text(path, GLUETUN_AUTH_TEMPLATE, mode=0o600)
     return path
 
 
@@ -390,7 +390,7 @@ class StackPublisher:
                     base_compose_content,
                     mode=0o600,
                 )
-        atomic_write_text(self.compose_override_file, content, mode=0o644)
+        atomic_write_text(self.compose_override_file, content, mode=0o600)
 
     def _require_valid_manifest(
         self, bundle_dir: Path, *, active_digest: str, gateway_enabled: bool

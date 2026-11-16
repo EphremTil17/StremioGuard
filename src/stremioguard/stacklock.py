@@ -18,6 +18,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from stremioguard.env import ensure_directory
+
 STACK_LOCK_NAME = "stack.lock"
 _POLL_SECONDS = 0.2
 # path -> [file descriptor, depth]. flock conflicts between two descriptors of
@@ -55,7 +57,7 @@ def stack_lock(root_dir: Path, *, wait_seconds: float = 0.0) -> Iterator[bool]:
             held[1] -= 1
         return
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path.parent)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     acquired = False
     try:

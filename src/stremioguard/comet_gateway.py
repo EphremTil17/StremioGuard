@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -179,7 +180,13 @@ class CometGatewayManager:
     def _token_lock(self) -> Iterator[None]:
         ensure_directory(self.config.state_dir)
         lock_path = self.config.tokens_file.with_suffix(".lock")
-        with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            lock_file = os.fdopen(fd, "a+", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
                 yield

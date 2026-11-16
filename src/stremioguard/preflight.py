@@ -14,6 +14,7 @@ from stremioguard.config import (
     Runner,
     docker_permission_help,
 )
+from stremioguard.env import atomic_write_text, ensure_directory
 
 _DAEMON_UNREACHABLE_MESSAGE = (
     "Docker is installed, but the daemon is not reachable from this shell. "
@@ -103,8 +104,8 @@ def require_matching_daemon(
         return
 
     if not record.exists():
-        record.parent.mkdir(parents=True, exist_ok=True)
-        record.write_text(f"{current}\n", encoding="utf-8")
+        ensure_directory(record.parent)
+        atomic_write_text(record, f"{current}\n", mode=0o600)
         return
 
     previous = record.read_text(encoding="utf-8").strip()

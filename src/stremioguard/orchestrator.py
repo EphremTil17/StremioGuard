@@ -29,7 +29,7 @@ from stremioguard.config import (
     docker_permission_help,
     parse_public_ip,
 )
-from stremioguard.env import atomic_write_text, ensure_directory
+from stremioguard.env import atomic_write_text, ensure_directory, read_regular_file
 from stremioguard.guard import (
     GluetunGuard,
     GluetunState,
@@ -45,6 +45,7 @@ app = typer.Typer(
     help="Guard Stremio behind the gluetun VPN container.",
     no_args_is_help=True,
     context_settings={"color": True},
+    pretty_exceptions_show_locals=False,
 )
 
 # Upper bound on one sleep between heartbeats; far below the unit's WatchdogSec.
@@ -71,6 +72,7 @@ TEARDOWN_LOCK_WAIT_SECONDS = 60
 # `./stremio logs` under identical lines. Eventful windows still log on the
 # regular interval.
 QUIET_SUMMARY_INTERVAL_SECONDS = 3600
+RUN_LOG_ROTATION = "10 MB"
 
 logger.remove()
 if os.environ.get("STREMIO_BACKGROUND") != "1":
@@ -80,6 +82,7 @@ if os.environ.get("STREMIO_BACKGROUND") != "1":
         "<cyan>stremio-vpn</cyan> | <level>{message}</level>",
         level="INFO",
         colorize=sys.stdout.isatty(),
+        diagnose=False,
     )
 
 
@@ -246,8 +249,13 @@ class Orchestrator:
         the lock when the process dies, however it dies.
         """
         lock_path = self.guard.config.root_dir / ".stremio" / "watchdog.instance.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_file = lock_path.open("a+")
+        ensure_directory(lock_path.parent)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            lock_file = os.fdopen(fd, "a+")
+        except BaseException:
+            os.close(fd)
+            raise
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -836,11 +844,27 @@ class Orchestrator:
         logger.info("--- Public IP (via gluetun) ---")
         logger.info(g.public_ip_via_gluetun() or "unavailable")
         logger.info("--- Home IP baseline ---")
-        age = g.home_ip_age_seconds()
-        if age is None:
+        try:
+            os.lstat(g.config.home_ip_file)
+            baseline_present = True
+        except FileNotFoundError:
+            baseline_present = False
+        except OSError:
+            baseline_present = True
+        if not baseline_present:
             logger.info("not recorded (run `./stremio record-home-ip`)")
         else:
-            logger.info(f"{int(age // 86400)} days old")
+            raw_baseline = read_regular_file(g.config.home_ip_file, max_bytes=256)
+            baseline_ip = (
+                parse_public_ip(raw_baseline.decode("utf-8", errors="replace"))
+                if raw_baseline is not None
+                else None
+            )
+            age = g.home_ip_age_seconds()
+            if baseline_ip is None or age is None:
+                logger.warning("unusable (re-run `./stremio record-home-ip`)")
+            else:
+                logger.info(f"{int(age // 86400)} days old")
         logger.info("--- Lockout ---")
         if lockout_marker_present(g.config.vpn_lockout_file):
             lockout = g.read_vpn_lockout() or {}
@@ -869,7 +893,7 @@ class Orchestrator:
         # baseline could never match it.
         ip = g.public_ip(version=4)
         if not ip:
-            raise RuntimeError("Could not determine public IPv4 address.")
+            raise RuntimeError("No IP-check service returned a public IPv4 address.")
 
         expected_vpn_ip = (
             parse_public_ip(g.config.expected_vpn_ip) or g.config.expected_vpn_ip
@@ -882,8 +906,9 @@ class Orchestrator:
                 "baseline. Disconnect any active VPN and rerun."
             )
 
-        if g.config.home_ip_file.exists():
-            previous = g.config.home_ip_file.read_text(encoding="utf-8").strip()
+        previous_bytes = read_regular_file(g.config.home_ip_file, max_bytes=256)
+        if previous_bytes is not None:
+            previous = parse_public_ip(previous_bytes.decode("utf-8", errors="replace"))
             if previous and previous != ip:
                 g.warn(f"Overwriting existing home IP baseline {previous} with {ip}.")
 
@@ -946,20 +971,25 @@ class Orchestrator:
                 )
 
 
+def _open_private_log_file(path: str | os.PathLike[str], flags: int) -> int:
+    return os.open(path, flags, 0o600)
+
+
 def configure_file_logging(config: Config) -> None:
     if not config.log_file:
         return
-    # Run logs record the home and tunnel IPs: owner-only. The directory mode
-    # also covers files the sink creates later on rotation.
+    # Run logs record the home and tunnel IPs: owner-only. The opener also
+    # covers files the sink creates later on rotation.
     ensure_directory(config.log_file.parent)
-    config.log_file.touch(mode=0o600, exist_ok=True)
     logger.add(
         config.log_file,
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | stremio-vpn | {message}",
         level="INFO",
-        rotation="10 MB",
+        rotation=RUN_LOG_ROTATION,
         retention="30 days",
         enqueue=True,
+        diagnose=False,
+        opener=_open_private_log_file,
     )
     logger.info(f"Writing run log to {config.log_file}")
 
@@ -977,7 +1007,7 @@ def _preferred_stack_lock(root_dir: Path) -> Iterator[None]:
             held = stack.enter_context(
                 stack_lock(root_dir, wait_seconds=TEARDOWN_LOCK_WAIT_SECONDS)
             )
-        except OSError as error:
+        except Exception as error:
             logger.warning(f"Could not open stack lock ({error}); proceeding with teardown anyway.")
         else:
             if not held:
@@ -1020,7 +1050,15 @@ def _run_command(
         # same stack.
         logger.warning(f"Ignoring .env for teardown: {error}")
         config = Config.from_env(root_dir, env_file=Path(os.devnull))
-    configure_file_logging(config)
+    try:
+        configure_file_logging(config)
+    except Exception as error:
+        if not teardown:
+            logger.error(f"Could not configure run log ({error}).")
+            raise typer.Exit(1) from None
+        logger.warning(
+            f"Could not configure run log ({error}); proceeding with teardown without file logging."
+        )
     guard = GluetunGuard(config, frozen=deployed and not teardown, teardown=teardown)
     orch = Orchestrator(guard)
     try:
@@ -1114,8 +1152,22 @@ def stop() -> None:
     """Stop active services."""
 
     def _stop(o: Orchestrator) -> None:
-        o.guard.require_commands()
-        if not o.guard.stop_active_services():
+        require_error: Exception | None = None
+        try:
+            o.guard.require_commands()
+        except Exception as error:
+            require_error = error
+            logger.error(str(error))
+        stopped = False
+        try:
+            stopped = o.guard.stop_active_services()
+        except Exception as error:
+            if require_error is None:
+                raise
+            logger.error(str(error))
+        if require_error is not None:
+            raise typer.Exit(1)
+        if not stopped:
             raise RuntimeError("Protected services could not be confirmed stopped.")
 
     _run_command(_stop, teardown=True, lock="preferred")

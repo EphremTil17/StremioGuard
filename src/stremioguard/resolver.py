@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -12,11 +12,15 @@ from typing import Any
 
 from loguru import logger
 
-from stremioguard.env import env_file_value
+from stremioguard.config import parse_public_ip
+from stremioguard.env import atomic_write_text, ensure_directory, env_file_value, read_regular_file
 
 RECOMMENDATIONS_API_URL = "https://api.nordvpn.com/v1/servers/recommendations"
 DEFAULT_CACHE_TTL_SECONDS = 3600.0  # 1 hour
+STALE_CACHE_MAX_AGE_SECONDS = 86400  # 24 hours
 DEFAULT_TIMEOUT_SECONDS = 8.0
+MAX_RECOMMENDATIONS_BYTES = 4 * 1024 * 1024
+CACHE_MAX_BYTES = 65536
 
 # NordVPN country name to country_id mapping for fast API filtering
 NORDVPN_COUNTRY_IDS: dict[str, int] = {
@@ -50,11 +54,14 @@ def _fetch_nordvpn_recommendations(
     }
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-        raw_body = response.read().decode("utf-8")
+        raw_bytes = response.read(MAX_RECOMMENDATIONS_BYTES + 1)
+        if len(raw_bytes) > MAX_RECOMMENDATIONS_BYTES:
+            raise ValueError("NordVPN recommendations response exceeded 4 MiB limit")
+        raw_body = raw_bytes.decode("utf-8")
         data = json.loads(raw_body)
-        if isinstance(data, list):
-            return [s for s in data if isinstance(s, dict)]
-    return []
+        if not isinstance(data, list):
+            raise ValueError("NordVPN recommendations response was not a JSON list")
+        return [s for s in data if isinstance(s, dict)]
 
 
 def _server_load(s: dict[str, Any]) -> int:
@@ -76,12 +83,17 @@ def _find_best_server(
     matching_servers: list[dict[str, Any]] = []
 
     for server in servers:
+        if not isinstance(server, dict):
+            continue
         if server.get("status") != "online":
             continue
 
-        station = str(server.get("station") or "").strip()
-        hostname = str(server.get("hostname") or "").strip()
-        if not station or not hostname:
+        raw_station = server.get("station")
+        raw_hostname = server.get("hostname")
+        if not _valid_station_ip(raw_station) or not isinstance(raw_hostname, str):
+            continue
+        hostname = raw_hostname.strip()
+        if not hostname:
             continue
 
         # Location matching
@@ -126,16 +138,66 @@ def _find_best_server(
     # Sort by lowest load
     matching_servers.sort(key=_server_load)
     best = matching_servers[0]
-    return str(best["hostname"]), str(best["station"])
+    return str(best["hostname"]).strip(), str(best["station"])
 
 
 def _valid_station_ip(station: object) -> bool:
-    if not isinstance(station, str):
-        return False
+    return isinstance(station, str) and parse_public_ip(station) == station
+
+
+def _read_cached_endpoint(
+    cache_path: Path,
+    *,
+    country_clean: str | None,
+    city_clean: str | None,
+    now: float,
+    max_age_seconds: float,
+    inclusive: bool,
+) -> tuple[str, str] | None:
+    raw = read_regular_file(cache_path, max_bytes=CACHE_MAX_BYTES)
+    if raw is None:
+        return None
     try:
-        return str(ipaddress.ip_address(station)) == station
-    except ValueError:
-        return False
+        cache_data = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(cache_data, dict):
+        return None
+
+    if cache_data.get("country") != country_clean or cache_data.get("city") != city_clean:
+        return None
+    cached_hostname = cache_data.get("hostname")
+    cached_ip = cache_data.get("ip")
+    if not isinstance(cached_hostname, str) or not cached_hostname.strip():
+        return None
+    if not isinstance(cached_ip, str):
+        return None
+
+    raw_ts = cache_data.get("timestamp")
+    if (
+        isinstance(raw_ts, bool)
+        or not isinstance(raw_ts, (int, float))
+        or not math.isfinite(raw_ts)
+    ):
+        logger.warning("Ignoring cached NordVPN endpoint: invalid timestamp.")
+        return None
+
+    age = now - float(raw_ts)
+    if age < 0:
+        logger.warning(
+            f"Ignoring cached NordVPN endpoint dated in the future (age {age / 3600:.2f} hours)."
+        )
+        return None
+    too_old = age > max_age_seconds if inclusive else age >= max_age_seconds
+    if too_old:
+        if inclusive:
+            logger.warning(f"Ignoring stale cached NordVPN endpoint (age {age / 3600:.2f} hours).")
+        return None
+
+    if not _valid_station_ip(cached_ip):
+        logger.warning("Ignoring cached NordVPN endpoint with an invalid station address.")
+        return None
+    return cached_hostname.strip(), cached_ip
 
 
 def resolve_nordvpn_endpoint(
@@ -152,28 +214,17 @@ def resolve_nordvpn_endpoint(
     city_clean = city.strip() if city else None
 
     # 1. Check cache if available and not forced
-    if cache_path and cache_path.exists() and not force_refresh:
-        try:
-            cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
-            cached_country = cache_data.get("country")
-            cached_city = cache_data.get("city")
-            cached_timestamp = float(cache_data.get("timestamp", 0.0))
-            cached_hostname = cache_data.get("hostname")
-            cached_ip = cache_data.get("ip")
-
-            age = time.time() - cached_timestamp
-            if (
-                age < max_cache_age_seconds
-                and cached_country == country_clean
-                and cached_city == city_clean
-                and cached_hostname
-                and cached_ip
-            ):
-                if _valid_station_ip(cached_ip):
-                    return str(cached_hostname), str(cached_ip)
-                logger.warning("Ignoring cached NordVPN endpoint with an invalid station address.")
-        except (json.JSONDecodeError, OSError, ValueError):
-            pass
+    if cache_path and not force_refresh:
+        cached = _read_cached_endpoint(
+            cache_path,
+            country_clean=country_clean,
+            city_clean=city_clean,
+            now=time.time(),
+            max_age_seconds=max_cache_age_seconds,
+            inclusive=False,
+        )
+        if cached is not None:
+            return cached
 
     # 2. Query live NordVPN API
     country_id = None
@@ -192,7 +243,7 @@ def resolve_nordvpn_endpoint(
             else:
                 if cache_path:
                     try:
-                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        ensure_directory(cache_path.parent)
                         cache_payload = {
                             "country": country_clean,
                             "city": city_clean,
@@ -200,31 +251,28 @@ def resolve_nordvpn_endpoint(
                             "ip": ip,
                             "timestamp": time.time(),
                         }
-                        cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
-                    except OSError as write_err:
+                        atomic_write_text(
+                            cache_path, json.dumps(cache_payload, indent=2), mode=0o600
+                        )
+                    except (OSError, RuntimeError) as write_err:
                         logger.debug(f"Failed to persist NordVPN endpoint cache: {write_err}")
                 return hostname, ip
-    except (urllib.error.URLError, json.JSONDecodeError, OSError) as err:
-        logger.warning(f"Could not fetch live NordVPN server recommendations: {err}")
+    except Exception as err:
+        detail = (
+            str(err) if isinstance(err, (urllib.error.URLError, OSError)) else type(err).__name__
+        )
+        logger.warning(f"Could not fetch live NordVPN server recommendations: {detail}")
 
-    # 3. Fall back to stale cache if available
-    if cache_path and cache_path.exists():
-        try:
-            cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
-            cached_ip = cache_data.get("ip")
-            if (
-                cache_data.get("country") == country_clean
-                and cache_data.get("city") == city_clean
-                and cache_data.get("hostname")
-                and cached_ip
-            ):
-                if _valid_station_ip(cached_ip):
-                    return str(cache_data["hostname"]), str(cached_ip)
-                logger.warning(
-                    "Ignoring stale cached NordVPN endpoint with an invalid station address."
-                )
-        except (json.JSONDecodeError, OSError):
-            pass
+    # 3. Fall back to bounded stale cache if available
+    if cache_path:
+        return _read_cached_endpoint(
+            cache_path,
+            country_clean=country_clean,
+            city_clean=city_clean,
+            now=time.time(),
+            max_age_seconds=STALE_CACHE_MAX_AGE_SECONDS,
+            inclusive=True,
+        )
 
     return None
 

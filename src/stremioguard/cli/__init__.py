@@ -31,6 +31,7 @@ __all__ = [
 APP = typer.Typer(
     help="Start and guard Stremio behind the gluetun VPN container.",
     no_args_is_help=False,
+    pretty_exceptions_show_locals=False,
 )
 COMET_APP = typer.Typer(
     help="Manage the modular Comet playback-proxy subsystem.",
@@ -53,6 +54,7 @@ logger.add(
     "<cyan>stremio</cyan> | <level>{message}</level>",
     level="INFO",
     colorize=sys.stdout.isatty(),
+    diagnose=False,
 )
 
 

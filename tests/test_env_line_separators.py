@@ -31,7 +31,13 @@ from stremioguard.config import (
     CometConfig,
 )
 from stremioguard.publishing import StackPublisher
-from tests.conftest import FakeRunner, completed, make_comet_config, write_minimal_bundle_manifest
+from tests.conftest import (
+    PUBLIC_IPV4_STATION,
+    FakeRunner,
+    completed,
+    make_comet_config,
+    write_minimal_bundle_manifest,
+)
 
 GOLDENS_PATH = Path(__file__).resolve().parent / "data" / "env_rendering_goldens.json"
 
@@ -537,14 +543,14 @@ def test_ac9b_resolver_rejects_malformed_station_from_api_and_cache(
 def test_ac9b_resolver_accepts_valid_station_ip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC-9(b) / D7: valid RFC 5737 station IP sets both endpoint keys."""
+    """AC-9(b) / D7: valid public station IP sets both endpoint keys."""
     env_path = tmp_path / ".env"
     env_path.write_text("VPN_SERVICE_PROVIDER=nordvpn\nSERVER_COUNTRIES=Canada\n", encoding="utf-8")
     cache_path = tmp_path / "cache.json"
     payload = [
         {
             "hostname": "ca1.nordvpn.com",
-            "station": "198.51.100.42",
+            "station": PUBLIC_IPV4_STATION,
             "status": "online",
             "load": 10,
             "locations": [{"country": {"name": "Canada", "city": {"name": "Toronto"}}}],
@@ -552,8 +558,8 @@ def test_ac9b_resolver_accepts_valid_station_ip(
     ]
     monkeypatch.setattr(resolver, "_fetch_nordvpn_recommendations", lambda **_kw: payload)
     assert resolver.nordvpn_endpoint_env(env_path, cache_path) == {
-        "OPENVPN_ENDPOINT_IP": "198.51.100.42",
-        "WIREGUARD_ENDPOINT_IP": "198.51.100.42",
+        "OPENVPN_ENDPOINT_IP": PUBLIC_IPV4_STATION,
+        "WIREGUARD_ENDPOINT_IP": PUBLIC_IPV4_STATION,
     }
 
 

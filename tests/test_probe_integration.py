@@ -146,8 +146,8 @@ def docker_probe_sandbox(tmp_path: Path) -> Iterator[dict[str, str]]:
             "-c",
             (
                 "printf '#!/bin/sh\\n"
-                'printf "HTTP/1.1 200 OK\\\\r\\\\nContent-Length: 13\\\\r\\\\n'
-                'Connection: close\\\\r\\\\n\\\\r\\\\n203.0.113.42\\\\n"\\n'
+                'printf "HTTP/1.1 200 OK\\\\r\\\\nContent-Length: 8\\\\r\\\\n'
+                'Connection: close\\\\r\\\\n\\\\r\\\\n8.8.8.8\\\\n"\\n'
                 "' > /h.sh && chmod +x /h.sh && exec nc -lk -p 8080 -e /h.sh"
             ),
         )
@@ -192,7 +192,7 @@ def docker_probe_sandbox(tmp_path: Path) -> Iterator[dict[str, str]]:
                 f"http://{good_name}:8080/",
                 check=False,
             )
-            if probe.returncode == 0 and "203.0.113.42" in probe.stdout:
+            if probe.returncode == 0 and "8.8.8.8" in probe.stdout:
                 break
             time.sleep(0.2)
         else:
@@ -234,7 +234,7 @@ def test_ac1_in_gluetun_probes_bound_stall_and_trickle(
     start1 = time.monotonic()
     ip1 = guard1.public_ip_via_gluetun()
     dur1 = time.monotonic() - start1
-    assert ip1 == "203.0.113.42"
+    assert ip1 == "8.8.8.8"
     assert dur1 < max_duration, f"stall+good took {dur1:.2f}s >= {max_duration}s"
     _assert_no_probe_processes(gluetun_name)
 
@@ -266,7 +266,7 @@ def test_ac1_in_gluetun_probes_bound_stall_and_trickle(
     start3 = time.monotonic()
     ip3 = guard3.public_ip_via_gluetun()
     dur3 = time.monotonic() - start3
-    assert ip3 == "203.0.113.42"
+    assert ip3 == "8.8.8.8"
     assert dur3 < max_duration, f"trickle+good took {dur3:.2f}s >= {max_duration}s"
     _assert_no_probe_processes(gluetun_name)
 

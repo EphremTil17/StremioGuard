@@ -7,6 +7,7 @@ import binascii
 import fcntl
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Mapping
 from contextlib import suppress
@@ -239,14 +240,98 @@ def write_env_settings(env_path: Path, settings: Mapping[str, str]) -> None:
         os.close(dir_fd)
 
 
+def _mkdir_parents_private(directory: Path) -> None:
+    """Create missing directories along ``directory`` at 0700, leaving existing ones."""
+    abs_dir = Path(os.path.abspath(directory))
+    parts = abs_dir.parts
+    if not parts:
+        return
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current = current / part
+        if not os.path.lexists(current):
+            try:
+                os.mkdir(current, 0o700)
+            except FileExistsError:
+                if not os.path.isdir(current):
+                    raise
+
+
 def ensure_directory(path: Path, *, mode: int = 0o700) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=mode)
-    os.chmod(path, mode)
+    """Create ``path`` (and missing parents at 0700) without following any symlink.
+
+    Refuses with ``RuntimeError`` when any existing component of
+    ``os.path.abspath(path)`` is a symlink or a non-directory, and sets the
+    leaf's mode via ``fchmod`` on an ``O_NOFOLLOW | O_DIRECTORY`` descriptor.
+    """
+    abs_path = Path(os.path.abspath(path))
+    parts = abs_path.parts
+    if not parts:
+        return
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current = current / part
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current, 0o700)
+            except FileExistsError:
+                st = os.lstat(current)
+            else:
+                continue
+        if stat.S_ISLNK(st.st_mode):
+            raise RuntimeError(f"Refusing symlinked directory component {current} for {path}.")
+        if not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError(f"Refusing non-directory path {current} for {path}.")
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(abs_path, flags)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
 
 
-def atomic_write_text(path: Path, content: str, *, mode: int = 0o644) -> None:
+def read_regular_file(path: Path, *, max_bytes: int) -> bytes | None:
+    """Read up to ``max_bytes`` from a regular file without blocking or following symlinks.
+
+    Returns ``None`` when ``path`` is missing, a symlink, not a regular file
+    (e.g. FIFO or directory), larger than ``max_bytes``, or unreadable.
+    """
+    if max_bytes < 0:
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        limit = max_bytes + 1
+        while total < limit:
+            chunk = os.read(fd, limit - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > max_bytes:
+            return None
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        with suppress(OSError):
+            os.close(fd)
+
+
+def atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
     """Write a generated file without exposing partial contents."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_parents_private(path.parent)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:

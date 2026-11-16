@@ -115,6 +115,11 @@ CONFIG_ENV_KEYS = (
 
 
 def parse_public_ip(text: str) -> str | None:
+    """Parse ``text`` as a canonical global unicast IPv4 or IPv6 address.
+
+    Unwraps ``::ffff:`` IPv4-mapped IPv6 addresses first, then rejects any
+    non-global, multicast, reserved, IPv6 site-local, or zone-suffixed address.
+    """
     candidate = text.strip()
     if not candidate:
         return None
@@ -122,8 +127,15 @@ def parse_public_ip(text: str) -> str | None:
         ip = ipaddress.ip_address(candidate)
     except ValueError:
         return None
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        return str(ip.ipv4_mapped)
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.scope_id is not None:
+            return None
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+    if not ip.is_global or ip.is_multicast or ip.is_reserved:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.is_site_local:
+        return None
     return str(ip)
 
 

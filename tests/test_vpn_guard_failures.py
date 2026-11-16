@@ -31,6 +31,10 @@ from stremioguard.config import (
 from stremioguard.guard import GluetunGuard, LockoutActiveError, PublicIPAssessment
 from stremioguard.orchestrator import Orchestrator
 from tests.conftest import (
+    PUBLIC_IPV4_EGRESS,
+    PUBLIC_IPV4_HOST,
+    PUBLIC_IPV6_EGRESS,
+    PUBLIC_IPV6_HOST,
     FakeRunner,
     completed,
     compose_args_prefix,
@@ -125,9 +129,11 @@ def test_ac2_host_probe_bounds_stall_trickle_non_utf8_and_non_address(tmp_path: 
     def good_handler(conn: socket.socket, _stop: threading.Event) -> None:
         try:
             conn.recv(1024)
-            conn.sendall(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n198.51.100.77\n"
-            )
+            body = f"{PUBLIC_IPV4_HOST}\n".encode()
+            head = (
+                f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+            ).encode()
+            conn.sendall(head + body)
         except OSError:
             pass
 
@@ -156,7 +162,7 @@ def test_ac2_host_probe_bounds_stall_trickle_non_utf8_and_non_address(tmp_path: 
             FakeRunner({}),
         )
         t0 = time.monotonic()
-        assert g_good.public_ip() == "198.51.100.77"
+        assert g_good.public_ip() == PUBLIC_IPV4_HOST
         assert time.monotonic() - t0 < 8.0
 
         # Only bad URLs -> None.
@@ -243,6 +249,7 @@ def test_ac4_hour_long_probe_timeout_outage_does_not_lock_out_and_recovers(
         "wget",
         "--tries=1",
         "--timeout=1",
+        *(f"--header={k}: {v}" for k, v in guard_mod.PROBE_REQUEST_HEADERS),
         "-qO-",
         "https://example.test/ip",
     ]
@@ -268,7 +275,7 @@ def test_ac4_hour_long_probe_timeout_outage_does_not_lock_out_and_recovers(
             if args == exec_probe:
                 if not probe_recovered["ok"]:
                     raise subprocess.TimeoutExpired(args, timeout or 3)
-                return completed(args, "203.0.113.20\n")
+                return completed(args, f"{PUBLIC_IPV4_EGRESS}\n")
             if args == list(status_stremio):
                 out = "stremio\n" if services_running["stremio"] else ""
                 return completed(args, out)
@@ -355,7 +362,7 @@ def test_ac4_hour_long_probe_timeout_outage_does_not_lock_out_and_recovers(
 
         # URL 1 recovers -> starts on first SAFE tick.
         probe_recovered["ok"] = True
-        with mock.patch.object(guard, "public_ip", return_value="198.51.100.10"):
+        with mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST):
             assert orch._tick() is True
         assert services_running["stremio"] is True
         assert list(up_stremio) in runner.calls
@@ -451,8 +458,8 @@ def test_ac5_regression_continuous_unhealthy_budget_exhausted(tmp_path: Path) ->
 
 def test_ac6_leak_matrix_same_family_and_ipv4_mapped_normalization(tmp_path: Path) -> None:
     """AC-6 (INV-4): same-family evidence and ::ffff: IPv4-mapped normalization."""
-    home = "198.51.100.10"
-    vpn_v4 = "203.0.113.20"
+    home = PUBLIC_IPV4_HOST
+    vpn_v4 = PUBLIC_IPV4_EGRESS
 
     def assess(
         *,
@@ -486,12 +493,12 @@ def test_ac6_leak_matrix_same_family_and_ipv4_mapped_normalization(tmp_path: Pat
     assert v2 == PublicIPAssessment.UNSAFE_DEFINITIVE
 
     # 3. IPv6 egress with IPv6 host probe failing and only IPv4 home -> UNKNOWN with reason
-    v3, w3 = assess(egress="2001:db8::2", host=None)
+    v3, w3 = assess(egress=PUBLIC_IPV6_EGRESS, host=None)
     assert v3 == PublicIPAssessment.UNKNOWN
     assert any("family" in w.lower() for w in w3)
 
     # 4. IPv6 egress with different IPv6 host answer -> SAFE
-    v4, _ = assess(egress="2001:db8::2", host="2001:db8::1", home_file_content=None)
+    v4, _ = assess(egress=PUBLIC_IPV6_EGRESS, host=PUBLIC_IPV6_HOST, home_file_content=None)
     assert v4 == PublicIPAssessment.SAFE
 
     # 5. IPv4 egress != home with host probe failing -> SAFE (regression)
@@ -951,9 +958,18 @@ def test_ac11_unwritable_state_dir_and_cli_failsafe_gating(
     )
     state_dir.chmod(0o500)
     try:
+        # Simulate a non-owner / read-only 0500 state dir where fchmod cannot
+        # restore write bits, matching root-owned .stremio/ on a hardened host.
         monkeypatch.setattr(orchestrator_mod, "_deployment_root", lambda: tmp_path)
         monkeypatch.setattr(guard_mod, "SubprocessRunner", lambda: runner_a)
-        with pytest.raises(typer.Exit) as excinfo:
+        with (
+            mock.patch.object(
+                env_mod.os,
+                "fchmod",
+                side_effect=PermissionError("read-only state dir"),
+            ),
+            pytest.raises(typer.Exit) as excinfo,
+        ):
             orchestrator_mod._run_command(
                 lambda o: o.fail_safe(), teardown=True, deployed=True, lock="preferred"
             )
@@ -1514,7 +1530,7 @@ def handle(raw_conn):
                 if not chunk:
                     return
                 buf += chunk
-            body = b"203.0.113.42"
+            body = b"1.1.1.1"
             hdrs = (
                 f"HTTP/1.1 200 OK\\r\\nContent-Length: {len(body)}\\r\\n"
                 "Connection: close\\r\\n\\r\\n"
@@ -1588,7 +1604,7 @@ def test_ac19_host_probe_leaves_no_threads_or_fds_across_all_trickle_phases(
             make_config(tmp_path, public_ip_timeout_seconds=1, ip_check_urls=(ok_url,)),
             FakeRunner({}),
         )
-        assert ok_guard.public_ip() == "203.0.113.42"
+        assert ok_guard.public_ip() == PUBLIC_IPV4_HOST
     finally:
         ok_proc.kill()
         ok_proc.wait(timeout=5)
@@ -1743,6 +1759,7 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
         "wget",
         "--tries=1",
         "--timeout=1",
+        *(f"--header={k}: {v}" for k, v in guard_mod.PROBE_REQUEST_HEADERS),
         "-qO-",
         "https://example.test/ip",
     ]
@@ -1779,14 +1796,14 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
                     raise self._exc
                 if args == egress_cmd:
                     self.calls.append(args)
-                    return completed(args, "203.0.113.20\n")
+                    return completed(args, f"{PUBLIC_IPV4_EGRESS}\n")
                 return super().run(
                     args, check=check, capture=capture, timeout=timeout, env=env, input=input
                 )
 
         runner = _FaultRunner(fault)
         guard = GluetunGuard(cfg, runner)
-        with mock.patch.object(guard, "public_ip", return_value="198.51.100.10"):
+        with mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST):
             assert guard.public_ip_assessment(force_probe=True) == PublicIPAssessment.SAFE
         assert control_cmd in runner.calls
         assert egress_cmd in runner.calls
@@ -1809,7 +1826,7 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
         f"    sys.stdout.buffer.write(b'-P OUTPUT DROP\\n{guard_mod.DNS_BLOCK_RULE}\\n')\n"
         "    sys.exit(0)\n"
         "if 'exec' in args:\n"
-        "    sys.stdout.buffer.write(b'203.0.113.20\\n')\n"
+        f"    sys.stdout.buffer.write(b'{PUBLIC_IPV4_EGRESS}\\n')\n"
         "    sys.exit(0)\n"
         "sys.exit(1)\n",
         encoding="utf-8",
@@ -1818,7 +1835,7 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
 
     guard_real = GluetunGuard(cfg, SubprocessRunner())
-    with mock.patch.object(guard_real, "public_ip", return_value="203.0.113.20"):
+    with mock.patch.object(guard_real, "public_ip", return_value=PUBLIC_IPV4_EGRESS):
         assert (
             guard_real.public_ip_assessment(force_probe=True)
             == PublicIPAssessment.UNSAFE_DEFINITIVE

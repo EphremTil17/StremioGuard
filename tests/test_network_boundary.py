@@ -20,7 +20,14 @@ from stremioguard import orchestrator as orchestrator_mod
 from stremioguard.config import SubprocessRunner
 from stremioguard.guard import DNS_BLOCK_RULE, GluetunGuard, GluetunState, PublicIPAssessment
 from stremioguard.orchestrator import Orchestrator
-from tests.conftest import FakeRunner, completed, compose_args_prefix, make_config
+from tests.conftest import (
+    PUBLIC_IPV4_EGRESS,
+    PUBLIC_IPV4_HOST,
+    FakeRunner,
+    completed,
+    compose_args_prefix,
+    make_config,
+)
 
 PREFIX = "sgfix8-"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -174,13 +181,15 @@ def test_ac6_dns_block_matrix_and_warning_rate_limit(
                 )
 
         guard = GluetunGuard(cfg, _CaseRunner(responses))
-        guard._verified_egress_ip = "203.0.113.20"
+        guard._verified_egress_ip = PUBLIC_IPV4_EGRESS
         guard._last_egress_probe_time = 1e12
         warnings: list[str] = []
         with (
             mock.patch.object(guard, "public_ip_via_control_server", return_value=None),
-            mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.20") as ep,
-            mock.patch.object(guard, "public_ip", return_value="198.51.100.10"),
+            mock.patch.object(
+                guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS
+            ) as ep,
+            mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST),
             mock.patch.object(guard, "warn", side_effect=warnings.append),
         ):
             verdict = guard.public_ip_assessment(force_probe=True)
@@ -266,7 +275,7 @@ def test_ac6_dns_block_matrix_and_warning_rate_limit(
     fake_docker.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
     real_guard = GluetunGuard(cfg, SubprocessRunner())
-    real_guard._verified_egress_ip = "203.0.113.20"
+    real_guard._verified_egress_ip = PUBLIC_IPV4_EGRESS
     with (
         mock.patch.object(real_guard, "public_ip_via_control_server", return_value=None),
         mock.patch.object(real_guard, "public_ip_via_gluetun") as real_ep,
@@ -313,9 +322,9 @@ def test_ac7_dns_block_identity_caching_orchestrator_and_preflight(tmp_path: Pat
     with (
         mock.patch.object(guard_mod.time, "monotonic", side_effect=lambda: clock["now"]),
         mock.patch.object(guard, "namespace_dns_block_active", return_value=True) as dns_check,
-        mock.patch.object(guard, "public_ip_via_control_server", return_value="203.0.113.10"),
-        mock.patch.object(guard, "public_ip_via_gluetun", return_value="203.0.113.10"),
-        mock.patch.object(guard, "public_ip", return_value="198.51.100.10"),
+        mock.patch.object(guard, "public_ip_via_control_server", return_value=PUBLIC_IPV4_EGRESS),
+        mock.patch.object(guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS),
+        mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST),
     ):
         for _ in range(10):
             assert guard.public_ip_assessment() == PublicIPAssessment.SAFE
@@ -371,9 +380,11 @@ def test_ac7_dns_block_identity_caching_orchestrator_and_preflight(tmp_path: Pat
         mock.patch.object(
             orch_guard, "namespace_dns_block_active", side_effect=lambda: dns_holder["active"]
         ),
-        mock.patch.object(orch_guard, "public_ip_via_control_server", return_value="203.0.113.10"),
-        mock.patch.object(orch_guard, "public_ip_via_gluetun", return_value="203.0.113.10"),
-        mock.patch.object(orch_guard, "public_ip", return_value="198.51.100.10"),
+        mock.patch.object(
+            orch_guard, "public_ip_via_control_server", return_value=PUBLIC_IPV4_EGRESS
+        ),
+        mock.patch.object(orch_guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS),
+        mock.patch.object(orch_guard, "public_ip", return_value=PUBLIC_IPV4_HOST),
         mock.patch.object(orch_guard, "stale_namespace_services", return_value=[]),
         mock.patch.object(
             orch_guard, "container_running", side_effect=lambda **_: services_up["running"]

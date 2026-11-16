@@ -11,6 +11,12 @@ from pathlib import Path
 from unittest import mock
 
 from stremioguard import resolver
+from tests.conftest import (
+    PUBLIC_IPV4_ALT,
+    PUBLIC_IPV4_EGRESS,
+    PUBLIC_IPV4_HOST,
+    PUBLIC_IPV4_STATION,
+)
 
 
 class ResolverTests(unittest.TestCase):
@@ -75,7 +81,7 @@ class ResolverTests(unittest.TestCase):
                 "country": "United States",
                 "city": "Denver",
                 "hostname": "us-cached.nordvpn.com",
-                "ip": "10.0.0.1",
+                "ip": PUBLIC_IPV4_STATION,
                 "timestamp": time.time(),
             }
             cache_path.write_text(json.dumps(cache_payload), encoding="utf-8")
@@ -85,7 +91,7 @@ class ResolverTests(unittest.TestCase):
                     country="United States", city="Denver", cache_path=cache_path
                 )
 
-            self.assertEqual(result, ("us-cached.nordvpn.com", "10.0.0.1"))
+            self.assertEqual(result, ("us-cached.nordvpn.com", PUBLIC_IPV4_STATION))
             mock_urlopen.assert_not_called()
 
     def test_resolve_nordvpn_endpoint_fetches_and_updates_cache_on_miss(self) -> None:
@@ -94,7 +100,7 @@ class ResolverTests(unittest.TestCase):
             payload = [
                 {
                     "hostname": "us1234.nordvpn.com",
-                    "station": "203.0.113.94",
+                    "station": PUBLIC_IPV4_EGRESS,
                     "status": "online",
                     "load": 11,
                     "locations": [
@@ -111,11 +117,11 @@ class ResolverTests(unittest.TestCase):
                     country="United States", city="Denver", cache_path=cache_path
                 )
 
-            self.assertEqual(result, ("us1234.nordvpn.com", "203.0.113.94"))
+            self.assertEqual(result, ("us1234.nordvpn.com", PUBLIC_IPV4_EGRESS))
             self.assertTrue(cache_path.exists())
             saved = json.loads(cache_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["hostname"], "us1234.nordvpn.com")
-            self.assertEqual(saved["ip"], "203.0.113.94")
+            self.assertEqual(saved["ip"], PUBLIC_IPV4_EGRESS)
 
     def test_resolve_nordvpn_endpoint_falls_back_to_stale_cache_on_network_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -124,8 +130,8 @@ class ResolverTests(unittest.TestCase):
                 "country": "United States",
                 "city": "Denver",
                 "hostname": "us-stale.nordvpn.com",
-                "ip": "10.0.0.2",
-                "timestamp": time.time() - 100000,  # expired
+                "ip": PUBLIC_IPV4_ALT,
+                "timestamp": time.time() - 7200,  # expired past 1h TTL, within 24h cap
             }
             cache_path.write_text(json.dumps(cache_payload), encoding="utf-8")
 
@@ -136,7 +142,7 @@ class ResolverTests(unittest.TestCase):
                     country="United States", city="Denver", cache_path=cache_path
                 )
 
-            self.assertEqual(result, ("us-stale.nordvpn.com", "10.0.0.2"))
+            self.assertEqual(result, ("us-stale.nordvpn.com", PUBLIC_IPV4_ALT))
 
     def test_resolve_nordvpn_endpoint_returns_none_when_no_match_and_no_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -165,11 +171,15 @@ class EndpointEnvTests(unittest.TestCase):
             with mock.patch.object(
                 resolver,
                 "resolve_nordvpn_endpoint",
-                return_value=("ca1.nordvpn.com", "198.51.100.4"),
+                return_value=("ca1.nordvpn.com", PUBLIC_IPV4_HOST),
             ) as resolve:
                 result = resolver.nordvpn_endpoint_env(env, Path(directory) / "cache.json")
         self.assertEqual(
-            result, {"OPENVPN_ENDPOINT_IP": "198.51.100.4", "WIREGUARD_ENDPOINT_IP": "198.51.100.4"}
+            result,
+            {
+                "OPENVPN_ENDPOINT_IP": PUBLIC_IPV4_HOST,
+                "WIREGUARD_ENDPOINT_IP": PUBLIC_IPV4_HOST,
+            },
         )
         self.assertEqual(resolve.call_args.kwargs["country"], "Canada")
 

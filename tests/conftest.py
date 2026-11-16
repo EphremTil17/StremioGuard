@@ -11,6 +11,15 @@ import pytest
 from stremioguard.comet_gateway import CometGatewayConfig
 from stremioguard.config import CometConfig, Config
 
+# Well-known public anycast DNS resolver addresses for tests (D3).
+PUBLIC_IPV4_HOST = "1.1.1.1"
+PUBLIC_IPV4_EGRESS = "8.8.8.8"
+PUBLIC_IPV4_ALT = "9.9.9.9"
+PUBLIC_IPV4_SNAPSHOT = "8.8.4.4"
+PUBLIC_IPV4_STATION = "1.0.0.1"
+PUBLIC_IPV6_HOST = "2606:4700:4700::1111"
+PUBLIC_IPV6_EGRESS = "2001:4860:4860::8888"
+
 # Deployment paths that modules bind at import time (`from ...context import
 # ROOT_DIR`), so patching the defining module alone would not reach them.
 _SANDBOXED_PATHS = {
