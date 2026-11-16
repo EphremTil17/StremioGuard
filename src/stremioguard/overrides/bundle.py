@@ -54,11 +54,21 @@ class SkippedOverride:
 SPECS = [
     OverrideSpec(
         name="api_app",
-        feature="hardened API key management in request logs",
+        feature="hardened API key management and response guard installation",
         container_path="/app/comet/api/app.py",
         output_name="app.py",
         requirement=Requirement.REQUIRED,
         render=lambda repo_dir, ctx: render_api_app_override(repo_dir),
+    ),
+    OverrideSpec(
+        name="response_guard",
+        feature="response-boundary P2P filter and torznab block",
+        container_path="/app/comet/stremioguard_response_guard.py",
+        output_name="stremioguard_response_guard.py",
+        requirement=Requirement.REQUIRED,
+        render=lambda repo_dir, ctx: (
+            Path(__file__).with_name("response_guard.py").read_text(encoding="utf-8")
+        ),
     ),
     OverrideSpec(
         name="logger",
@@ -245,9 +255,31 @@ def write_override_bundle(
             if target_path.exists():
                 target_path.unlink()
 
-    # Create and write manifest atomically
+    # Log applied/skipped summary
+    for name in applied_names:
+        logger.info(f"Applied patch: {name}")
+
+    for s in skipped:
+        logger.warning(f"Skipped patch '{s.name}' ({s.feature}): {s.reason}")
+
+    manifest_path = state_dir / "bundle-manifest.json"
+    # Enforce requirement validation before writing the manifest so a failed
+    # render never leaves a bundle-manifest.json on disk.
+    for s in skipped:
+        spec = next(sp for sp in SPECS if sp.name == s.name)
+        is_required = spec.requirement == Requirement.REQUIRED or (
+            gateway_enabled and spec.requirement == Requirement.REQUIRED_WHEN_GATEWAY
+        )
+        if is_required:
+            manifest_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Required patch '{spec.name}' failed to apply: {s.reason}")
+
     if any(spec.name == "media_search" for spec in SPECS):
-        _validate_rtn_rank_display_contract(state_dir)
+        try:
+            _validate_rtn_rank_display_contract(state_dir)
+        except BaseException:
+            manifest_path.unlink(missing_ok=True)
+            raise
 
     manifest = {
         "image_digest": image_digest,
@@ -262,21 +294,4 @@ def write_override_bundle(
         "skipped": [{"name": s.name, "reason": s.reason} for s in skipped],
         "outputs": outputs,
     }
-    manifest_path = state_dir / "bundle-manifest.json"
     atomic_write_text(manifest_path, json.dumps(manifest, indent=2) + "\n", mode=0o644)
-
-    # Log applied/skipped summary
-    for name in applied_names:
-        logger.info(f"Applied patch: {name}")
-
-    for s in skipped:
-        logger.warning(f"Skipped patch '{s.name}' ({s.feature}): {s.reason}")
-
-    # Enforce requirement validation
-    for s in skipped:
-        spec = next(sp for sp in SPECS if sp.name == s.name)
-        is_required = spec.requirement == Requirement.REQUIRED or (
-            gateway_enabled and spec.requirement == Requirement.REQUIRED_WHEN_GATEWAY
-        )
-        if is_required:
-            raise RuntimeError(f"Required patch '{spec.name}' failed to apply: {s.reason}")

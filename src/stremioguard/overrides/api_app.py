@@ -6,13 +6,22 @@ from pathlib import Path
 
 from stremioguard.overrides._patching import replace_first_matching
 
+_GUARD_INSTALL_SNIPPET = (
+    "# StremioGuard: enforce P2P stripping and torznab blocking at the response boundary.\n"
+    "from comet.stremioguard_response_guard import (\n"
+    "    StremioGuardResponseGuard as _StremioGuardResponseGuard,\n"
+    ")  # noqa: E402\n"
+    "app.add_middleware(_StremioGuardResponseGuard)\n"
+)
+
 
 def render_api_app_override(repo_dir: Path) -> str:
     """Log the matched route template instead of the concrete request path.
 
     Addon paths embed configuration parameters. Upstream's own `_metrics_route`
     reduces a request to its route template with token parameters abstracted,
-    preserving endpoint observability while hardening API key management.
+    preserving endpoint observability while hardening API key management. Also
+    installs `StremioGuardResponseGuard` as the outermost user middleware.
     """
     source_file = repo_dir / "comet" / "api" / "app.py"
     if not source_file.exists():
@@ -23,8 +32,14 @@ def render_api_app_override(repo_dir: Path) -> str:
             "Unable to apply API route template override for API key management hardening; "
             "Comet no longer defines _metrics_route."
         )
+    fastapi_lines = [line for line in content.splitlines() if line.startswith("app = FastAPI(")]
+    if len(fastapi_lines) != 1:
+        raise RuntimeError(
+            "Unable to install StremioGuardResponseGuard; expected exactly one "
+            f"`app = FastAPI(` line, found {len(fastapi_lines)}."
+        )
 
-    return replace_first_matching(
+    patched = replace_first_matching(
         content,
         (
             (
@@ -37,3 +52,8 @@ def render_api_app_override(repo_dir: Path) -> str:
             "Comet's request log line has changed."
         ),
     )
+    if _GUARD_INSTALL_SNIPPET not in patched:
+        if patched and not patched.endswith("\n"):
+            patched += "\n"
+        patched = f"{patched}\n{_GUARD_INSTALL_SNIPPET}"
+    return patched

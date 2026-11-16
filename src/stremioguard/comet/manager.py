@@ -187,6 +187,13 @@ print(response.read().decode())
 STREMTHRU_REQUIRED_ROUTE = "/v0/store/magnets/check"
 
 
+def build_postgres_database_url(password: str, *, user: str = "comet") -> str:
+    """Build Comet's PostgreSQL URL with scheme and percent-encoded credentials."""
+    encoded_user = urllib.parse.quote(user, safe="")
+    encoded_password = urllib.parse.quote(password, safe="")
+    return f"postgresql://{encoded_user}:{encoded_password}@127.0.0.1:5432/comet"
+
+
 class CometManager:
     def __init__(self, config: CometConfig, runner: Runner | None = None) -> None:
         self.config = config
@@ -360,7 +367,8 @@ class CometManager:
         api_key = self.config.default_debrid_apikey or ""
         entries = (
             ("DATABASE_TYPE", "postgresql"),
-            ("DATABASE_URL", f"comet:{self._resolve_postgres_password()}@127.0.0.1:5432/comet"),
+            ("DATABASE_URL", build_postgres_database_url(self._resolve_postgres_password())),
+            ("DISABLE_TORRENT_STREAMS", "True"),
             ("PUBLIC_BASE_URL", public_base_url),
             ("ADMIN_DASHBOARD_PASSWORD", admin_password),
             ("CONFIGURE_PAGE_PASSWORD", configure_password),
@@ -414,10 +422,13 @@ class CometManager:
 
     def _managed_patch_fingerprint(self) -> str:
         digest = hashlib.sha256()
-        override_root = Path(__file__).resolve().parent.parent / "overrides"
-        project_root = override_root.parent.parent
+        package_root = Path(__file__).resolve().parent.parent
+        override_root = package_root / "overrides"
+        project_root = package_root.parent
         files = sorted(override_root.rglob("*.py")) + [
-            Path(__file__).resolve().parent.parent / "metadata.py"
+            package_root / "metadata.py",
+            package_root / "comet" / "validation.py",
+            package_root / "comet" / "smoke_probe.py",
         ]
         for path in files:
             if not path.is_file():

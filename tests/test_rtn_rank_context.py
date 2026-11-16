@@ -236,7 +236,10 @@ class RankContextOverrideTests(unittest.TestCase):
                 pack_backed=torrent.get("packBacked", False),
             )
 """
-            stream_file.write_text(STREAM_SOURCE + native_calls, encoding="utf-8")
+            head = STREAM_SOURCE.split("        for service in debrid_services:\n", 1)[0]
+            marker = "            the_stream = {\n"
+            tail = marker + STREAM_SOURCE.split(marker, 1)[1]
+            stream_file.write_text(head + native_calls + tail, encoding="utf-8")
 
             rendered = render_stream_override(root)
 

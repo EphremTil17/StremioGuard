@@ -49,7 +49,7 @@ Each patch is managed as a declarative spec with an explicit requirement class:
 
 | Patch Name | Feature / Purpose | Requirement Class | Degraded Mode (If Failed) |
 |------------|-------------------|-------------------|---------------------------|
-| `stream` | P2P stream block, amber uncached marker, TV-readable stream naming, gateway playback URLs, and RTN rank display | `REQUIRED` | Hard failure in every deployment: it carries the P2P block, a VPN guarantee, and is a required half of the current RTN display contract. |
+| `stream` | P2P stream block (structural second layer via `_assert_p2p_blocked`), amber uncached marker, TV-readable stream naming, gateway playback URLs, and RTN rank display | `REQUIRED` | Hard failure in every deployment: it carries the inner `stream.py` P2P block (`_assert_p2p_blocked`), a structural second layer behind `response_guard`, and is a required half of the current RTN display contract. |
 | `media_search` | Carries RTN scores to stream rendering | `REQUIRED` | Hard failure; score display cannot silently disappear. |
 | `config` | Protected gateway `/configure` credentials integration | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; the gateway deployment is not published. |
 | `template` | Configure page installer link customization | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; the gateway deployment is not published. |
@@ -57,8 +57,9 @@ Each patch is managed as a declarative spec with an explicit requirement class:
 | `filtering` | Permissively filters branded/multilingual titles | `OPTIONAL` | Falls back to stock strict title matching. |
 | `formatter` | Curated TV-safe emoji/text layout | `OPTIONAL` | Stream labels default to upstream format layout. |
 | `orchestration` | Preserves episode-pack season priority and badges | `OPTIONAL` | Season pack items are dropped or ranked below single files. |
-| `logger` | Secret redaction in the startup log: upstream's `censor()` printed the first half of every secret (the TorBox key, admin and configure-page passwords, database credentials) and the protected API prefix showed ten characters of the public API token. Both now print a fixed `********` | `REQUIRED` | Hard failure; a candidate whose masking code moved is rejected rather than allowed to leak. |
-| `api_app` | Hardened API key management: logs each request's route template (`/s/{token}/{b64config}/…`, via upstream's `_metrics_route`) instead of the raw path containing user credentials | `REQUIRED` | Hard failure; a drifted candidate is rejected to enforce hardened API key management. |
+| `logger` | Secret redaction in the startup log: upstream's `censor()` printed the first half of every secret (the TorBox key, admin and configure-page passwords, database credentials), `censor_url()` masked only URLs containing `://`, and the protected API prefix showed ten characters of the public API token. `censor()` and the token preview now print `********`, `censor_url()` masks userinfo with or without a scheme, and `DATABASE_URL` always carries the `postgresql://` scheme | `REQUIRED` | Hard failure; a candidate whose masking code moved is rejected rather than allowed to leak. |
+| `api_app` | Hardened API key management and response guard installation: logs each request's route template (`/s/{token}/{b64config}/…`, via upstream's `_metrics_route`) instead of the raw path containing user credentials, and installs `StremioGuardResponseGuard` as the outermost user middleware on `app` | `REQUIRED` | Hard failure; a drifted candidate or missing `app = FastAPI(` line is rejected so the guard cannot be silently omitted. |
+| `response_guard` | Response-boundary P2P filter and torznab block (`StremioGuardResponseGuard` pure-ASGI middleware): enforces that no top-level JSON `streams` list leaves Comet with a P2P entry (`infoHash` or `magnet:` `url`/`externalUrl`) and answers every request with a `torznab` path segment with 404 (alongside `DISABLE_TORRENT_STREAMS=True`) | `REQUIRED` | Hard failure; Comet cannot run without the response-boundary guard mounted. |
 
 ### Canary & PR Flow for Maintainers
 
@@ -70,10 +71,14 @@ an automated validation pipeline:
    digest of `:latest` against the lock's `tested_digest`.
 2. **Automated Validation:** If a new digest is detected, the job runs
    `python -m stremioguard.comet.validate` to extract, patch, compile, and
-   smoke-import the entire patch suite. The validator force-enables every
-   feature (gateway on, episode packs on) so `tested_digest` vouches for all
-   deployment shapes, and any skipped patch — even an optional one — fails
-   the run as upstream drift.
+   import-smoke-test the entire patch suite inside the candidate image. The
+   import-smoke stage imports every patched module, scans all nested code
+   objects for undefined globals/names, and drives the real `app` through
+   ASGI to prove `StremioGuardResponseGuard` is the outermost middleware,
+   strips P2P entries from JSON `streams` lists, and blocks torznab with 404.
+   The validator force-enables every feature (gateway on, episode packs on)
+   so `tested_digest` vouches for all deployment shapes, and any skipped patch
+   — even an optional one — fails the run as upstream drift.
 3. **Feedback Actions:**
    - **Pass:** The canary opens an automated PR bumping `tested_digest` in
      `vendor/comet.lock.json`, embedding the JSON validation report.
@@ -98,6 +103,7 @@ The generated files currently include:
 - `config.py`
 - `index.html`
 - `app.py`
+- `stremioguard_response_guard.py`
 - `logger.py`
 
 ## Current Patch Logic
@@ -158,10 +164,13 @@ Purpose:
   text on any client, so this glyph is the nearest thing to an amber row;
   cached entries are unchanged
 - never offer direct-torrent (P2P) streams: Stremio plays those with the
-  client device's own torrent engine, outside the VPN. The patch forces
-  Comet's torrent switch off whatever the addon configuration asks for, and
-  the stream patch is `REQUIRED` in every deployment so a Comet update that
-  moves that switch is rejected
+  client device's own torrent engine, outside the VPN. Torznab is disabled
+  (`DISABLE_TORRENT_STREAMS=True` and 404 at `response_guard`), and
+  `response_guard` (`StremioGuardResponseGuard`) enforces P2P removal at
+  Comet's ASGI response boundary for every top-level JSON `streams` list.
+  In `stream.py`, forcing `enable_torrent = False` and checking it with
+  `_assert_p2p_blocked` acts as a structural second layer; both `stream` and
+  `response_guard` are `REQUIRED` in every deployment
 
 Approach:
 

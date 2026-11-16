@@ -38,17 +38,29 @@ class ContainerPathToModuleTests(unittest.TestCase):
         self.assertIsNone(container_path_to_module("/app/comet/templates/index.html"))
 
 
-def _runner_with_entrypoint(entrypoint: str) -> mock.Mock:
-    """Runner that answers the image-inspect probe, then succeeds."""
+def _runner_with_entrypoint(
+    entrypoint: str,
+    *,
+    smoke_stdout: str = 'STREMIOGUARD-SMOKE-REPORT {"ok": true, "findings": []}\n',
+    smoke_stderr: str = "",
+    smoke_returncode: int = 0,
+) -> mock.Mock:
+    """Runner that answers the image-inspect probe, then returns smoke output."""
     runner = mock.Mock()
 
     def run(args: list[str], **kwargs: object):
         if args[:3] == ["docker", "image", "inspect"]:
             return completed(args, entrypoint, "")
-        return completed(args, "", "")
+        return completed(args, smoke_stdout, smoke_stderr, returncode=smoke_returncode)
 
     runner.run.side_effect = run
     return runner
+
+
+_GUARD_OUTPUTS = {
+    "app.py": "/app/comet/api/app.py",
+    "stremioguard_response_guard.py": "/app/comet/stremioguard_response_guard.py",
+}
 
 
 class ImagePythonCommandTests(unittest.TestCase):
@@ -79,6 +91,7 @@ class ImportSmokeTestTests(unittest.TestCase):
     def test_passes_and_mounts_every_python_output(self) -> None:
         runner = _runner_with_entrypoint('["uv","run","python","-m","comet.main"]')
         outputs = {
+            **_GUARD_OUTPUTS,
             "stream.py": "/app/comet/api/endpoints/stream.py",
             "index.html": "/app/comet/templates/index.html",
         }
@@ -89,27 +102,37 @@ class ImportSmokeTestTests(unittest.TestCase):
         args = runner.run.call_args.args[0]
         self.assertEqual(args[:5], ["docker", "run", "--rm", "--network", "none"])
         self.assertEqual(args[args.index("--entrypoint") + 1], "uv")
-        # Only the .py output is bind-mounted; the template is not a module.
-        self.assertIn("-v", args)
-        mount_index = args.index("-v")
-        self.assertEqual(
-            args[mount_index + 1],
+        # Only .py outputs are bind-mounted; the template is not a module.
+        self.assertIn(
             f"{Path('/bundle') / 'stream.py'}:/app/comet/api/endpoints/stream.py:ro",
+            args,
         )
+        guard_mount = (
+            f"{Path('/bundle') / 'stremioguard_response_guard.py'}"
+            ":/app/comet/stremioguard_response_guard.py:ro"
+        )
+        self.assertIn(guard_mount, args)
         self.assertNotIn("index.html", " ".join(args))
         # The interpreter's remaining argv follows the image reference.
         image_index = args.index("g0ldyy/comet@sha256:abc")
-        self.assertEqual(args[image_index + 1 : image_index + 3], ["run", "python"])
-        # The import statement only references the Python module, not the template.
-        script = args[-1]
-        self.assertEqual(script, "import comet.api.endpoints.stream")
+        self.assertEqual(args[image_index + 1 : image_index + 4], ["run", "python", "-c"])
+        # The probe source is passed via -c, followed by the sorted Python module names.
+        self.assertIn("STREMIOGUARD-SMOKE-REPORT", args[image_index + 4])
+        self.assertEqual(
+            args[image_index + 5 :],
+            [
+                "comet.api.app",
+                "comet.api.endpoints.stream",
+                "comet.stremioguard_response_guard",
+            ],
+        )
 
     def test_uses_bare_python_on_images_without_uv(self) -> None:
         runner = _runner_with_entrypoint('["python","-m","comet.main"]')
         result = import_smoke_test(
             runner,
             "g0ldyy/comet@sha256:abc",
-            {"stream.py": "/app/comet/api/endpoints/stream.py"},
+            {**_GUARD_OUTPUTS, "stream.py": "/app/comet/api/endpoints/stream.py"},
             Path("/bundle"),
         )
         self.assertEqual(result["status"], "passed")
@@ -127,7 +150,8 @@ class ImportSmokeTestTests(unittest.TestCase):
             {"index.html": "/app/comet/templates/index.html"},
             Path("."),
         )
-        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("/app/comet/api/app.py", str(result["detail"]))
         runner.run.assert_not_called()
 
     def test_timeout_expired_reports_failure_instead_of_raising(self) -> None:
@@ -144,7 +168,7 @@ class ImportSmokeTestTests(unittest.TestCase):
         result = import_smoke_test(
             runner,
             "g0ldyy/comet@sha256:abc",
-            {"stream.py": "/app/comet/api/endpoints/stream.py"},
+            {**_GUARD_OUTPUTS, "stream.py": "/app/comet/api/endpoints/stream.py"},
             Path("/bundle"),
         )
         self.assertEqual(result["status"], "failed")
@@ -158,11 +182,161 @@ class ImportSmokeTestTests(unittest.TestCase):
         result = import_smoke_test(
             runner,
             "g0ldyy/comet@sha256:abc",
-            {"stream.py": "/app/comet/api/endpoints/stream.py"},
+            {**_GUARD_OUTPUTS, "stream.py": "/app/comet/api/endpoints/stream.py"},
             Path("/bundle"),
         )
         self.assertEqual(result["status"], "failed")
         self.assertIn("fastapi", str(result["detail"]))
+
+    def test_ac5_nonzero_exit_with_report_surfaces_findings(self) -> None:
+        runner = _runner_with_entrypoint(
+            '["python","-m","comet.main"]',
+            smoke_stdout=(
+                'STREMIOGUARD-SMOKE-REPORT {"ok": false, '
+                '"findings": ["stream probe failed: bad", "torznab probe failed: 200"]}\n'
+            ),
+            smoke_returncode=1,
+        )
+        result = import_smoke_test(
+            runner, "g0ldyy/comet@sha256:abc", _GUARD_OUTPUTS, Path("/bundle")
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("stream probe failed: bad", str(result["detail"]))
+        self.assertIn("torznab probe failed: 200", str(result["detail"]))
+
+    def test_ac5_zero_exit_without_report_or_malformed_or_ok_false_fails(self) -> None:
+        for stdout in (
+            "",
+            "just some log line\n",
+            "STREMIOGUARD-SMOKE-REPORT {not-json}\n",
+            'STREMIOGUARD-SMOKE-REPORT {"ok": false, "findings": ["undefined name"]}\n',
+        ):
+            runner = _runner_with_entrypoint(
+                '["python","-m","comet.main"]',
+                smoke_stdout=stdout,
+                smoke_stderr="stderr diagnostic tail",
+                smoke_returncode=0,
+            )
+            result = import_smoke_test(
+                runner, "g0ldyy/comet@sha256:abc", _GUARD_OUTPUTS, Path("/bundle")
+            )
+            self.assertEqual(result["status"], "failed", msg=stdout)
+
+    def test_ac5_missing_guard_outputs_fail_without_running_docker(self) -> None:
+        for outputs in (
+            {"app.py": "/app/comet/api/app.py"},
+            {"stremioguard_response_guard.py": "/app/comet/stremioguard_response_guard.py"},
+        ):
+            runner = mock.Mock()
+            result = import_smoke_test(runner, "g0ldyy/comet@sha256:abc", outputs, Path("/bundle"))
+            self.assertEqual(result["status"], "failed")
+            runner.run.assert_not_called()
+
+
+class UndefinedNameScanTests(unittest.TestCase):
+    """AC-6: host tests of smoke_probe.scan_module_undefined_names."""
+
+    def test_ac6_reports_real_undefined_names_and_allows_valid_patterns(self) -> None:
+        import importlib
+        import secrets
+
+        from stremioguard.comet.smoke_probe import scan_module_undefined_names
+
+        with tempfile.TemporaryDirectory() as directory:
+            pkg_dir = Path(directory)
+            helper_name = f"sg_helper_{secrets.token_hex(4)}"
+            target_name = f"sg_target_{secrets.token_hex(4)}"
+
+            (pkg_dir / f"{helper_name}.py").write_text("STAR_IMPORTED = 42\n", encoding="utf-8")
+            target_file = pkg_dir / f"{target_name}.py"
+            target_file.write_text(
+                f"""\
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from {helper_name} import *
+
+if TYPE_CHECKING:
+    from typing import Any as AnnotationOnlyType
+
+try:
+    from nonexistent_optional_pkg import OptionalThing
+except ImportError:
+    OptionalThing = None
+
+
+def init_global():
+    global _assigned_elsewhere
+    _assigned_elsewhere = 123
+
+
+def read_allowed():
+    return (
+        len([1, 2]),
+        _assigned_elsewhere,
+        OptionalThing,
+        STAR_IMPORTED,
+    )
+
+
+def annotated_fn(x: AnnotationOnlyType) -> AnnotationOnlyType:
+    return x
+
+
+class SampleClass:
+    attr_a = 10
+    attr_b = attr_a + 1
+    annotated_attr: int = attr_b
+
+    def method_bad(self):
+        return missing_in_method
+
+
+def bad_func():
+    return missing_in_func
+
+
+def outer_func():
+    def inner_func():
+        return missing_in_nested
+    return inner_func
+
+
+bad_lambda = lambda: missing_in_lambda
+
+
+def comp_func():
+    return [missing_in_comp for _ in range(1)]
+""",
+                encoding="utf-8",
+            )
+
+            sys.path.insert(0, str(pkg_dir))
+            try:
+                module = importlib.import_module(target_name)
+                findings = scan_module_undefined_names(module)
+            finally:
+                sys.path.remove(str(pkg_dir))
+                sys.modules.pop(target_name, None)
+                sys.modules.pop(helper_name, None)
+
+            joined = "\n".join(findings)
+            self.assertEqual(len(findings), 5, msg=joined)
+            for expected_name, expected_code in (
+                ("missing_in_method", "method_bad"),
+                ("missing_in_func", "bad_func"),
+                ("missing_in_nested", "inner_func"),
+                ("missing_in_lambda", "<lambda>"),
+                ("missing_in_comp", "comp_func"),
+            ):
+                matching = [
+                    f
+                    for f in findings
+                    if expected_name in f and str(target_file) in f and expected_code in f
+                ]
+                self.assertEqual(len(matching), 1, msg=f"missing {expected_name} in {joined}")
+                # Must include a line number after `target_file:`.
+                self.assertRegex(matching[0], rf"{target_file}:\d+")
 
 
 def _mock_runner(*responses: object) -> mock.Mock:

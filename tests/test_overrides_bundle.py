@@ -140,6 +140,7 @@ class TestOverridesBundle(unittest.TestCase):
                 comet_cfg,
                 outputs={
                     "app.py": "/app/comet/api/app.py",
+                    "stremioguard_response_guard.py": "/app/comet/stremioguard_response_guard.py",
                     "logger.py": "/app/comet/core/logger.py",
                     "formatting.py": "/app/comet/utils/formatting.py",
                     "stream.py": "/app/comet/api/endpoints/stream.py",
@@ -150,7 +151,7 @@ class TestOverridesBundle(unittest.TestCase):
                     "patch_fingerprint": "fp123",
                     "format_style": "emoji",
                     "patch_episode_pack": False,
-                    "applied": ["formatter", "stream", "media_search"],
+                    "applied": ["response_guard", "formatter", "stream", "media_search"],
                     "skipped": [],
                 },
             )
@@ -630,13 +631,23 @@ class RenderApiAppOverrideTests(unittest.TestCase):
 
     def test_logged_path_carries_no_token_or_config(self) -> None:
         # Execute the patched logger against a real addon path shape.
+        import sys
+        import types
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_required_comet_sources(root)
             rendered = render_api_app_override(root)
 
+        comet_pkg = types.ModuleType("comet")
+        guard_mod = types.ModuleType("comet.stremioguard_response_guard")
+        guard_mod.StremioGuardResponseGuard = type("StremioGuardResponseGuard", (), {})  # type: ignore[attr-defined]
         namespace: dict[str, object] = {}
-        exec(compile(rendered, "app.py", "exec"), namespace)
+        with mock.patch.dict(
+            sys.modules,
+            {"comet": comet_pkg, "comet.stremioguard_response_guard": guard_mod},
+        ):
+            exec(compile(rendered, "app.py", "exec"), namespace)
         route = mock.Mock(path="/s/secret-token/{b64config}/playback/{hash}")
         request = mock.Mock()
         request.scope = {"route": route}
@@ -677,3 +688,148 @@ class RenderApiAppOverrideTests(unittest.TestCase):
         spec = next(spec for spec in SPECS if spec.name == "api_app")
         self.assertEqual(spec.requirement, Requirement.REQUIRED)
         self.assertEqual(spec.container_path, "/app/comet/api/app.py")
+
+
+class Ac3ResponseGuardRenderAndMountTests(unittest.TestCase):
+    """AC-3: rendering app.py guard install, response_guard spec, and publisher mount."""
+
+    def test_ac3_app_override_installs_guard_at_top_level_and_is_idempotent(self) -> None:
+        import ast
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_required_comet_sources(root)
+            rendered = render_api_app_override(root)
+
+            # Re-rendering its own output must not append twice.
+            write_comet_api_app(root, rendered)
+            self.assertEqual(render_api_app_override(root), rendered)
+
+        tree = ast.parse(rendered)
+        self.assertGreaterEqual(len(tree.body), 2)
+        last_two = tree.body[-2:]
+        assert isinstance(last_two[0], ast.ImportFrom)
+        self.assertEqual(last_two[0].module, "comet.stremioguard_response_guard")
+        assert isinstance(last_two[1], ast.Expr)
+        call = last_two[1].value
+        assert isinstance(call, ast.Call)
+        assert isinstance(call.func, ast.Attribute)
+        self.assertEqual(call.func.attr, "add_middleware")
+
+    def test_ac3_zero_or_two_fastapi_lines_raise_runtime_error(self) -> None:
+        cases = (
+            "# no fastapi app\n",
+            'app = FastAPI(title="1")\napp = FastAPI(title="2")\n',
+        )
+        for replacement in cases:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_comet_api_app(
+                    root,
+                    COMET_API_APP_SOURCE.replace('app = FastAPI(title="Comet")\n', replacement),
+                )
+                with self.assertRaises(RuntimeError):
+                    render_api_app_override(root)
+
+    def test_ac3_response_guard_spec_required_and_mounted_read_only(self) -> None:
+        from stremioguard.overrides.bundle import required_output_names
+
+        spec = next(sp for sp in SPECS if sp.name == "response_guard")
+        self.assertEqual(spec.requirement, Requirement.REQUIRED)
+        self.assertEqual(spec.output_name, "stremioguard_response_guard.py")
+        self.assertEqual(spec.container_path, "/app/comet/stremioguard_response_guard.py")
+        for gateway_enabled in (False, True):
+            self.assertIn(
+                "stremioguard_response_guard.py",
+                required_output_names(gateway_enabled=gateway_enabled),
+            )
+
+        guard_source = (
+            Path(__file__).resolve().parent.parent
+            / "src"
+            / "stremioguard"
+            / "overrides"
+            / "response_guard.py"
+        ).read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text(
+                "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_ENABLED=1\nCOMET_ENABLED=1\n",
+                encoding="utf-8",
+            )
+            comet_cfg = make_comet_config(root, enabled=True)
+            record_test_digest(comet_cfg.state_dir)
+            bundle_dir = write_bundle(comet_cfg)
+            rendered = spec.render(root, mock.Mock())
+            self.assertEqual(rendered, guard_source)
+
+            pub = StackPublisher(root)
+            with (
+                mock.patch("stremioguard.publishing.CometConfig.from_env", return_value=comet_cfg),
+                mock.patch(
+                    "stremioguard.publishing.CometGatewayConfig.from_env",
+                    return_value=make_comet_gateway_config(root, enabled=False),
+                ),
+            ):
+                pub.publish()
+            override_content = pub.compose_override_file.read_text(encoding="utf-8")
+            expected_mount = (
+                f"- {bundle_dir / 'stremioguard_response_guard.py'}"
+                ":/app/comet/stremioguard_response_guard.py:ro"
+            )
+            self.assertIn(expected_mount, override_content)
+
+
+class Ac10PatchHelpersTests(unittest.TestCase):
+    """AC-10: replace_first_matching and write_override_bundle manifest cleanup."""
+
+    def test_ac10_replacement_in_comment_still_patches_remaining_anchor(self) -> None:
+        from stremioguard.overrides._patching import replace_first_matching
+
+        out = replace_first_matching(
+            "# note: NEW_VAL\ndef foo():\n    x = OLD_VAL\n",
+            (("OLD_VAL", "NEW_VAL"),),
+            error="err",
+        )
+        self.assertEqual(out, "# note: NEW_VAL\ndef foo():\n    x = NEW_VAL\n")
+
+    def test_ac10_overlapping_replacement_and_remaining_anchor_raises(self) -> None:
+        from stremioguard.overrides._patching import replace_first_matching
+
+        anchor = "for t in items:\n"
+        replacement = "for t in items:\n    record(t)\n"
+        content = f"{replacement}# second site:\n{anchor}"
+        with self.assertRaisesRegex(RuntimeError, "matched 2 sites, expected 1"):
+            replace_first_matching(content, ((anchor, replacement),), error="drifted", expected=1)
+
+    def test_ac10_failed_required_patch_removes_existing_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            manifest_path = state_dir / "bundle-manifest.json"
+            manifest_path.write_text('{"stale": true}\n', encoding="utf-8")
+
+            def failing_render(rd, ctx):
+                raise RuntimeError("boom")
+
+            mock_specs = [
+                OverrideSpec(
+                    name="api_app",
+                    feature="api_app",
+                    container_path="/app/comet/api/app.py",
+                    output_name="app.py",
+                    requirement=Requirement.REQUIRED,
+                    render=failing_render,
+                ),
+            ]
+            with (
+                mock.patch("stremioguard.overrides.bundle.SPECS", mock_specs),
+                self.assertRaisesRegex(RuntimeError, "Required patch 'api_app' failed"),
+            ):
+                write_override_bundle(
+                    repo_dir=Path("/dummy"),
+                    state_dir=state_dir,
+                    result_format_style="plain",
+                    patch_episode_pack_results=False,
+                    gateway_enabled=False,
+                )
+            self.assertFalse(manifest_path.exists())

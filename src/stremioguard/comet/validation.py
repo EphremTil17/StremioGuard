@@ -21,9 +21,14 @@ import subprocess
 import time
 from pathlib import Path, PurePosixPath
 
+from stremioguard.comet.smoke_probe import REPORT_PREFIX
 from stremioguard.config import Runner
 
 IMPORT_SMOKE_TIMEOUT_SECONDS = 60
+_REQUIRED_GUARD_CONTAINER_PATHS = (
+    "/app/comet/api/app.py",
+    "/app/comet/stremioguard_response_guard.py",
+)
 # Comet's single gunicorn worker runs its anime-mapping refresh synchronously
 # at startup and won't answer ANY request, including /health, until it's
 # done — observed taking ~110s against the real image. The default here
@@ -77,21 +82,45 @@ def image_python_command(runner: Runner, image_ref: str) -> list[str]:
     return ["python"]
 
 
+def _stderr_tail(result: subprocess.CompletedProcess[str], *, limit: int = 2000) -> str:
+    text = (result.stderr or result.stdout or "").strip()
+    if len(text) > limit:
+        return text[-limit:]
+    return text
+
+
 def import_smoke_test(
     runner: Runner, image_ref: str, outputs: dict[str, str], bundle_dir: Path
 ) -> dict[str, object]:
     """Import every applied override's module inside `image_ref`'s own venv,
-    each bind-mounted read-only over its container path. `--network none`:
-    this is a static import check, not a live boot.
+    scan all code objects for undefined names, and probe the response guard
+    against the real ASGI app (`--network none`).
 
     Returns {"status": "passed"|"failed", "stage": "import", "detail": str}.
     """
+    present_paths = set(outputs.values())
+    missing_guard = [path for path in _REQUIRED_GUARD_CONTAINER_PATHS if path not in present_paths]
+    if missing_guard:
+        return {
+            "status": "failed",
+            "stage": "import",
+            "detail": (
+                "import smoke test requires guard outputs missing from bundle: "
+                + ", ".join(missing_guard)
+            ),
+        }
+
     modules = sorted(
         module for module in (container_path_to_module(path) for path in outputs.values()) if module
     )
     if not modules:
-        return {"status": "passed", "stage": "import", "detail": ""}
+        return {
+            "status": "failed",
+            "stage": "import",
+            "detail": "import smoke test found no Python modules to validate",
+        }
 
+    probe_source = Path(__file__).with_name("smoke_probe.py").read_text(encoding="utf-8")
     python_command = image_python_command(runner, image_ref)
     args = [
         "docker",
@@ -107,7 +136,8 @@ def import_smoke_test(
         image_ref,
         *python_command[1:],
         "-c",
-        "; ".join(f"import {module}" for module in modules),
+        probe_source,
+        *modules,
     ]
     try:
         result = runner.run(args, check=False, timeout=IMPORT_SMOKE_TIMEOUT_SECONDS)
@@ -117,9 +147,45 @@ def import_smoke_test(
             "stage": "import",
             "detail": f"import smoke test timed out after {IMPORT_SMOKE_TIMEOUT_SECONDS}s",
         }
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "unknown import error").strip()
+
+    stdout_lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    last_line = stdout_lines[-1] if stdout_lines else ""
+    if not last_line.startswith(REPORT_PREFIX):
+        tail = _stderr_tail(result)
+        detail = tail or f"smoke probe exited {result.returncode} without emitting a report"
+        if tail and result.returncode != 0:
+            detail = f"smoke probe exited {result.returncode} without a report:\n{tail}"
+        elif tail:
+            detail = f"smoke probe did not emit a report:\n{tail}"
         return {"status": "failed", "stage": "import", "detail": detail}
+
+    raw_report = last_line[len(REPORT_PREFIX) :]
+    try:
+        report = json.loads(raw_report)
+    except json.JSONDecodeError as error:
+        return {
+            "status": "failed",
+            "stage": "import",
+            "detail": f"malformed smoke report ({error}): {raw_report}",
+        }
+    if not isinstance(report, dict):
+        return {
+            "status": "failed",
+            "stage": "import",
+            "detail": f"malformed smoke report (expected JSON object): {raw_report}",
+        }
+
+    findings = report.get("findings")
+    finding_lines = [str(item) for item in findings] if isinstance(findings, list) else []
+    if result.returncode != 0 or report.get("ok") is not True:
+        detail = "\n".join(finding_lines)
+        if not detail:
+            tail = _stderr_tail(result)
+            detail = (
+                tail or f"smoke probe failed (exit {result.returncode}, ok={report.get('ok')!r})"
+            )
+        return {"status": "failed", "stage": "import", "detail": detail}
+
     return {"status": "passed", "stage": "import", "detail": ""}
 
 

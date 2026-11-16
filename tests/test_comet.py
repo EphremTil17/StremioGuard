@@ -555,8 +555,9 @@ class CometManagerTests(unittest.TestCase):
             )
             manager = CometManager(cfg, FakeRunner({}))
             rendered = manager.render_runtime_env()
-            self.assertIn("DATABASE_URL=comet:", rendered)
+            self.assertIn("DATABASE_URL=postgresql://comet:", rendered)
             self.assertIn("@127.0.0.1:5432/comet", rendered)
+            self.assertIn("DISABLE_TORRENT_STREAMS=True", rendered)
             self.assertIn("PUBLIC_BASE_URL=https://comet.example.com", rendered)
             self.assertIn("CONFIGURE_PAGE_PASSWORD=cfg-password", rendered)
             self.assertIn("PROXY_DEBRID_STREAM=True", rendered)
@@ -601,7 +602,10 @@ class CometManagerTests(unittest.TestCase):
             self.assertNotEqual(password, "comet")
             # DATABASE_URL in the runtime env must use the same generated password.
             runtime = cfg.runtime_env_file.read_text(encoding="utf-8")
-            self.assertIn(f"DATABASE_URL=comet:{password}@127.0.0.1:5432/comet", runtime)
+            self.assertIn(
+                f"DATABASE_URL=postgresql://comet:{password}@127.0.0.1:5432/comet",
+                runtime,
+            )
 
     def test_resolve_postgres_password_reuses_existing_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1219,6 +1223,60 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(parsed["CONFIGURE_PAGE_PASSWORD"], "p@ss #with 'quotes' and $var")
             self.assertEqual(parsed["TORBOX_API_KEY"], "tb key #2")
             self.assertEqual(parsed["PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY"], "rd key $x")
+
+    def test_ac7_render_runtime_env_database_url_and_disable_torrent_streams(self) -> None:
+        import secrets
+        from urllib.parse import unquote, urlsplit
+
+        from stremioguard.env import parse_dotenv
+
+        passwords = [
+            "comet",
+            secrets.token_urlsafe(18),
+            "SGF9FAKE-p@ss:w/rd%#?x$HOME'\" ",
+        ]
+        for password in passwords:
+            with self.subTest(password=password), tempfile.TemporaryDirectory() as directory:
+                tmp_path = Path(directory)
+                cfg = make_comet_config(tmp_path)
+                manager = CometManager(cfg, FakeRunner({}))
+                manager._write_postgres_env(password)
+                pg_before = manager.postgres_env_file().read_bytes()
+
+                rendered = manager.render_runtime_env()
+                self.assertEqual(manager.postgres_env_file().read_bytes(), pg_before)
+                self.assertEqual(rendered.count("DISABLE_TORRENT_STREAMS=True"), 1)
+
+                parsed = parse_dotenv(rendered)
+                db_url = parsed["DATABASE_URL"]
+                self.assertTrue(db_url.startswith("postgresql://comet:"), db_url)
+                split = urlsplit(db_url)
+                self.assertEqual(split.scheme, "postgresql")
+                self.assertEqual(split.hostname, "127.0.0.1")
+                self.assertEqual(split.port, 5432)
+                self.assertEqual(split.path, "/comet")
+                self.assertEqual(unquote(split.password or ""), password)
+
+    def test_ac11_managed_patch_fingerprint_tracks_validation_and_smoke_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = make_comet_config(Path(directory))
+            manager = CometManager(cfg, FakeRunner({}))
+            baseline = manager._managed_patch_fingerprint()
+
+            for filename in ("validation.py", "smoke_probe.py"):
+                orig_read_bytes = Path.read_bytes
+
+                def patched_read_bytes(
+                    self_path: Path, *, target: str = filename, orig=orig_read_bytes
+                ) -> bytes:
+                    data = orig(self_path)
+                    if self_path.name == target and self_path.parent.name == "comet":
+                        return data + b"\n# fingerprint change\n"
+                    return data
+
+                with mock.patch.object(Path, "read_bytes", patched_read_bytes):
+                    updated = manager._managed_patch_fingerprint()
+                self.assertNotEqual(updated, baseline, msg=filename)
 
 
 class PlaybackProbeTests(unittest.TestCase):

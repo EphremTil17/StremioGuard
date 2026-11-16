@@ -34,7 +34,7 @@ def replace_first_matching(
     site upstream is not misreported as drift.
     """
     for anchor, replacement in candidates:
-        if replacement in content:
+        if replacement in content and anchor not in content.replace(replacement, ""):
             return content
         if anchor not in content:
             continue

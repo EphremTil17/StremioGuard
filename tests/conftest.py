@@ -278,6 +278,7 @@ def record_test_digest(state_dir: Path) -> None:
 
 MINIMAL_BUNDLE_OUTPUTS = {
     "app.py": "/app/comet/api/app.py",
+    "stremioguard_response_guard.py": "/app/comet/stremioguard_response_guard.py",
     "logger.py": "/app/comet/core/logger.py",
     "stream.py": "/app/comet/api/endpoints/stream.py",
     "media_search.py": "/app/comet/services/media_search.py",
@@ -338,6 +339,14 @@ Request = object  # upstream: from fastapi import Request
 STREMIO_API_PREFIX = "/s/secret-token"
 
 
+class FastAPI:
+    def __init__(self, *args, **kwargs):
+        self.user_middleware = []
+
+    def add_middleware(self, cls, **kwargs):
+        self.user_middleware.insert(0, (cls, kwargs))
+
+
 def _metrics_route(request: Request) -> str:
     route = getattr(request.scope.get("route"), "path", "unmatched")
     if STREMIO_API_PREFIX and route.startswith(STREMIO_API_PREFIX):
@@ -350,6 +359,9 @@ async def dispatch(request, method, status_code, process_time):
         "API",
         f"{method} {request.url.path} - {status_code} - {process_time:.2f}s",
     )
+
+
+app = FastAPI(title="Comet")
 """
 
 
@@ -362,6 +374,22 @@ def censor(text: str):
     return text[:half] + "*" * (len(text) - half)
 
 
+def censor_url(url: str):
+    if not url:
+        return url
+    if "://" in url:
+        try:
+            scheme, rest = url.split("://", 1)
+            if "@" in rest:
+                auth, host = rest.split("@", 1)
+                if ":" in auth:
+                    user, password = auth.split(":", 1)
+                    return f"{scheme}://{user}:{censor(password)}@{host}"
+        except Exception:
+            pass
+    return url
+
+
 def preview(token_value):
     return f"{token_value[:6]}...{token_value[-4:]}"
 """
@@ -369,6 +397,7 @@ def preview(token_value):
 # Manifest outputs every bundle must carry, whatever the deployment shape.
 REQUIRED_PATCH_OUTPUTS = {
     "app.py": "/app/comet/api/app.py",
+    "stremioguard_response_guard.py": "/app/comet/stremioguard_response_guard.py",
     "logger.py": "/app/comet/core/logger.py",
     "stream.py": "/app/comet/api/endpoints/stream.py",
 }
