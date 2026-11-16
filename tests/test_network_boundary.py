@@ -77,14 +77,15 @@ def test_ac2_compose_pins_gluetun_dns_and_firewall_over_env_file(tmp_path: Path)
 
 
 def test_ac4_compose_drops_net_raw_on_namespace_services_only() -> None:
-    """AC-4 (default suite, INV-2): cap_drop is [NET_RAW] on namespace services."""
+    """AC-4 (default suite, INV-2): namespace services drop ALL (NET_RAW is not effective)."""
     resolved = _compose_config_json(REPO_ROOT, "--no-env-resolution")
     services = resolved["services"]
     assert isinstance(services, dict)
     for name in ("stremio", "comet-gateway", "comet-postgres", "stremthru", "comet"):
         service = services[name]
         assert isinstance(service, dict)
-        assert service.get("cap_drop") == ["NET_RAW"], name
+        assert service.get("cap_drop") == ["ALL"], name
+        assert "NET_RAW" not in (service.get("cap_add") or []), name
 
     gluetun = services["gluetun"]
     assert isinstance(gluetun, dict)

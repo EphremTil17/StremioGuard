@@ -22,7 +22,7 @@ from stremioguard.config import SubprocessRunner, compose_command
 from stremioguard.guard import DNS_BLOCK_RULE, GluetunGuard
 from tests.conftest import make_config
 
-PREFIX = "sgfix8-"
+PREFIX = os.environ.get("STREMIOGUARD_DOCKER_TEST_PREFIX", "sgfix8-")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 GLUETUN_IMAGE = (
@@ -444,7 +444,6 @@ def _build_harness_compose(
     gt_service: dict[str, object] = {
         "image": repo_gt["image"],
         "restart": restart_policy,
-        "cap_add": repo_gt["cap_add"],
         "devices": repo_gt["devices"],
         "environment": repo_gt["environment"],
         "env_file": [str(env_file)],
@@ -456,6 +455,9 @@ def _build_harness_compose(
             f"ip route add default via {gateway_ip} dev eth0 && exec /gluetun-entrypoint",
         ],
     }
+    for field in ("cap_drop", "cap_add", "security_opt", "read_only", "tmpfs"):
+        if field in repo_gt:
+            gt_service[field] = repo_gt[field]
     compose_doc: dict[str, object] = {
         "services": {"gluetun": gt_service},
         "networks": {"test_net": {"external": True, "name": network_name}},
@@ -948,8 +950,10 @@ def test_ac4_cap_drop_net_raw_blocks_af_packet_bypass(tmp_path: Path) -> None:
         text=True,
         encoding="utf-8",
     )
-    comet_cap_drop = json.loads(cfg_res.stdout)["services"]["comet"]["cap_drop"]
-    assert comet_cap_drop == ["NET_RAW"]
+    comet_svc = json.loads(cfg_res.stdout)["services"]["comet"]
+    comet_cap_drop = comet_svc["cap_drop"]
+    assert comet_cap_drop == ["ALL"]
+    assert "NET_RAW" not in (comet_svc.get("cap_add") or [])
 
     with _vpn_server_sandbox(tmp_path) as sb:
         cfg_dir = Path(sb["cfg_dir"])

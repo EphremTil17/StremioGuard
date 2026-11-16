@@ -19,6 +19,7 @@ from loguru import logger
 
 from stremioguard.config import (
     COMET_GATEWAY_CONTAINER_PORT,
+    COMET_GATEWAY_HEALTH_PORT,
     COMET_PORT,
     DOCKER_QUERY_TIMEOUT_SECONDS,
     Runner,
@@ -564,6 +565,19 @@ http {{
         location / {{
             limit_req zone=gateway_fail burst=3 nodelay;
             deny all;
+        }}
+    }}
+
+    server {{
+        listen 127.0.0.1:{COMET_GATEWAY_HEALTH_PORT};
+        access_log off;
+
+        location = /__sg_alive {{
+            return 204;
+        }}
+
+        location / {{
+            return 404;
         }}
     }}
 }}

@@ -61,6 +61,7 @@ STREMTHRU_INTERNAL_URL = f"http://127.0.0.1:{STREMTHRU_PORT}"
 COMET_GATEWAY_SERVICE = "comet-gateway"
 COMET_PORT = 8000
 COMET_GATEWAY_CONTAINER_PORT = 8090
+COMET_GATEWAY_HEALTH_PORT = 8099
 # Every service shares gluetun's network namespace, so they also share one
 # port space: two listeners on the same port collide whatever address each
 # binds. This is the registry; tests/test_config.py checks docker-compose.yml
@@ -71,6 +72,7 @@ NAMESPACE_PORTS: dict[str, int] = {
     "stremio streaming server (https)": 12470,
     "comet": COMET_PORT,
     "comet-gateway": COMET_GATEWAY_CONTAINER_PORT,
+    "comet-gateway health (loopback)": COMET_GATEWAY_HEALTH_PORT,
     "comet-postgres": 5432,
     "stremthru": STREMTHRU_PORT,
     "gluetun control server": 18080,

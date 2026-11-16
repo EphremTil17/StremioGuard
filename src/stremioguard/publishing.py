@@ -6,6 +6,8 @@ import dataclasses
 import json
 from pathlib import Path
 
+from loguru import logger
+
 from stremioguard.comet_gateway import (
     COMET_GATEWAY_CONTAINER_PORT,
     GATEWAY_CONFIG_DIR,
@@ -48,6 +50,25 @@ routes = ["GET /v1/publicip/ip"]
 auth = "none"
 """
 
+# Gluetun settings pinned in docker-compose.yml (D1). Kept in the same order so
+# operator warnings match the table; never forwarded through .stremio/gluetun.env.
+GLUETUN_PINNED_ENV: dict[str, str] = {
+    "DNS_KEEP_NAMESERVER": "off",
+    "FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT": "on",
+    "HTTP_CONTROL_SERVER_ADDRESS": "127.0.0.1:18080",
+    "HTTPPROXY": "off",
+    "SHADOWSOCKS": "off",
+    "PPROF_ENABLED": "no",
+    "HEALTH_SERVER_ADDRESS": "127.0.0.1:9999",
+    "HTTP_CONTROL_SERVER_AUTH_CONFIG_FILEPATH": GLUETUN_AUTH_CONTAINER_PATH,
+    "HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE": "{}",
+    "FIREWALL_INPUT_PORTS": "",
+    "FIREWALL_VPN_INPUT_PORTS": "",
+    "FIREWALL_OUTBOUND_SUBNETS": "",
+    "VPN_PORT_FORWARDING": "off",
+    "VPN_INTERFACE": "tun0",
+}
+
 
 # Settings StremioGuard owns, as opposed to gluetun's. They never reach the
 # VPN container: every StremioGuard secret (debrid keys, configure password,
@@ -80,7 +101,9 @@ def render_gluetun_env(env_text: str) -> str:
     kept = {
         key: value
         for key, value in parse_dotenv(env_text).items()
-        if not key.startswith(STREMIOGUARD_ENV_PREFIXES) and key not in STREMIOGUARD_ENV_KEYS
+        if not key.startswith(STREMIOGUARD_ENV_PREFIXES)
+        and key not in STREMIOGUARD_ENV_KEYS
+        and key not in GLUETUN_PINNED_ENV
     }
     return render_dotenv(kept, header=GENERATED_ENV_HEADER)
 
@@ -306,11 +329,13 @@ class StackPublisher:
         gluetun_env_content: str | None = None
         snapshot_content: str | None = None
         base_compose_content: str | None = None
+        parsed_env: dict[str, str] | None = None
         if self.deploying:
             env_text = self.env_file.read_bytes().decode("utf-8") if self.env_file.exists() else ""
+            parsed_env = parse_dotenv(env_text, source=str(self.env_file))
             gluetun_env_content = render_gluetun_env(env_text)
             snapshot_content = render_dotenv(
-                parse_dotenv(env_text, source=str(self.env_file)),
+                parsed_env,
                 header=GENERATED_ENV_HEADER,
             )
             base_compose = self.root_dir / "docker-compose.yml"
@@ -320,6 +345,7 @@ class StackPublisher:
                     + base_compose.read_text(encoding="utf-8")
                 )
 
+        auth_config_file = self.root_dir / ".stremio" / "gluetun-auth.toml"
         content = render_stack_compose_override(
             bind_addresses=bind_addresses,
             stremio_host_port=stremio_host_port,
@@ -331,13 +357,28 @@ class StackPublisher:
                 if comet_config.enabled and comet_gateway_config.enabled
                 else None
             ),
-            gluetun_auth_config_file=ensure_gluetun_auth_config(self.root_dir),
+            gluetun_auth_config_file=auth_config_file,
             comet_bundle_dir=comet_bundle_dir,
         )
+
+        # Warn once per overridden pin after every output renders and before writing.
+        if self.deploying:
+            assert parsed_env is not None
+            for key, pin in GLUETUN_PINNED_ENV.items():
+                if key in parsed_env and parsed_env[key] != pin:
+                    pin_display = pin or '""'
+                    message = (
+                        f".env sets {key}, but docker-compose.yml pins it to `{pin_display}` "
+                        "for gluetun, so that line has no effect. Remove it from .env."
+                    )
+                    if key == "FIREWALL_OUTBOUND_SUBNETS":
+                        message += " LAN access from the VPN namespace is not supported."
+                    logger.warning("{}", message)
 
         # 6. Write the generation, each file atomically and the override last:
         # compose_command only switches to the published base file and env
         # snapshot once all three exist.
+        ensure_gluetun_auth_config(self.root_dir)
         if self.deploying:
             assert gluetun_env_content is not None
             assert snapshot_content is not None

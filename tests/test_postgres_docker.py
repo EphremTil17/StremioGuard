@@ -25,7 +25,7 @@ from stremioguard.config import SubprocessRunner
 from stremioguard.env import env_file_value
 from tests.conftest import make_comet_config
 
-PREFIX = "sgfix8-"
+PREFIX = os.environ.get("STREMIOGUARD_DOCKER_TEST_PREFIX", "sgfix8-")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 POSTGRES_IMAGE = "postgres@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395"
 COMET_IMAGE = "g0ldyy/comet@sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea"
@@ -181,12 +181,14 @@ def _write_pg_test_compose(
         "restart": "no",
         "command": repo_pg["command"],
         "configs": repo_pg["configs"],
-        "cap_drop": repo_pg["cap_drop"],
         "healthcheck": repo_pg["healthcheck"],
         "volumes": [f"{data_dir}:/var/lib/postgresql/"],
         "network_mode": f"container:{owner_name}",
         "env_file": [str(env_file)],
     }
+    for field in ("cap_drop", "cap_add", "security_opt", "read_only", "tmpfs"):
+        if field in repo_pg:
+            pg_service[field] = repo_pg[field]
     doc = {"services": {"comet-postgres": pg_service}, "configs": referenced}
     compose_path = work_dir / "pg-compose.yml"
     compose_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")

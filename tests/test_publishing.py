@@ -503,6 +503,7 @@ def test_gluetun_gets_only_its_own_settings_normalized() -> None:
             'OPENVPN_PASSWORD="p@ss word"',
             "WIREGUARD_PRIVATE_KEY=abc=",
             "TZ=America/Los_Angeles",
+            "SERVER_COUNTRIES=United States",
             "FIREWALL_OUTBOUND_SUBNETS=192.168.1.0/24",
             "COMET_TORBOX_API_KEY=secret",
             "COMET_CONFIGURE_PAGE_PASSWORD=secret",
@@ -519,7 +520,7 @@ def test_gluetun_gets_only_its_own_settings_normalized() -> None:
         "OPENVPN_PASSWORD='p@ss word'",
         "WIREGUARD_PRIVATE_KEY='abc='",
         "TZ='America/Los_Angeles'",
-        "FIREWALL_OUTBOUND_SUBNETS='192.168.1.0/24'",
+        "SERVER_COUNTRIES='United States'",
     ]
     # What the VPN container reads back is exactly the parsed .env value.
     assert parse_dotenv(rendered) == {
@@ -527,7 +528,7 @@ def test_gluetun_gets_only_its_own_settings_normalized() -> None:
         "OPENVPN_PASSWORD": "p@ss word",
         "WIREGUARD_PRIVATE_KEY": "abc=",
         "TZ": "America/Los_Angeles",
-        "FIREWALL_OUTBOUND_SUBNETS": "192.168.1.0/24",
+        "SERVER_COUNTRIES": "United States",
     }
 
 
