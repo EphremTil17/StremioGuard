@@ -31,7 +31,7 @@ from stremioguard.config import (
     LOCKOUT_FILE_NAME,
     PUBLISHED_ENV_FILE,
 )
-from stremioguard.env import atomic_write_text, fail
+from stremioguard.env import atomic_write_text, check_env_value, fail
 from stremioguard.guard import lockout_marker_present
 
 WATCHDOG_UNIT = "stremioguard-watchdog.service"
@@ -205,8 +205,7 @@ def require_user_systemd() -> None:
 
 def _unit_value(value: object) -> str:
     text = str(value)
-    if "\n" in text:
-        raise ValueError(f"Refusing to write a newline into a unit file: {text!r}")
+    check_env_value(text, label="unit value")
     return text.replace("%", "%%")
 
 
@@ -357,8 +356,7 @@ def install_units() -> bool:
 
 
 def _env_line(key: str, value: str) -> str:
-    if "\n" in value:
-        raise ValueError(f"{key} contains a newline; refusing to forward it to the watchdog.")
+    check_env_value(value, key=key)
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'{key}="{escaped}"\n'
 
@@ -375,14 +373,19 @@ def config_generation() -> str:
         return ""
 
 
+def render_watchdog_env(env: Mapping[str, str]) -> str:
+    """Render the forwarded settings for the unit's EnvironmentFile=."""
+    merged = {**env, CONFIG_GENERATION_KEY: config_generation()}
+    return "".join(_env_line(key, merged[key]) for key in FORWARDED_ENV_KEYS if merged.get(key))
+
+
 def write_watchdog_env(env: Mapping[str, str]) -> bool:
     """Persist the forwarded settings for the unit's EnvironmentFile=.
 
     Returns whether a setting other than the per-run values changed.
     """
     path = watchdog_env_file()
-    env = {**env, CONFIG_GENERATION_KEY: config_generation()}
-    content = "".join(_env_line(key, env[key]) for key in FORWARDED_ENV_KEYS if env.get(key))
+    content = render_watchdog_env(env)
     try:
         previous = path.read_text(encoding="utf-8")
     except FileNotFoundError:

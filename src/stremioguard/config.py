@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import subprocess
 import urllib.parse
 from dataclasses import dataclass
@@ -393,12 +394,30 @@ def _scrape_mode(env_file: Path, key: str, default: str) -> str:
     return mode
 
 
+_IMAGE_DOMAIN_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*"
+    r"(?::[0-9]+)?"
+)
+_IMAGE_PATH_COMPONENT_RE = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*")
+
+
 def _validate_public_url(value: str | None, *, key: str) -> None:
     if not value:
         return
-    parsed = urllib.parse.urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RuntimeError(f"Invalid {key} value: {value!r}; expected an absolute HTTP(S) URL")
+    try:
+        parsed = urllib.parse.urlparse(value)
+        hostname = parsed.hostname
+    except ValueError as error:
+        raise RuntimeError(
+            f"Invalid {key} value (malformed URL; expected an absolute HTTP(S) URL)"
+        ) from error
+    if parsed.scheme not in {"http", "https"}:
+        raise RuntimeError(
+            f"Invalid {key} value (unsupported or missing scheme; expected an absolute HTTP(S) URL)"
+        )
+    if not parsed.netloc or not hostname:
+        raise RuntimeError(f"Invalid {key} value (missing host; expected an absolute HTTP(S) URL)")
 
 
 def _validate_image_repository(value: str, *, key: str) -> str:
@@ -408,8 +427,27 @@ def _validate_image_repository(value: str, *, key: str) -> str:
     name_part = value.rsplit("/", 1)[-1]
     if "@" in value or ":" in name_part:
         raise RuntimeError(
-            f"Invalid {key} value: {value!r}; expected a repository name without a tag "
+            f"Invalid {key} value: {ascii(value)}; expected a repository name without a tag "
             "or digest (e.g. 'g0ldyy/comet'). StremioGuard manages the digest pin."
+        )
+    if not value or len(value) > 255:
+        raise RuntimeError(
+            f"Invalid {key} value: {ascii(value)}; expected a valid Docker repository name."
+        )
+    parts = value.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        domain, path_parts = parts[0], parts[1:]
+        if _IMAGE_DOMAIN_RE.fullmatch(domain) is None:
+            raise RuntimeError(
+                f"Invalid {key} value: {ascii(value)}; expected a valid Docker repository name."
+            )
+    else:
+        path_parts = parts
+    if not path_parts or any(
+        _IMAGE_PATH_COMPONENT_RE.fullmatch(part) is None for part in path_parts
+    ):
+        raise RuntimeError(
+            f"Invalid {key} value: {ascii(value)}; expected a valid Docker repository name."
         )
     return value
 

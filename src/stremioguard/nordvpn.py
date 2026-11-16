@@ -12,6 +12,7 @@ import typer
 from loguru import logger
 
 from stremioguard.env import (
+    check_env_value,
     fail,
     validate_wireguard_private_key,
     write_env_settings,
@@ -19,6 +20,24 @@ from stremioguard.env import (
 
 NORDVPN_CREDENTIALS_API_URL = "https://api.nordvpn.com/v1/users/services/credentials"
 API_TIMEOUT_SECONDS = 15
+_MAX_CREDENTIALS_RESPONSE_BYTES = 65536
+
+
+def _validated_credential_field(data: dict[str, object], field: str) -> str:
+    raw = data.get(field)
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        fail(f"NordVPN API returned a non-string {field}.")
+    try:
+        check_env_value(raw, key=field)
+    except ValueError as error:
+        codepoint = str(error).rsplit(" ", 1)[-1]
+        fail(
+            f"NordVPN API returned a {field} containing {codepoint}, "
+            "which cannot be stored in .env."
+        )
+    return raw
 
 
 def fetch_nordvpn_credentials_from_token(token: str) -> tuple[str, str, str]:
@@ -38,8 +57,7 @@ def fetch_nordvpn_credentials_from_token(token: str) -> tuple[str, str, str]:
 
     try:
         with urllib.request.urlopen(request, timeout=API_TIMEOUT_SECONDS) as response:
-            raw_body = response.read().decode("utf-8")
-            data = json.loads(raw_body)
+            raw_bytes = response.read(_MAX_CREDENTIALS_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
             fail(
@@ -50,8 +68,21 @@ def fetch_nordvpn_credentials_from_token(token: str) -> tuple[str, str, str]:
         fail(f"NordVPN API request failed with HTTP {error.code}: {error.reason}")
     except urllib.error.URLError as error:
         fail(f"Failed to connect to NordVPN API: {error.reason}")
-    except (json.JSONDecodeError, OSError) as error:
-        fail(f"Failed to parse NordVPN API response: {error}")
+    except OSError as error:
+        fail(f"Failed to read NordVPN API response ({type(error).__name__}).")
+
+    if len(raw_bytes) > _MAX_CREDENTIALS_RESPONSE_BYTES:
+        fail("NordVPN API response exceeded maximum allowed size.")
+
+    try:
+        raw_body = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("NordVPN API returned a non-UTF-8 response.")
+
+    try:
+        data = json.loads(raw_body)
+    except json.JSONDecodeError:
+        fail("Failed to parse NordVPN API JSON response.")
 
     if not isinstance(data, dict):
         fail("Invalid response structure received from NordVPN API.")
@@ -63,8 +94,8 @@ def fetch_nordvpn_credentials_from_token(token: str) -> tuple[str, str, str]:
             "Ensure that your NordVPN subscription is active."
         )
 
-    username = str(data.get("username") or "")
-    password = str(data.get("password") or "")
+    username = _validated_credential_field(data, "username")
+    password = _validated_credential_field(data, "password")
 
     try:
         valid_key = validate_wireguard_private_key(private_key)

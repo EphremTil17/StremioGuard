@@ -1,0 +1,262 @@
+{
+  "base_commit": "2de2bc7",
+  "corpus": [
+    {
+      "key": "K_0",
+      "value": "plain",
+      "format_env_value": "'plain'",
+      "render_env_value": "plain",
+      "render_strict_env_value": "plain",
+      "render_dotenv": "# hdr\nK_0='plain'\n",
+      "_env_line": "K_0=\"plain\"\n"
+    },
+    {
+      "key": "K_1",
+      "value": "with spaces",
+      "format_env_value": "'with spaces'",
+      "render_env_value": "with spaces",
+      "render_strict_env_value": "'with spaces'",
+      "render_dotenv": "# hdr\nK_1='with spaces'\n",
+      "_env_line": "K_1=\"with spaces\"\n"
+    },
+    {
+      "key": "K_2",
+      "value": "a # not a comment",
+      "format_env_value": "'a # not a comment'",
+      "render_env_value": "'a # not a comment'",
+      "render_strict_env_value": "'a # not a comment'",
+      "render_dotenv": "# hdr\nK_2='a # not a comment'\n",
+      "_env_line": "K_2=\"a # not a comment\"\n"
+    },
+    {
+      "key": "K_3",
+      "value": "#leading-hash",
+      "format_env_value": "'#leading-hash'",
+      "render_env_value": "#leading-hash",
+      "render_strict_env_value": "'#leading-hash'",
+      "render_dotenv": "# hdr\nK_3='#leading-hash'\n",
+      "_env_line": "K_3=\"#leading-hash\"\n"
+    },
+    {
+      "key": "K_4",
+      "value": "trailing #",
+      "format_env_value": "'trailing #'",
+      "render_env_value": "'trailing #'",
+      "render_strict_env_value": "'trailing #'",
+      "render_dotenv": "# hdr\nK_4='trailing #'\n",
+      "_env_line": "K_4=\"trailing #\"\n"
+    },
+    {
+      "key": "K_5",
+      "value": "$HOME and ${PATH}",
+      "format_env_value": "'$HOME and ${PATH}'",
+      "render_env_value": "$HOME and ${PATH}",
+      "render_strict_env_value": "'$HOME and ${PATH}'",
+      "render_dotenv": "# hdr\nK_5='$HOME and ${PATH}'\n",
+      "_env_line": "K_5=\"$HOME and ${PATH}\"\n"
+    },
+    {
+      "key": "K_6",
+      "value": "it's",
+      "format_env_value": "\"it's\"",
+      "render_env_value": "it's",
+      "render_strict_env_value": "\"it's\"",
+      "render_dotenv": "# hdr\nK_6=\"it's\"\n",
+      "_env_line": "K_6=\"it's\"\n"
+    },
+    {
+      "key": "K_7",
+      "value": "say \"hi\"",
+      "format_env_value": "'say \"hi\"'",
+      "render_env_value": "say \"hi\"",
+      "render_strict_env_value": "'say \"hi\"'",
+      "render_dotenv": "# hdr\nK_7='say \"hi\"'\n",
+      "_env_line": "K_7=\"say \\\"hi\\\"\"\n"
+    },
+    {
+      "key": "K_8",
+      "value": "both ' and \"",
+      "format_env_value": "\"both ' and \\\"\"",
+      "render_env_value": "both ' and \"",
+      "render_strict_env_value": "\"both ' and \\\"\"",
+      "render_dotenv": "# hdr\nK_8=\"both ' and \\\"\"\n",
+      "_env_line": "K_8=\"both ' and \\\"\"\n"
+    },
+    {
+      "key": "K_9",
+      "value": "trailing backslash\\",
+      "format_env_value": "\"trailing backslash\\\\\"",
+      "render_env_value": "trailing backslash\\",
+      "render_strict_env_value": "\"trailing backslash\\\\\"",
+      "render_dotenv": "# hdr\nK_9=\"trailing backslash\\\\\"\n",
+      "_env_line": "K_9=\"trailing backslash\\\\\"\n"
+    },
+    {
+      "key": "K_10",
+      "value": "back\\slash",
+      "format_env_value": "'back\\slash'",
+      "render_env_value": "back\\slash",
+      "render_strict_env_value": "'back\\slash'",
+      "render_dotenv": "# hdr\nK_10='back\\slash'\n",
+      "_env_line": "K_10=\"back\\\\slash\"\n"
+    },
+    {
+      "key": "K_11",
+      "value": "\\'",
+      "format_env_value": "\"\\\\'\"",
+      "render_env_value": "\\'",
+      "render_strict_env_value": "\"\\\\'\"",
+      "render_dotenv": "# hdr\nK_11=\"\\\\'\"\n",
+      "_env_line": "K_11=\"\\\\'\"\n"
+    },
+    {
+      "key": "K_12",
+      "value": "",
+      "format_env_value": "''",
+      "render_env_value": "",
+      "render_strict_env_value": "",
+      "render_dotenv": "# hdr\nK_12=''\n",
+      "_env_line": "K_12=\"\"\n"
+    },
+    {
+      "key": "K_13",
+      "value": "  padded  ",
+      "format_env_value": "'  padded  '",
+      "render_env_value": "'  padded  '",
+      "render_strict_env_value": "'  padded  '",
+      "render_dotenv": "# hdr\nK_13='  padded  '\n",
+      "_env_line": "K_13=\"  padded  \"\n"
+    },
+    {
+      "key": "K_14",
+      "value": "tab\there",
+      "format_env_value": "'tab\there'",
+      "render_env_value": "tab\there",
+      "render_strict_env_value": "'tab\there'",
+      "render_dotenv": "# hdr\nK_14='tab\there'\n",
+      "_env_line": "K_14=\"tab\there\"\n"
+    },
+    {
+      "key": "K_15",
+      "value": "=equals=",
+      "format_env_value": "'=equals='",
+      "render_env_value": "=equals=",
+      "render_strict_env_value": "=equals=",
+      "render_dotenv": "# hdr\nK_15='=equals='\n",
+      "_env_line": "K_15=\"=equals=\"\n"
+    },
+    {
+      "key": "K_16",
+      "value": "\"starts with a quote\"",
+      "format_env_value": "'\"starts with a quote\"'",
+      "render_env_value": "'\"starts with a quote\"'",
+      "render_strict_env_value": "'\"starts with a quote\"'",
+      "render_dotenv": "# hdr\nK_16='\"starts with a quote\"'\n",
+      "_env_line": "K_16=\"\\\"starts with a quote\\\"\"\n"
+    },
+    {
+      "key": "K_17",
+      "value": "'single-wrapped'",
+      "format_env_value": "\"'single-wrapped'\"",
+      "render_env_value": "\"'single-wrapped'\"",
+      "render_strict_env_value": "\"'single-wrapped'\"",
+      "render_dotenv": "# hdr\nK_17=\"'single-wrapped'\"\n",
+      "_env_line": "K_17=\"'single-wrapped'\"\n"
+    },
+    {
+      "key": "K_18",
+      "value": "é",
+      "format_env_value": "'é'",
+      "render_env_value": "é",
+      "render_strict_env_value": "'é'",
+      "render_dotenv": "# hdr\nK_18='é'\n",
+      "_env_line": "K_18=\"é\"\n"
+    },
+    {
+      "key": "K_19",
+      "value": "🔒",
+      "format_env_value": "'🔒'",
+      "render_env_value": "🔒",
+      "render_strict_env_value": "'🔒'",
+      "render_dotenv": "# hdr\nK_19='🔒'\n",
+      "_env_line": "K_19=\"🔒\"\n"
+    },
+    {
+      "key": "K_20",
+      "value": "\t",
+      "format_env_value": "'\t'",
+      "render_env_value": "'\t'",
+      "render_strict_env_value": "'\t'",
+      "render_dotenv": "# hdr\nK_20='\t'\n",
+      "_env_line": "K_20=\"\t\"\n"
+    },
+    {
+      "key": "K_21",
+      "value": " ",
+      "format_env_value": "' '",
+      "render_env_value": "' '",
+      "render_strict_env_value": "' '",
+      "render_dotenv": "# hdr\nK_21=' '\n",
+      "_env_line": "K_21=\" \"\n"
+    },
+    {
+      "key": "K_22",
+      "value": "$HOME",
+      "format_env_value": "'$HOME'",
+      "render_env_value": "$HOME",
+      "render_strict_env_value": "'$HOME'",
+      "render_dotenv": "# hdr\nK_22='$HOME'\n",
+      "_env_line": "K_22=\"$HOME\"\n"
+    },
+    {
+      "key": "K_23",
+      "value": "${PATH}",
+      "format_env_value": "'${PATH}'",
+      "render_env_value": "${PATH}",
+      "render_strict_env_value": "'${PATH}'",
+      "render_dotenv": "# hdr\nK_23='${PATH}'\n",
+      "_env_line": "K_23=\"${PATH}\"\n"
+    },
+    {
+      "key": "K_24",
+      "value": "a #b",
+      "format_env_value": "'a #b'",
+      "render_env_value": "'a #b'",
+      "render_strict_env_value": "'a #b'",
+      "render_dotenv": "# hdr\nK_24='a #b'\n",
+      "_env_line": "K_24=\"a #b\"\n"
+    },
+    {
+      "key": "K_25",
+      "value": "#x",
+      "format_env_value": "'#x'",
+      "render_env_value": "#x",
+      "render_strict_env_value": "'#x'",
+      "render_dotenv": "# hdr\nK_25='#x'\n",
+      "_env_line": "K_25=\"#x\"\n"
+    },
+    {
+      "key": "K_26",
+      "value": "\\",
+      "format_env_value": "\"\\\\\"",
+      "render_env_value": "\\",
+      "render_strict_env_value": "\"\\\\\"",
+      "render_dotenv": "# hdr\nK_26=\"\\\\\"\n",
+      "_env_line": "K_26=\"\\\\\"\n"
+    },
+    {
+      "key": "K_27",
+      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "format_env_value": "'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'",
+      "render_env_value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "render_strict_env_value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "render_dotenv": "# hdr\nK_27='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n",
+      "_env_line": "K_27=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n"
+    }
+  ],
+  "render_dotenv_all": "# corpus\nK_0='plain'\nK_1='with spaces'\nK_2='a # not a comment'\nK_3='#leading-hash'\nK_4='trailing #'\nK_5='$HOME and ${PATH}'\nK_6=\"it's\"\nK_7='say \"hi\"'\nK_8=\"both ' and \\\"\"\nK_9=\"trailing backslash\\\\\"\nK_10='back\\slash'\nK_11=\"\\\\'\"\nK_12=''\nK_13='  padded  '\nK_14='tab\there'\nK_15='=equals='\nK_16='\"starts with a quote\"'\nK_17=\"'single-wrapped'\"\nK_18='é'\nK_19='🔒'\nK_20='\t'\nK_21=' '\nK_22='$HOME'\nK_23='${PATH}'\nK_24='a #b'\nK_25='#x'\nK_26=\"\\\\\"\nK_27='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n",
+  "write_env_settings_initial": "# comment line\nDUP=first\nKEEP=stays\n  export DUP=second\r\nPLAIN_REPLACE=old\r\n",
+  "write_env_settings_after": "# comment line\nDUP=first\nKEEP=updated\nexport DUP='a # b'\nPLAIN_REPLACE=simple\nADDED=it's $HOME\n",
+  "stremthru_fixed_token": "fixed_token_ABC123_-",
+  "stremthru_env": "# Generated by ./stremio; do not edit by hand.\nSTREMTHRU_AUTH=stremioguard:fixed_token_ABC123_-\n"
+}

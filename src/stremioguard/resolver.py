@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import time
 import urllib.error
@@ -128,6 +129,15 @@ def _find_best_server(
     return str(best["hostname"]), str(best["station"])
 
 
+def _valid_station_ip(station: object) -> bool:
+    if not isinstance(station, str):
+        return False
+    try:
+        return str(ipaddress.ip_address(station)) == station
+    except ValueError:
+        return False
+
+
 def resolve_nordvpn_endpoint(
     country: str | None = None,
     city: str | None = None,
@@ -159,7 +169,9 @@ def resolve_nordvpn_endpoint(
                 and cached_hostname
                 and cached_ip
             ):
-                return str(cached_hostname), str(cached_ip)
+                if _valid_station_ip(cached_ip):
+                    return str(cached_hostname), str(cached_ip)
+                logger.warning("Ignoring cached NordVPN endpoint with an invalid station address.")
         except (json.JSONDecodeError, OSError, ValueError):
             pass
 
@@ -175,20 +187,23 @@ def resolve_nordvpn_endpoint(
         best = _find_best_server(servers, country=country_clean, city=city_clean)
         if best:
             hostname, ip = best
-            if cache_path:
-                try:
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    cache_payload = {
-                        "country": country_clean,
-                        "city": city_clean,
-                        "hostname": hostname,
-                        "ip": ip,
-                        "timestamp": time.time(),
-                    }
-                    cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
-                except OSError as write_err:
-                    logger.debug(f"Failed to persist NordVPN endpoint cache: {write_err}")
-            return hostname, ip
+            if not _valid_station_ip(ip):
+                logger.warning("Ignoring NordVPN API endpoint with an invalid station address.")
+            else:
+                if cache_path:
+                    try:
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        cache_payload = {
+                            "country": country_clean,
+                            "city": city_clean,
+                            "hostname": hostname,
+                            "ip": ip,
+                            "timestamp": time.time(),
+                        }
+                        cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
+                    except OSError as write_err:
+                        logger.debug(f"Failed to persist NordVPN endpoint cache: {write_err}")
+                return hostname, ip
     except (urllib.error.URLError, json.JSONDecodeError, OSError) as err:
         logger.warning(f"Could not fetch live NordVPN server recommendations: {err}")
 
@@ -196,13 +211,18 @@ def resolve_nordvpn_endpoint(
     if cache_path and cache_path.exists():
         try:
             cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
+            cached_ip = cache_data.get("ip")
             if (
                 cache_data.get("country") == country_clean
                 and cache_data.get("city") == city_clean
                 and cache_data.get("hostname")
-                and cache_data.get("ip")
+                and cached_ip
             ):
-                return str(cache_data["hostname"]), str(cache_data["ip"])
+                if _valid_station_ip(cached_ip):
+                    return str(cache_data["hostname"]), str(cached_ip)
+                logger.warning(
+                    "Ignoring stale cached NordVPN endpoint with an invalid station address."
+                )
         except (json.JSONDecodeError, OSError):
             pass
 

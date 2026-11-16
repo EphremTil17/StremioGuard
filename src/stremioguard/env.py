@@ -28,8 +28,40 @@ def fail(message: str) -> NoReturn:
 
 
 _KEY_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=(.*)$", re.DOTALL)
+_KEY_NAME_BEFORE_EQUALS = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*$")
 _DOUBLE_QUOTE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t"}
-_ENV_CACHE: dict[str, tuple[tuple[int, int, int], dict[str, str]]] = {}
+
+# Exactly the characters str.splitlines() breaks on, plus NUL.
+FORBIDDEN_ENV_CHARS: frozenset[str] = frozenset(
+    {
+        "\x00",
+        "\n",
+        "\r",
+        "\v",
+        "\f",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    }
+)
+
+
+def _first_forbidden_env_char(text: str) -> str | None:
+    for char in text:
+        if char in FORBIDDEN_ENV_CHARS:
+            return char
+    return None
+
+
+def check_env_value(value: str, *, key: str | None = None, label: str = "dotenv value") -> None:
+    """Refuse any value containing a forbidden line separator or NUL without echoing it."""
+    bad = _first_forbidden_env_char(value)
+    if bad is not None:
+        subject = key if key is not None else label
+        raise ValueError(f"{subject} cannot contain forbidden character U+{ord(bad):04X}")
 
 
 def _parse_quoted(raw: str, quote: str, *, source: str, line_number: int) -> str:
@@ -53,19 +85,48 @@ def _parse_quoted(raw: str, quote: str, *, source: str, line_number: int) -> str
 def parse_dotenv(text: str, *, source: str = ".env") -> dict[str, str]:
     """Parse dotenv text the one way every StremioGuard reader agrees on.
 
-    The grammar is Docker Compose's, minus variable expansion: an optional
-    `export ` prefix, single quotes (literal) and double quotes (backslash
-    escapes), an unquoted value ending at whitespace followed by `#`, and the
-    LAST assignment of a key winning. Values are literal: `$NAME` is never
-    expanded, so a secret containing `$` survives. Compose never reads the raw
-    file once `./stremio start` has published its normalized copy (see
-    publishing.py), so the two cannot disagree about a value.
+    Lines end at ``\\n`` only, with one trailing ``\\r`` dropped (CRLF files);
+    any non-comment line containing another line separator or NUL (either
+    literally or via a ``\\n``/``\\r`` escape) is refused with ``RuntimeError``.
+    Blank lines and ``#`` comments (after ``.strip()``) are skipped, an
+    optional ``export `` prefix is accepted, unquoted values end at whitespace
+    followed by ``#``, and the last assignment of a key wins.
+
+    Differences from Docker Compose:
+    - The supported double-quote escapes are ``\\t``, ``\\\\``, ``\\"``, and
+      ``\\$`` (producing a tab, ``\\``, ``"``, and ``$``, as in Compose); a
+      ``\\n`` or ``\\r`` escape is refused like a literal line break; and any
+      other escape drops its backslash, whereas Compose also expands ``\\v``,
+      ``\\f``, ``\\a``, ``\\b``, octal escapes, and keeps ``\\'`` with its
+      backslash.
+    - ``$NAME`` is always kept literal instead of being expanded unquoted or in
+      double quotes.
+    - Non-comment lines with line separators other than LF/CRLF or NUL are
+      refused instead of kept inside a value.
+
+    This is safe because once ``./stremio start`` publishes a generation,
+    Compose only ever reads the normalized, re-quoted files rendered by
+    StremioGuard (see ``publishing.py``), never the raw ``.env``.
     """
     values: dict[str, str] = {}
-    for line_number, line in enumerate(text.splitlines(), start=1):
+    for line_number, raw_line in enumerate(text.split("\n"), start=1):
+        line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        bad = _first_forbidden_env_char(line)
+        if bad is not None:
+            key_match = (
+                _KEY_NAME_BEFORE_EQUALS.match(line.split("=", 1)[0]) if "=" in line else None
+            )
+            if key_match:
+                raise RuntimeError(
+                    f"{source}: line {line_number}: {key_match.group(1)} "
+                    f"contains forbidden character U+{ord(bad):04X}"
+                )
+            raise RuntimeError(
+                f"{source}: line {line_number}: contains forbidden character U+{ord(bad):04X}"
+            )
         match = _KEY_PATTERN.match(stripped)
         if not match:
             # `KEY` alone means "inherit from the process environment" to
@@ -73,7 +134,12 @@ def parse_dotenv(text: str, *, source: str = ".env") -> dict[str, str]:
             continue
         key, raw = match.group(1), match.group(2).strip()
         if raw[:1] in {"'", '"'}:
-            values[key] = _parse_quoted(raw, raw[0], source=source, line_number=line_number)
+            value = _parse_quoted(raw, raw[0], source=source, line_number=line_number)
+            try:
+                check_env_value(value, key=key)
+            except ValueError as error:
+                raise RuntimeError(f"{source}: line {line_number}: {error}") from error
+            values[key] = value
             continue
         for index, char in enumerate(raw):
             if char == "#" and index > 0 and raw[index - 1].isspace():
@@ -86,28 +152,19 @@ def parse_dotenv(text: str, *, source: str = ".env") -> dict[str, str]:
 def read_env_file(env_path: Path) -> dict[str, str]:
     """Every assignment in ``env_path``; empty when the file does not exist."""
     try:
-        stat = env_path.stat()
-    except OSError:
+        text = env_path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
         return {}
-    # The inode too: an atomic replace within the same clock tick and of the
-    # same length must still be seen as a new file.
-    signature = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
-    cached = _ENV_CACHE.get(str(env_path))
-    if cached and cached[0] == signature:
-        return cached[1]
-    values = parse_dotenv(env_path.read_text(encoding="utf-8"), source=str(env_path))
-    _ENV_CACHE[str(env_path)] = (signature, values)
-    return values
+    return parse_dotenv(text, source=str(env_path))
 
 
 def env_file_value(env_path: Path, key: str) -> str | None:
     return read_env_file(env_path).get(key)
 
 
-def format_env_value(value: str) -> str:
+def format_env_value(value: str, *, key: str | None = None) -> str:
     """Quote ``value`` so both this parser and Compose read it back exactly."""
-    if "\n" in value or "\r" in value:
-        raise ValueError("a dotenv value cannot contain a line break")
+    check_env_value(value, key=key, label="dotenv value")
     # Single quotes are fully literal for both parsers, except that Compose
     # treats `\'` as an escaped quote, so a value containing a quote or
     # ending in a backslash needs double quotes instead.
@@ -120,7 +177,7 @@ def format_env_value(value: str) -> str:
 def render_dotenv(values: Mapping[str, str], *, header: str = "") -> str:
     """A normalized dotenv file: one quoted assignment per key."""
     lines = [header] if header else []
-    lines.extend(f"{key}={format_env_value(value)}" for key, value in values.items())
+    lines.extend(f"{key}={format_env_value(value, key=key)}" for key, value in values.items())
     return "\n".join(lines) + "\n"
 
 
@@ -130,16 +187,18 @@ def _plain_value_safe(value: str) -> bool:
     return not re.search(r"\s#", value)
 
 
-def render_env_value(value: str) -> str:
+def render_env_value(value: str, *, key: str | None = None) -> str:
     """Format a dotenv value for ``write_env_settings``, preserving plain safe values."""
-    return value if _plain_value_safe(value) else format_env_value(value)
+    check_env_value(value, key=key, label="dotenv value")
+    return value if _plain_value_safe(value) else format_env_value(value, key=key)
 
 
-def render_strict_env_value(value: str) -> str:
+def render_strict_env_value(value: str, *, key: str | None = None) -> str:
     """Format a generated dotenv value, quoting whenever whitespace or metacharacters appear."""
+    check_env_value(value, key=key, label="dotenv value")
     if not value or re.fullmatch(r"[A-Za-z0-9_.:/@+=,-]+", value):
         return value
-    return format_env_value(value)
+    return format_env_value(value, key=key)
 
 
 def write_env_setting(env_path: Path, key: str, value: str) -> None:
@@ -152,11 +211,15 @@ def write_env_settings(env_path: Path, settings: Mapping[str, str]) -> None:
     The LAST assignment of a key is the one every reader uses, so that is the
     line replaced; an `export ` prefix on it is kept.
     """
-    lines = env_path.read_text(encoding="utf-8").splitlines()
+    raw = env_path.read_bytes().decode("utf-8")
+    if raw == "":
+        lines: list[str] = []
+    elif raw.endswith("\n"):
+        lines = raw[:-1].split("\n")
+    else:
+        lines = raw.split("\n")
     for key, value in settings.items():
-        if "\n" in value or "\r" in value:
-            raise ValueError(f"{key} cannot contain a line break")
-        rendered = render_env_value(value)
+        rendered = render_env_value(value, key=key)
         target = None
         for index, line in enumerate(lines):
             match = _KEY_PATTERN.match(line.strip())
@@ -182,7 +245,7 @@ def atomic_write_text(path: Path, content: str, *, mode: int = 0o644) -> None:
     temporary_path = Path(temporary_name)
     try:
         os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())

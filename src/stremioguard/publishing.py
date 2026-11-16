@@ -88,7 +88,7 @@ def render_gluetun_env(env_text: str) -> str:
 def write_gluetun_env(root_dir: Path) -> Path:
     path = root_dir / GLUETUN_ENV_FILE
     env_file = root_dir / ".env"
-    content = render_gluetun_env(env_file.read_text(encoding="utf-8") if env_file.exists() else "")
+    content = render_gluetun_env(env_file.read_bytes().decode("utf-8") if env_file.exists() else "")
     atomic_write_text(path, content, mode=0o600)
     return path
 
@@ -301,7 +301,25 @@ class StackPublisher:
             )
             comet_config = dataclasses.replace(comet_config, image=image_override)
 
-        # 5. Render
+        # 5. Render every output before writing any file so a refusal leaves
+        # the previous generation byte-identical on disk.
+        gluetun_env_content: str | None = None
+        snapshot_content: str | None = None
+        base_compose_content: str | None = None
+        if self.deploying:
+            env_text = self.env_file.read_bytes().decode("utf-8") if self.env_file.exists() else ""
+            gluetun_env_content = render_gluetun_env(env_text)
+            snapshot_content = render_dotenv(
+                parse_dotenv(env_text, source=str(self.env_file)),
+                header=GENERATED_ENV_HEADER,
+            )
+            base_compose = self.root_dir / "docker-compose.yml"
+            if base_compose.exists():
+                base_compose_content = (
+                    "# Published copy of docker-compose.yml; do not edit by hand.\n"
+                    + base_compose.read_text(encoding="utf-8")
+                )
+
         content = render_stack_compose_override(
             bind_addresses=bind_addresses,
             stremio_host_port=stremio_host_port,
@@ -321,19 +339,14 @@ class StackPublisher:
         # compose_command only switches to the published base file and env
         # snapshot once all three exist.
         if self.deploying:
-            env_text = self.env_file.read_text(encoding="utf-8") if self.env_file.exists() else ""
-            write_gluetun_env(self.root_dir)
-            atomic_write_text(
-                self.root_dir / PUBLISHED_ENV_FILE,
-                render_dotenv(parse_dotenv(env_text), header=GENERATED_ENV_HEADER),
-                mode=0o600,
-            )
-            base_compose = self.root_dir / "docker-compose.yml"
-            if base_compose.exists():
+            assert gluetun_env_content is not None
+            assert snapshot_content is not None
+            atomic_write_text(self.root_dir / GLUETUN_ENV_FILE, gluetun_env_content, mode=0o600)
+            atomic_write_text(self.root_dir / PUBLISHED_ENV_FILE, snapshot_content, mode=0o600)
+            if base_compose_content is not None:
                 atomic_write_text(
                     self.root_dir / PUBLISHED_COMPOSE_FILE,
-                    "# Published copy of docker-compose.yml; do not edit by hand.\n"
-                    + base_compose.read_text(encoding="utf-8"),
+                    base_compose_content,
                     mode=0o600,
                 )
         atomic_write_text(self.compose_override_file, content, mode=0o644)

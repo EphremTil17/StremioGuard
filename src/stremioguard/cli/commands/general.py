@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 from contextlib import suppress
@@ -23,6 +22,7 @@ from stremioguard.cli.toolchain import _require_uv, _uv_command, run_guard
 from stremioguard.comet import prompt_comet_setup
 from stremioguard.config import CIRCUIT_BREAKER_EXIT_CODE, Config
 from stremioguard.env import (
+    atomic_write_text,
     env_flag_enabled,
     env_needs_init,
     fail,
@@ -104,7 +104,7 @@ def init() -> None:
     if not existing_setup:
         if not ENV_EXAMPLE.exists():
             fail(f"{ENV_EXAMPLE.name} not found; cannot bootstrap .env.")
-        shutil.copy(ENV_EXAMPLE, ENV_FILE)
+        atomic_write_text(ENV_FILE, ENV_EXAMPLE.read_text(encoding="utf-8"), mode=0o600)
         logger.success(f"Created {ENV_FILE.name} from {ENV_EXAMPLE.name}.")
     else:
         logger.info(f"{ENV_FILE.name} already exists.")
@@ -240,6 +240,10 @@ def start() -> None:
     # watchdog that systemd can keep alive.
     units_changed = supervisor.prepare_supervision()
     context = RunContext.create()
+    try:
+        supervisor.render_watchdog_env(context.env())
+    except ValueError as error:
+        fail(str(error))
     _run_guard_then_watch("start", context, units_changed=units_changed)
 
 
@@ -247,9 +251,13 @@ def restart() -> None:
     """Reset/build/start active services and restart the supervised watchdog."""
     _warn_for_optional_stremio_settings()
     units_changed = supervisor.prepare_supervision(allow_recovery=True)
+    context = RunContext.create()
+    try:
+        supervisor.render_watchdog_env(context.env())
+    except ValueError as error:
+        fail(str(error))
     if not supervisor.stop_watchdog():
         fail("The watchdog could not be confirmed stopped; refusing to reset the stack under it.")
-    context = RunContext.create()
     _run_guard_then_watch("reset", context, units_changed=units_changed)
 
 
