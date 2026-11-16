@@ -209,6 +209,7 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard, "preflight", return_value=False) as preflight_mock,
+                mock.patch.object(guard, "stop_active_services", return_value=True) as stop_mock,
                 mock.patch.object(guard, "compose_fresh") as compose_fresh_mock,
             ):
                 orch.setup_active_services(reset=False)
@@ -219,13 +220,17 @@ class OrchestratorTests(unittest.TestCase):
             preflight_mock.assert_called_once_with(
                 allow_recovery=False, defer_vpn_recovery=True, keep_running_gluetun=True
             )
+            stop_mock.assert_called_once_with()
             compose_fresh_mock.assert_not_called()
 
     def test_first_time_setup_never_clears_a_lockout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             guard = GluetunGuard(make_config(Path(directory)), FakeRunner({}))
             guard.config.vpn_lockout_file.write_text("{}", encoding="utf-8")
-            with mock.patch.object(guard, "preflight", return_value=False):
+            with (
+                mock.patch.object(guard, "preflight", return_value=False),
+                mock.patch.object(guard, "stop_active_services", return_value=True),
+            ):
                 Orchestrator(guard).setup_active_services(reset=False)
             self.assertTrue(guard.config.vpn_lockout_file.exists())
 
@@ -1290,7 +1295,7 @@ class SupervisedWatchdogTests(unittest.TestCase):
                 orch.fail_safe()
             self.assertEqual(g.read_vpn_lockout(), {"reason": "auth_rejected"})
 
-    def test_fail_safe_stops_services_even_if_marker_write_fails(self) -> None:
+    def test_fail_safe_stops_services_and_raises_if_marker_write_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             orch = self._orchestrator(Path(directory))
             g = orch.guard
@@ -1298,6 +1303,7 @@ class SupervisedWatchdogTests(unittest.TestCase):
                 mock.patch.object(g, "write_vpn_lockout", side_effect=OSError("read-only")),
                 mock.patch.object(g, "require_commands"),
                 mock.patch.object(g, "stop_active_services", return_value=True) as stop,
+                self.assertRaises(RuntimeError),
             ):
                 orch.fail_safe()
             stop.assert_called_once()
@@ -1420,10 +1426,12 @@ class SupervisedWatchdogTests(unittest.TestCase):
             with (
                 mock.patch.object(g, "compose"),
                 mock.patch.object(g, "preflight", return_value=False),
+                mock.patch.object(g, "stop_active_services", return_value=True) as stop_services,
                 mock.patch.object(g, "start_services") as start_services,
                 mock.patch.object(orchestrator_mod.time, "sleep"),
             ):
                 orch.setup_active_services(reset=True)
+            stop_services.assert_called_once_with()
             self.assertFalse(g.config.vpn_lockout_file.exists())
             start_services.assert_not_called()
 
@@ -1587,12 +1595,16 @@ def test_second_consecutive_leak_verdict_locks_out(tmp_path: Path) -> None:
     assert excinfo.value.exit_code == 78
     marker = json.loads(guard.config.vpn_lockout_file.read_text(encoding="utf-8"))
     assert marker["reason"] == "egress_leak"
-    assert "2 times in a row" in marker["evidence"]
+    assert "within 24 hours" in marker["evidence"]
     stop_gluetun.assert_called_once()
     start.assert_not_called()
 
 
-def test_single_leak_verdict_followed_by_safe_resumes(tmp_path: Path) -> None:
+def test_single_leak_verdict_followed_by_safe_resumes_then_second_locks_out(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
     guard, orch = _leak_orchestrator(tmp_path)
     with (
         mock.patch.object(guard, "gluetun_healthy", return_value=True),
@@ -1613,12 +1625,14 @@ def test_single_leak_verdict_followed_by_safe_resumes(tmp_path: Path) -> None:
         orch.watch_once()
         orch.watch_once()
         start.assert_called_once_with(["stremio"], build=True, check=False)
-        assert orch.consecutive_leak_verdicts == 0
-        # A later, non-consecutive verdict counts from one again.
-        orch.watch_once()
-    assert stop.call_count == 2
-    stop_gluetun.assert_not_called()
-    assert not guard.config.vpn_lockout_file.exists()
+        assert len(orch.leak_verdict_times) == 1
+        # A second verdict within 24 hours locks out even after a SAFE tick.
+        with pytest.raises(typer.Exit) as excinfo:
+            orch.watch_once()
+    assert excinfo.value.exit_code == 78
+    assert stop.call_count == 3
+    stop_gluetun.assert_called_once()
+    assert guard.config.vpn_lockout_file.exists()
 
 
 # --- Auto-start loop limit --------------------------------------------------------

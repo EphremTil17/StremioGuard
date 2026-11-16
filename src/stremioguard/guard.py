@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import os
+import socket
+import ssl
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -22,6 +27,8 @@ from stremioguard.config import (
     DOCKER_QUERY_TIMEOUT_SECONDS,
     GENERATED_COMPOSE_FILE,
     MANAGED_STACK_ENV,
+    REPEAT_WARNING_SECONDS,
+    TEARDOWN_MUTATION_TIMEOUT_SECONDS,
     WATCHDOG_MUTATION_TIMEOUT_SECONDS,
     CometConfig,
     Config,
@@ -143,6 +150,24 @@ DEFAULT_LOCKOUT_REMEDIATION = (
 )
 
 
+def lockout_marker_present(path: Path) -> bool:
+    """Whether a lockout marker is present or cannot be proven absent.
+
+    Returns True for any directory entry (regular file, symlink — dangling or
+    not — or directory) and whenever status cannot be read for any reason
+    other than FileNotFoundError.
+    """
+    if os.path.lexists(path):
+        return True
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def read_lockout_marker(path: Path) -> dict[str, object] | None:
     """The marker's details, or None when it is absent or unreadable.
 
@@ -151,7 +176,7 @@ def read_lockout_marker(path: Path) -> dict[str, object] | None:
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -165,17 +190,193 @@ class GluetunUnavailableError(RuntimeError):
     """
 
 
+class _ProbeConnectionTracker:
+    """Tracks sockets opened during one probe attempt so deadline expiry aborts any phase."""
+
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._sockets: list[socket.socket] = []
+
+    def remaining(self) -> float:
+        with self._lock:
+            if self._cancelled:
+                raise TimeoutError("probe deadline exceeded")
+        rem = self.deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("probe deadline exceeded")
+        return rem
+
+    def register(self, sock: socket.socket) -> None:
+        with self._lock:
+            if self._cancelled:
+                with suppress(OSError):
+                    sock.close()
+                raise TimeoutError("probe deadline exceeded")
+            self._sockets.append(sock)
+
+    def replace(self, old_sock: socket.socket, new_sock: socket.socket) -> None:
+        """Swap a wrapped raw socket for its SSLSocket before handshake I/O begins."""
+        with self._lock:
+            if old_sock in self._sockets:
+                self._sockets.remove(old_sock)
+            if self._cancelled:
+                with suppress(OSError):
+                    new_sock.close()
+                raise TimeoutError("probe deadline exceeded")
+            self._sockets.append(new_sock)
+
+    def unregister_and_close(self, sock: socket.socket) -> None:
+        with self._lock:
+            if sock in self._sockets:
+                self._sockets.remove(sock)
+        with suppress(OSError):
+            sock.close()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            for sock in self._sockets:
+                with suppress(OSError):
+                    if sock.fileno() != -1:
+                        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+    def close_all(self) -> None:
+        with self._lock:
+            sockets = list(self._sockets)
+            self._sockets.clear()
+        for sock in sockets:
+            with suppress(OSError):
+                sock.close()
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+
+def _tracked_create_connection(
+    tracker: _ProbeConnectionTracker,
+    address: tuple[str, int],
+    timeout: float | None = None,
+    source_address: tuple[str, int] | None = None,
+) -> socket.socket:
+    host, port = address
+    err: OSError | None = None
+    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        af, socktype, proto, _, sa = res
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            rem = tracker.remaining()
+            sock.settimeout(rem if timeout is None else min(timeout, rem))
+            if source_address:
+                sock.bind(source_address)
+            tracker.register(sock)
+            sock.connect(sa)
+            err = None
+            return sock
+        except OSError as exc:
+            err = exc
+            if sock is not None:
+                tracker.unregister_and_close(sock)
+    if err is not None:
+        raise err
+    raise OSError("getaddrinfo returns an empty list")
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, tracker: _ProbeConnectionTracker) -> None:
+        super().__init__()
+        self._tracker = tracker
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        tracker = self._tracker
+
+        class _Conn(http.client.HTTPConnection):
+            def connect(self) -> None:
+                self._create_connection = lambda address, timeout=None, source_address=None: (
+                    _tracked_create_connection(tracker, address, timeout, source_address)
+                )
+                super().connect()
+
+        return self.do_open(_Conn, req)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(
+        self,
+        tracker: _ProbeConnectionTracker,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
+        self._ssl_context = context if context is not None else ssl.create_default_context()
+        super().__init__(context=self._ssl_context)
+        self._tracker = tracker
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        tracker = self._tracker
+        ssl_context = self._ssl_context
+
+        class _Conn(http.client.HTTPSConnection):
+            def connect(self) -> None:
+                self._create_connection = lambda address, timeout=None, source_address=None: (
+                    _tracked_create_connection(tracker, address, timeout, source_address)
+                )
+                # Connect TCP (and HTTP tunnel if configured) first, then wrap without
+                # handshaking so the SSLSocket is tracked before any TLS I/O runs.
+                http.client.HTTPConnection.connect(self)
+                raw_sock = self.sock
+                assert raw_sock is not None
+                server_hostname: str = getattr(self, "_tunnel_host", None) or self.host
+                ssl_sock: ssl.SSLSocket | None = None
+                try:
+                    ssl_sock = ssl_context.wrap_socket(
+                        raw_sock,
+                        server_hostname=server_hostname,
+                        do_handshake_on_connect=False,
+                    )
+                    self.sock = ssl_sock
+                    tracker.replace(raw_sock, ssl_sock)
+                    rem = tracker.remaining()
+                    current_timeout = ssl_sock.gettimeout()
+                    ssl_sock.settimeout(
+                        rem if current_timeout is None else min(current_timeout, rem)
+                    )
+                    ssl_sock.do_handshake()
+                except BaseException:
+                    tracker.unregister_and_close(raw_sock)
+                    if ssl_sock is not None:
+                        tracker.unregister_and_close(ssl_sock)
+                    raise
+
+        return self.do_open(_Conn, req, context=ssl_context)
+
+
 class GluetunGuard:
     def __init__(
-        self, config: Config, runner: Runner | None = None, *, frozen: bool = False
+        self,
+        config: Config,
+        runner: Runner | None = None,
+        *,
+        frozen: bool = False,
+        teardown: bool = False,
     ) -> None:
         """``frozen`` is the watchdog's mode: run the published generation as
-        it is, never render a new one, and bound every Docker call."""
+        it is, never render a new one, and bound every Docker call.
+        ``teardown`` bounds mutation calls for fail-safe and ``stop``.
+        """
         self.config = config
         self.runner = runner or SubprocessRunner()
         self._env_path = self.config.env_file or self.config.root_dir / ".env"
         self.frozen = frozen
-        self.mutation_timeout: float | None = WATCHDOG_MUTATION_TIMEOUT_SECONDS if frozen else None
+        self.teardown = teardown
+        if teardown:
+            self.mutation_timeout: float | None = TEARDOWN_MUTATION_TIMEOUT_SECONDS
+        elif frozen:
+            self.mutation_timeout = WATCHDOG_MUTATION_TIMEOUT_SECONDS
+        else:
+            self.mutation_timeout = None
         self.last_gluetun_state: GluetunState | None = None
         self._evidence_cursor = 0.0
         self.last_observed_ip: str | None = None
@@ -187,6 +388,8 @@ class GluetunGuard:
         self._verified_control_ip: str | None = None
         self._last_egress_probe_time = 0.0
         self._warned_snapshot_pair: tuple[str, str] | None = None
+        self._egress_warned_at: float | None = None
+        self._host_ip_warned_at: float | None = None
 
     def log(self, message: str) -> None:
         logger.info(message)
@@ -205,7 +408,7 @@ class GluetunGuard:
         return read_lockout_marker(self.config.vpn_lockout_file)
 
     def check_vpn_lockout(self, *, allow_recovery: bool = False) -> None:
-        if not self.config.vpn_lockout_file.exists():
+        if not lockout_marker_present(self.config.vpn_lockout_file):
             return
         if allow_recovery:
             self.log(
@@ -265,7 +468,7 @@ class GluetunGuard:
         )
 
     def clear_vpn_lockout(self) -> None:
-        if self.config.vpn_lockout_file.exists():
+        if lockout_marker_present(self.config.vpn_lockout_file):
             try:
                 self.config.vpn_lockout_file.unlink()
                 self.log("Cleared VPN lockout marker.")
@@ -470,9 +673,11 @@ class GluetunGuard:
         container_id = self.service_container_id("gluetun")
         if not container_id:
             return ""
-        cmd = ["docker", "logs", "--tail", str(lines)]
+        cmd = ["docker", "logs"]
         if since_epoch is not None:
             cmd.extend(["--since", str(int(since_epoch))])
+        else:
+            cmd.extend(["--tail", str(lines)])
         cmd.append(container_id)
         result = self.runner.run(cmd, check=False, timeout=DOCKER_QUERY_TIMEOUT_SECONDS)
         parts = [p for p in (result.stdout or "", result.stderr or "") if p.strip()]
@@ -535,6 +740,51 @@ class GluetunGuard:
             "Check the log lines above or run `docker logs gluetun` for details."
         )
 
+    @staticmethod
+    def _fetch_ip_url(
+        opener: urllib.request.OpenerDirector,
+        url: str,
+        timeout: float,
+        *,
+        tracker: _ProbeConnectionTracker | None = None,
+    ) -> str | None:
+        """Fetch up to 128 bytes from ``url`` under a strict wall-clock deadline."""
+        timeout_seconds = max(0.0, timeout)
+        active_tracker = tracker or _ProbeConnectionTracker(time.monotonic() + timeout_seconds)
+        result: list[str | None] = [None]
+        done = threading.Event()
+        request = urllib.request.Request(url, headers={"User-Agent": "stremio-vpn-guard/1"})
+
+        def _worker() -> None:
+            try:
+                with opener.open(request, timeout=timeout_seconds) as response:
+                    raw = response.read(128)
+                if not active_tracker.cancelled:
+                    if isinstance(raw, bytes):
+                        result[0] = raw.decode("utf-8", errors="replace")
+                    elif isinstance(raw, str):
+                        result[0] = raw
+            except (
+                OSError,
+                urllib.error.URLError,
+                TimeoutError,
+                http.client.HTTPException,
+                ValueError,
+            ):
+                pass
+            finally:
+                active_tracker.close_all()
+                done.set()
+
+        thread = threading.Thread(target=_worker, name="stremioguard-ip-probe", daemon=True)
+        thread.start()
+        if not done.wait(timeout=timeout_seconds):
+            active_tracker.cancel()
+            thread.join(timeout=0.5)
+            return None
+        thread.join(timeout=0.1)
+        return result[0]
+
     def public_ip(self, *, version: int | None = None) -> str | None:
         """This host's direct public IP, optionally restricted to one IP family.
 
@@ -543,15 +793,16 @@ class GluetunGuard:
         skipped rather than returned, because comparing an IPv6 host address
         with an IPv4 tunnel egress could never match and would pass silently.
         """
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        timeout = float(self.config.public_ip_timeout_seconds)
         for url in self.config.ip_check_urls:
-            try:
-                request = urllib.request.Request(url, headers={"User-Agent": "stremio-vpn-guard/1"})
-                with opener.open(
-                    request, timeout=self.config.public_ip_timeout_seconds
-                ) as response:
-                    body = response.read(128).decode("utf-8", errors="replace")
-            except (OSError, urllib.error.URLError, TimeoutError):
+            tracker = _ProbeConnectionTracker(time.monotonic() + max(0.0, timeout))
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                _DeadlineHTTPHandler(tracker),
+                _DeadlineHTTPSHandler(tracker),
+            )
+            body = self._fetch_ip_url(opener, url, timeout, tracker=tracker)
+            if body is None:
                 continue
             ip = parse_public_ip(body)
             if ip and (version is None or ipaddress.ip_address(ip).version == version):
@@ -559,24 +810,35 @@ class GluetunGuard:
         return None
 
     def public_ip_via_gluetun(self) -> str | None:
-        container_id = self.service_container_id("gluetun")
+        try:
+            container_id = self.service_container_id("gluetun")
+        except (subprocess.SubprocessError, OSError):
+            return None
         if not container_id:
             return None
+        t = self.config.public_ip_timeout_seconds
         for url in self.config.ip_check_urls:
-            result = self.runner.run(
-                [
-                    "docker",
-                    "exec",
-                    container_id,
-                    "wget",
-                    "-qO-",
-                    "--timeout",
-                    str(self.config.public_ip_timeout_seconds),
-                    url,
-                ],
-                check=False,
-                timeout=self.config.public_ip_timeout_seconds + 2,
-            )
+            try:
+                result = self.runner.run(
+                    [
+                        "docker",
+                        "exec",
+                        container_id,
+                        "timeout",
+                        "-s",
+                        "KILL",
+                        str(t),
+                        "wget",
+                        "--tries=1",
+                        f"--timeout={t}",
+                        "-qO-",
+                        url,
+                    ],
+                    check=False,
+                    timeout=t + 2,
+                )
+            except (subprocess.SubprocessError, OSError):
+                continue
             if result.returncode == 0:
                 ip = parse_public_ip(result.stdout or "")
                 if ip:
@@ -587,27 +849,38 @@ class GluetunGuard:
         if self._control_server_failed:
             return None
 
-        container_id = self.service_container_id("gluetun")
+        try:
+            container_id = self.service_container_id("gluetun")
+        except (subprocess.SubprocessError, OSError):
+            return None
         if not container_id:
             return None
 
         # No -q: quiet mode suppresses the HTTP status line on stderr, which is
         # the only way to distinguish an auth/route failure (permanent) from a
         # transient one. The response body still arrives alone on stdout.
-        result = self.runner.run(
-            [
-                "docker",
-                "exec",
-                container_id,
-                "wget",
-                "-O-",
-                "--timeout",
-                str(self.config.public_ip_timeout_seconds),
-                "http://127.0.0.1:18080/v1/publicip/ip",
-            ],
-            check=False,
-            timeout=self.config.public_ip_timeout_seconds + 2,
-        )
+        t = self.config.public_ip_timeout_seconds
+        try:
+            result = self.runner.run(
+                [
+                    "docker",
+                    "exec",
+                    container_id,
+                    "timeout",
+                    "-s",
+                    "KILL",
+                    str(t),
+                    "wget",
+                    "--tries=1",
+                    f"--timeout={t}",
+                    "-O-",
+                    "http://127.0.0.1:18080/v1/publicip/ip",
+                ],
+                check=False,
+                timeout=t + 2,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
 
         if result.returncode != 0:
             output = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
@@ -662,10 +935,17 @@ class GluetunGuard:
             return PublicIPAssessment.SAFE
 
         self._verified_egress_ip = None
-        egress_ip = self.public_ip_via_gluetun()
+        egress_raw = self.public_ip_via_gluetun()
+        egress_ip = parse_public_ip(egress_raw) if egress_raw else None
         if not egress_ip:
-            self.warn("Could not determine the tunnel egress IP via gluetun.")
+            if (
+                self._egress_warned_at is None
+                or now - self._egress_warned_at >= REPEAT_WARNING_SECONDS
+            ):
+                self._egress_warned_at = now
+                self.warn("Could not determine the tunnel egress IP via gluetun.")
             return PublicIPAssessment.UNKNOWN
+        self._egress_warned_at = None
 
         if log_observation:
             self.log(f"Observed public IP: {egress_ip}")
@@ -673,14 +953,28 @@ class GluetunGuard:
             self.log(f"Public IP changed from {self.last_observed_ip} to {egress_ip}.")
         self.last_observed_ip = egress_ip
 
-        home_ip = None
+        egress_version = ipaddress.ip_address(egress_ip).version
+        raw_home: str | None = None
         if self.config.home_ip_file.exists():
             self._warn_if_home_ip_stale()
             # A malformed baseline counts as missing, so it cannot stand in for a
             # failed host probe.
-            home_ip = parse_public_ip(self.config.home_ip_file.read_text(encoding="utf-8"))
+            try:
+                raw_home = parse_public_ip(
+                    self.config.home_ip_file.read_text(encoding="utf-8", errors="replace")
+                )
+            except OSError:
+                raw_home = None
+        home_ip = (
+            raw_home
+            if raw_home is not None and ipaddress.ip_address(raw_home).version == egress_version
+            else None
+        )
 
-        host_ip = self.public_ip(version=ipaddress.ip_address(egress_ip).version)
+        host_raw = self.public_ip(version=egress_version)
+        host_ip = parse_public_ip(host_raw) if host_raw else None
+        if host_ip is not None and ipaddress.ip_address(host_ip).version != egress_version:
+            host_ip = None
         if host_ip == egress_ip:
             self.warn(
                 f"Tunnel egress IP {egress_ip} equals this host's direct public IP; "
@@ -688,14 +982,32 @@ class GluetunGuard:
             )
             return PublicIPAssessment.UNSAFE_DEFINITIVE
         if host_ip is None and home_ip is None:
-            self.warn(
-                "Could not determine this host's direct public IP and no valid home-IP "
-                "baseline is recorded, so the tunnel egress cannot be proven to differ from it. "
-                "Run `./stremio record-home-ip` while gluetun is stopped."
-            )
+            if (
+                self._host_ip_warned_at is None
+                or now - self._host_ip_warned_at >= REPEAT_WARNING_SECONDS
+            ):
+                self._host_ip_warned_at = now
+                if raw_home is not None:
+                    self.warn(
+                        f"Could not determine this host's direct IPv{egress_version} public IP "
+                        f"and the recorded home-IP baseline ({raw_home}) is a different address "
+                        "family, so the tunnel egress cannot be proven to differ from it."
+                    )
+                else:
+                    self.warn(
+                        "Could not determine this host's direct public IP and no valid home-IP "
+                        "baseline is recorded, so the tunnel egress cannot be proven to differ "
+                        "from it. Run `./stremio record-home-ip` while gluetun is stopped."
+                    )
             return PublicIPAssessment.UNKNOWN
+        self._host_ip_warned_at = None
 
-        if self.config.expected_vpn_ip and egress_ip != self.config.expected_vpn_ip:
+        expected_vpn_ip = (
+            parse_public_ip(self.config.expected_vpn_ip) or self.config.expected_vpn_ip
+            if self.config.expected_vpn_ip
+            else None
+        )
+        if expected_vpn_ip and egress_ip != expected_vpn_ip:
             self.warn(f"Public IP does not match EXPECTED_VPN_IP={self.config.expected_vpn_ip}.")
             return PublicIPAssessment.UNSAFE_DEFINITIVE
 
@@ -868,16 +1180,15 @@ class GluetunGuard:
             if not defer_vpn_recovery:
                 raise
             self.warn(
-                "Gluetun is unavailable at startup. Protected services remain stopped; "
-                "the watchdog will own the bounded recovery window."
+                "Gluetun is unavailable at startup; stopping protected services and "
+                "handing bounded recovery to the watchdog."
             )
             return False
         if not self.public_ip_safe(log_observation=True):
             if defer_vpn_recovery:
                 self.warn(
-                    "Gluetun is healthy but its public IP cannot be verified at startup. "
-                    "Protected services remain stopped; the watchdog will continue "
-                    "fail-closed monitoring."
+                    "Gluetun is healthy but its public IP cannot be verified at startup; "
+                    "stopping protected services for fail-closed watchdog monitoring."
                 )
                 return False
             raise RuntimeError("Public IP check failed via gluetun; refusing to start services.")
@@ -895,7 +1206,11 @@ class GluetunGuard:
         # `preflight` has rendered the Comet bundle, and publishing without
         # one raises. Asking "does an instance exist" must stay a question.
         for service in self.enabled_runtime_services():
-            result = self.runner.run(self._compose_command("ps", "-a", "-q", service), check=False)
+            result = self.runner.run(
+                self._compose_command("ps", "-a", "-q", service),
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
             if bool((result.stdout or "").strip()):
                 return True
         return False
@@ -906,20 +1221,26 @@ class GluetunGuard:
         None when Docker cannot answer: callers decide whether that counts
         as running (stop paths) or not (start paths).
         """
-        result = self.runner.run(
-            self._compose_command("ps", "--status", "running", "--services", *services),
-            check=False,
-            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
-        )
+        try:
+            result = self.runner.run(
+                self._compose_command("ps", "--status", "running", "--services", *services),
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
         if result.returncode != 0:
             return None
         return set((result.stdout or "").split()) & set(services)
 
-    def container_running(self, services: list[str] | None = None) -> bool:
+    def container_running(self, services: list[str] | None = None) -> bool | None:
+        """Whether all ``services`` are running, or ``None`` if Docker did not answer."""
         if services is None:
             services = self.enabled_runtime_services()
         running = self.running_services(services)
-        return running is not None and running >= set(services)
+        if running is None:
+            return None
+        return running >= set(services)
 
     def start_services(
         self, services: list[str], *, build: bool = False, check: bool = True
@@ -974,7 +1295,11 @@ class GluetunGuard:
         ]
 
     def _docker_stop_service(self, service: str) -> None:
-        container_id = self.service_container_id(service)
+        try:
+            container_id = self.service_container_id(service)
+        except (subprocess.SubprocessError, OSError) as error:
+            self.warn(f"Could not resolve container ID for {service}: {error}")
+            return
         if not container_id:
             return
         try:
@@ -983,7 +1308,7 @@ class GluetunGuard:
                 check=False,
                 timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
             )
-        except subprocess.SubprocessError as error:
+        except (subprocess.SubprocessError, OSError) as error:
             self.warn(f"Direct `docker stop` failed for {service} ({container_id[:12]}): {error}")
 
     def stop_active_services(self, services: list[str] | None = None) -> bool:
@@ -1037,10 +1362,17 @@ class GluetunGuard:
 
     def stop_gluetun(self) -> None:
         self.log("Stopping gluetun VPN container.")
-        result = self.compose("stop", "gluetun", check=False)
-        if self.container_running(["gluetun"]) or result.returncode != 0:
+        compose_ok = False
+        try:
+            result = self.compose("stop", "gluetun", check=False)
+            compose_ok = result.returncode == 0
+        except (subprocess.SubprocessError, OSError) as error:
+            self.warn(
+                f"`docker compose stop gluetun` failed ({error}); falling back to `docker stop`."
+            )
+        if self.container_running(["gluetun"]) is not False or not compose_ok:
             self._docker_stop_service("gluetun")
-            if self.container_running(["gluetun"]):
+            if self.container_running(["gluetun"]) is not False:
                 self.warn(
                     "FATAL: Gluetun VPN container could not be stopped. "
                     "Container may still be running in the background."

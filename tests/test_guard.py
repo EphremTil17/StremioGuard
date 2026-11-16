@@ -251,10 +251,14 @@ class GluetunGuardTests(unittest.TestCase):
                 "docker",
                 "exec",
                 "gluetun",
-                "wget",
-                "-qO-",
-                "--timeout",
+                "timeout",
+                "-s",
+                "KILL",
                 "1",
+                "wget",
+                "--tries=1",
+                "--timeout=1",
+                "-qO-",
                 "https://example.test/ip",
             )
             runner = FakeRunner(
@@ -608,10 +612,14 @@ class GluetunGuardTests(unittest.TestCase):
                 "docker",
                 "exec",
                 "gluetun-id",
-                "wget",
-                "-O-",
-                "--timeout",
+                "timeout",
+                "-s",
+                "KILL",
                 "1",
+                "wget",
+                "--tries=1",
+                "--timeout=1",
+                "-O-",
                 "http://127.0.0.1:18080/v1/publicip/ip",
             ]
             runner = FakeRunner({tuple(cmd): completed(cmd, '{"public_ip": "203.0.113.5"}')})
@@ -628,10 +636,14 @@ class GluetunGuardTests(unittest.TestCase):
                 "docker",
                 "exec",
                 "gluetun-id",
-                "wget",
-                "-O-",
-                "--timeout",
+                "timeout",
+                "-s",
+                "KILL",
                 "1",
+                "wget",
+                "--tries=1",
+                "--timeout=1",
+                "-O-",
                 "http://127.0.0.1:18080/v1/publicip/ip",
             ]
             # BusyBox wget shape: exit 1 with the status line on stderr.
@@ -660,10 +672,14 @@ class GluetunGuardTests(unittest.TestCase):
                 "docker",
                 "exec",
                 "gluetun-id",
-                "wget",
-                "-O-",
-                "--timeout",
+                "timeout",
+                "-s",
+                "KILL",
                 "1",
+                "wget",
+                "--tries=1",
+                "--timeout=1",
+                "-O-",
                 "http://127.0.0.1:18080/v1/publicip/ip",
             ]
             runner = FakeRunner({tuple(cmd): completed(cmd, stdout="", returncode=6)})
@@ -680,10 +696,14 @@ class GluetunGuardTests(unittest.TestCase):
                 "docker",
                 "exec",
                 "gluetun-id",
-                "wget",
-                "-O-",
-                "--timeout",
+                "timeout",
+                "-s",
+                "KILL",
                 "1",
+                "wget",
+                "--tries=1",
+                "--timeout=1",
+                "-O-",
                 "http://127.0.0.1:18080/v1/publicip/ip",
             ]
             runner = FakeRunner(
@@ -1115,7 +1135,7 @@ class DaemonIdentityTests(unittest.TestCase):
                     guard.clear_vpn_lockout()
                 self.assertIn("Failed to remove VPN lockout marker", str(ctx.exception))
 
-    def test_gluetun_recent_logs_passes_bounded_tail_and_since(self) -> None:
+    def test_gluetun_recent_logs_omits_tail_when_since_is_given(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             runner = FakeRunner({})
@@ -1123,7 +1143,7 @@ class DaemonIdentityTests(unittest.TestCase):
             with mock.patch.object(guard, "service_container_id", return_value="gluetun-abc"):
                 guard.gluetun_recent_logs(lines=30, since_epoch=1700000000.0)
             self.assertIn(
-                ["docker", "logs", "--tail", "30", "--since", "1700000000", "gluetun-abc"],
+                ["docker", "logs", "--since", "1700000000", "gluetun-abc"],
                 runner.calls,
             )
 
@@ -1389,7 +1409,7 @@ class EgressAssessmentTests(unittest.TestCase):
                 self.assertEqual(guard.public_ip(), "2001:db8::1")
 
 
-def test_running_check_is_one_query_and_unknown_is_not_running(tmp_path: Path) -> None:
+def test_running_check_is_one_query_and_unknown_is_none(tmp_path: Path) -> None:
     runner = FakeRunner(
         compose_stack_responses(
             tmp_path,
@@ -1403,7 +1423,7 @@ def test_running_check_is_one_query_and_unknown_is_not_running(tmp_path: Path) -
     query = (*compose_args_prefix(tmp_path), "ps", "--status", "running", "--services", "comet")
     runner.responses[query] = completed([], returncode=1)
     assert guard.running_services(["comet"]) is None
-    assert guard.container_running(["comet"]) is False
+    assert guard.container_running(["comet"]) is None
     assert guard.services_confirmed_stopped(["comet"]) is False
 
 

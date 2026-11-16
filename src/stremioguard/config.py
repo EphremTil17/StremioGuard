@@ -38,6 +38,10 @@ PUBLISHED_ENV_FILE = ".stremio/env.snapshot"
 DOCKER_QUERY_TIMEOUT_SECONDS = 30
 # Bound on one watchdog-driven `compose up/stop`; below the unit's WatchdogSec.
 WATCHDOG_MUTATION_TIMEOUT_SECONDS = 240
+# Bound on one teardown `compose stop` (fail-safe / `./stremio stop`).
+TEARDOWN_MUTATION_TIMEOUT_SECONDS = 120
+# While a failure persists, repeat its warning at most this often.
+REPEAT_WARNING_SECONDS = 300
 DEFAULT_COMET_HOST_PORT = 18000
 DEFAULT_COMET_GATEWAY_HOST_PORT = 18001
 CIRCUIT_BREAKER_EXIT_CODE = 78
@@ -111,9 +115,12 @@ def parse_public_ip(text: str) -> str | None:
     if not candidate:
         return None
     try:
-        return str(ipaddress.ip_address(candidate))
+        ip = ipaddress.ip_address(candidate)
     except ValueError:
         return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    return str(ip)
 
 
 def compose_command(root_dir: Path, *args: str) -> list[str]:
@@ -197,6 +204,8 @@ class SubprocessRunner:
             args,
             check=check,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=capture,
             timeout=timeout,
             env=env,
@@ -220,7 +229,14 @@ def docker_permission_help(output: str) -> str | None:
 
 
 def docker_daemon_help(runner: Runner) -> str | None:
-    result = runner.run(["docker", "ps", "--format", "{{.ID}}"], check=False)
+    try:
+        result = runner.run(
+            ["docker", "ps", "--format", "{{.ID}}"],
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
     detail = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
     return docker_permission_help(detail)
 

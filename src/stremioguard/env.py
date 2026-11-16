@@ -192,6 +192,11 @@ def atomic_write_text(path: Path, content: str, *, mode: int = 0o644) -> None:
             os.close(fd)
         temporary_path.unlink(missing_ok=True)
         raise
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def validate_wireguard_private_key(value: str) -> str:

@@ -21,11 +21,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import typer
 from loguru import logger
 
 from stremioguard.cli.context import ROOT_DIR, STATE_DIR, RunContext
-from stremioguard.config import CONFIG_ENV_KEYS, LOCKOUT_FILE_NAME, PUBLISHED_ENV_FILE
+from stremioguard.config import (
+    CIRCUIT_BREAKER_EXIT_CODE,
+    CONFIG_ENV_KEYS,
+    LOCKOUT_FILE_NAME,
+    PUBLISHED_ENV_FILE,
+)
 from stremioguard.env import atomic_write_text, fail
+from stremioguard.guard import lockout_marker_present
 
 WATCHDOG_UNIT = "stremioguard-watchdog.service"
 FAILSAFE_UNIT = "stremioguard-failsafe.service"
@@ -51,6 +58,24 @@ START_LIMIT_BURST = 6
 # the backoff must fit in START_LIMIT_INTERVAL_SEC, or a hang loop would never
 # hit the start limit and the fail-safe would never run.
 WATCHDOG_SEC = 300
+# Slow-success worst-case `fail_safe()` duration across a 5-service stack
+# (stremio, comet-gateway, comet, stremthru, comet-postgres), where every call
+# runs for its full timeout and then answers:
+# - _preferred_stack_lock wait: <= 60s (TEARDOWN_LOCK_WAIT_SECONDS)
+# - write_vpn_lockout() container lookup (`compose ps -q gluetun`): 30s
+# - require_commands(): `docker compose version` (30s) + `docker ps` (30s) +
+#   `docker info` (30s) = 90s
+# - stop_active_services():
+#     `compose config --services` (30s) + initial `ps --status running` (30s) +
+#     `compose stop` returning nonzero (TEARDOWN_MUTATION_TIMEOUT_SECONDS=120s) +
+#     fallback `ps --status running` (30s) +
+#     5 x (`compose ps -q <svc>` 30s + `docker stop` 30s = 60s -> 300s) +
+#     final confirm `ps --status running` (30s) = 540s
+# - _alert() delivery: <= 5s (ALERT_TIMEOUT_SECONDS)
+# Total: 60 + 30 + 90 + 540 = 720s (19 Docker calls = 660s + 60s lock wait; 725s
+# including alert, or 755s if `compose stop` exits 0 and runs an extra confirm).
+# Choosing 1200s provides > 50% headroom over the slow-success worst case.
+FAILSAFE_TIMEOUT_START_SEC = 1200
 
 _DOCKER_CLIENT_KEYS = (
     "DOCKER_HOST",
@@ -246,6 +271,7 @@ WorkingDirectory={_unit_value(ROOT_DIR)}
 Environment=STREMIOGUARD_MANAGED=1 PYTHONUNBUFFERED=1
 EnvironmentFile=-{_unit_value(watchdog_env_file())}
 ExecStart={_exec_arg(_python())} -m stremioguard.orchestrator failsafe
+TimeoutStartSec={FAILSAFE_TIMEOUT_START_SEC}
 Restart=on-failure
 RestartSec=30
 """
@@ -420,12 +446,30 @@ def retire_legacy_watchdog() -> None:
     pid_file.unlink(missing_ok=True)
 
 
-def prepare_supervision() -> bool:
+def require_failsafe_clear() -> None:
+    """Refuse normal starts while the fail-safe unit is failed or activating."""
+    try:
+        state = unit_state(FAILSAFE_UNIT)
+    except RuntimeError as error:
+        fail(str(error))
+    if state.active_state in {"failed", "activating"}:
+        logger.error(
+            f"{FAILSAFE_UNIT} is {state.active_state}/{state.sub_state} "
+            f"(result={state.result or 'unknown'}); refusing to start while a fail-safe "
+            "lockout or shutdown is in effect. Inspect with "
+            f"`systemctl --user status {FAILSAFE_UNIT}` and recover with `./stremio restart`."
+        )
+        raise typer.Exit(CIRCUIT_BREAKER_EXIT_CODE)
+
+
+def prepare_supervision(*, allow_recovery: bool = False) -> bool:
     """Everything that must hold before protected services may start.
 
     Returns whether the unit files changed.
     """
     require_user_systemd()
+    if not allow_recovery:
+        require_failsafe_clear()
     retire_legacy_watchdog()
     return install_units()
 
@@ -438,8 +482,11 @@ def start_watchdog(context: RunContext, *, units_changed: bool) -> None:
     """
     settings_changed = write_watchdog_env(context.env())
     before = unit_state(WATCHDOG_UNIT)
-    # Clears a start-limit hit. Only reached after `run_guard("start")`
-    # passed the lockout check, so this never bypasses a fail-safe lockout.
+    # Clears any prior failed/start-limit state on both units. For `./stremio start`,
+    # the fail-safe unit check and `run_guard("start")` exit-78 lockout check have
+    # already passed (other non-78 `run_guard` exits still reach here to keep any
+    # running containers watched); for `./stremio restart`, this is the operator's
+    # deliberate recovery.
     _systemctl("reset-failed", WATCHDOG_UNIT, FAILSAFE_UNIT)
     if before.running and not (units_changed or settings_changed):
         logger.info(f"Watchdog already running under systemd (PID {before.main_pid}).")
@@ -476,7 +523,7 @@ def require_supervised_stack() -> None:
     directly. They are safe only while the watchdog is verifying the tunnel
     and no lockout is in force; otherwise they would bypass both.
     """
-    if (STATE_DIR / LOCKOUT_FILE_NAME).exists():
+    if lockout_marker_present(STATE_DIR / LOCKOUT_FILE_NAME):
         fail("A lockout is active; recover with `./stremio restart` or `./stremio unlock` first.")
     running = watchdog_running()
     if running is None:
@@ -514,6 +561,7 @@ def stop_watchdog() -> bool:
 def status_lines() -> list[str]:
     try:
         watchdog = unit_state(WATCHDOG_UNIT)
+        failsafe = unit_state(FAILSAFE_UNIT)
         boot = unit_state(BOOT_UNIT)
     except (RuntimeError, OSError) as error:
         return [f"unavailable: {error}"]
@@ -523,6 +571,8 @@ def status_lines() -> list[str]:
     return [
         f"{WATCHDOG_UNIT}: {watchdog.active_state}/{watchdog.sub_state}{pid}, "
         f"restarts={watchdog.restarts}, last result={watchdog.result}",
+        f"{FAILSAFE_UNIT}: {failsafe.active_state}/{failsafe.sub_state}, "
+        f"last result={failsafe.result}",
         f"start at boot: {boot.unit_file_state or 'unknown'}"
         + ("" if boot.unit_file_state == "enabled" else f" (systemctl --user enable {BOOT_UNIT})"),
     ]

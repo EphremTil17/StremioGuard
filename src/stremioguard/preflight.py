@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
 
-from stremioguard.config import Runner, docker_permission_help
+from stremioguard.config import (
+    DOCKER_QUERY_TIMEOUT_SECONDS,
+    Runner,
+    docker_permission_help,
+)
+
+_DAEMON_UNREACHABLE_MESSAGE = (
+    "Docker is installed, but the daemon is not reachable from this shell. "
+    "Run `docker ps` to confirm and fix Docker access before retrying."
+)
 
 
 def require_docker(
@@ -28,7 +38,14 @@ def require_docker(
                 f"Missing required command(s): {', '.join(missing)}\n{_install_hint(missing)}"
             )
 
-    result = runner.run(["docker", "compose", "version"], check=False)
+    try:
+        result = runner.run(
+            ["docker", "compose", "version"],
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(_DAEMON_UNREACHABLE_MESSAGE) from error
     if result.returncode != 0:
         detail = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
         help_text = docker_permission_help(detail)
@@ -36,16 +53,20 @@ def require_docker(
             raise RuntimeError(help_text)
         raise RuntimeError("Docker Compose plugin is not available.")
 
-    daemon_result = runner.run(["docker", "ps", "--format", "{{.ID}}"], check=False)
+    try:
+        daemon_result = runner.run(
+            ["docker", "ps", "--format", "{{.ID}}"],
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(_DAEMON_UNREACHABLE_MESSAGE) from error
     if daemon_result.returncode != 0:
         detail = f"{daemon_result.stdout or ''}\n{daemon_result.stderr or ''}".strip()
         help_text = docker_permission_help(detail)
         if help_text:
             raise RuntimeError(help_text)
-        raise RuntimeError(
-            "Docker is installed, but the daemon is not reachable from this shell. "
-            "Run `docker ps` to confirm and fix Docker access before retrying."
-        )
+        raise RuntimeError(_DAEMON_UNREACHABLE_MESSAGE)
 
 
 def require_matching_daemon(
@@ -65,7 +86,15 @@ def require_matching_daemon(
     collides with an unrelated process. Pin the daemon on first start and
     refuse to move without an explicit opt-out.
     """
-    result = runner.run(["docker", "info", "--format", "{{.ID}}"], check=False)
+    try:
+        result = runner.run(
+            ["docker", "info", "--format", "{{.ID}}"],
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        warn("Could not read the Docker daemon ID; skipping the daemon-identity check.")
+        return
     current = (result.stdout or "").strip()
     if result.returncode != 0 or not current:
         # Older engines and odd endpoints may not report an ID. A missing

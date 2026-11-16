@@ -29,7 +29,7 @@ from stremioguard.env import (
     read_env_provider,
     write_env_setting,
 )
-from stremioguard.guard import read_lockout_marker
+from stremioguard.guard import lockout_marker_present, read_lockout_marker
 from stremioguard.init import (
     configure_external_access,
     configure_optional_stremio_settings,
@@ -246,7 +246,7 @@ def start() -> None:
 def restart() -> None:
     """Reset/build/start active services and restart the supervised watchdog."""
     _warn_for_optional_stremio_settings()
-    units_changed = supervisor.prepare_supervision()
+    units_changed = supervisor.prepare_supervision(allow_recovery=True)
     if not supervisor.stop_watchdog():
         fail("The watchdog could not be confirmed stopped; refusing to reset the stack under it.")
     context = RunContext.create()
@@ -317,7 +317,7 @@ def unlock() -> None:
     """Inspect and clear an active VPN lockout marker."""
     # The same path the guard writes and checks.
     lockout_file = Config.from_env(ROOT_DIR).vpn_lockout_file
-    if not lockout_file.exists():
+    if not lockout_marker_present(lockout_file):
         logger.info("No VPN lockout is active.")
         return
 

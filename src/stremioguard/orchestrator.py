@@ -9,7 +9,8 @@ import subprocess
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import FrameType
 
@@ -20,11 +21,13 @@ from stremioguard.alerts import send_alert
 from stremioguard.config import (
     CIRCUIT_BREAKER_EXIT_CODE,
     DEFAULT_VPN_FAILOVER_ESCALATION_RATIO,
+    REPEAT_WARNING_SECONDS,
     CometConfig,
     Config,
     deployed_env_file,
     docker_daemon_help,
     docker_permission_help,
+    parse_public_ip,
 )
 from stremioguard.env import atomic_write_text, ensure_directory
 from stremioguard.guard import (
@@ -32,6 +35,8 @@ from stremioguard.guard import (
     GluetunState,
     LockoutActiveError,
     PublicIPAssessment,
+    lockout_marker_present,
+    read_lockout_marker,
 )
 from stremioguard.sdnotify import notify
 from stremioguard.stacklock import required_stack_lock, stack_lock
@@ -45,8 +50,9 @@ app = typer.Typer(
 # Upper bound on one sleep between heartbeats; far below the unit's WatchdogSec.
 HEARTBEAT_SLEEP_CHUNK_SECONDS = 30.0
 LOOP_ERRORS_BEFORE_STOP = 3
-# A leak verdict stops services at once; a second one in a row locks out.
+# A leak verdict stops services at once; a second one within 24 hours locks out.
 LEAK_CONFIRMATIONS = 2
+LEAK_WINDOW_SECONDS = 86400
 # An authentication rejection must be seen again after gluetun has been
 # restarted onto another server before it counts as rejected credentials.
 AUTH_REJECTION_CONFIRMATIONS = 2
@@ -65,8 +71,6 @@ TEARDOWN_LOCK_WAIT_SECONDS = 60
 # `./stremio logs` under identical lines. Eventful windows still log on the
 # regular interval.
 QUIET_SUMMARY_INTERVAL_SECONDS = 3600
-# While a failure persists, repeat its warning at most this often.
-REPEAT_WARNING_SECONDS = 300
 
 logger.remove()
 if os.environ.get("STREMIO_BACKGROUND") != "1":
@@ -97,6 +101,8 @@ class Orchestrator:
         self.loop_errors_since_summary = 0
         self.outage_started_at: float | None = None
         self.outage_start_wall: float | None = None
+        self.unhealthy_elapsed_seconds: float = 0.0
+        self.last_watch_tick_at: float | None = None
         self.last_auth_check_wall: float | None = None
         self.last_restart_at: float = 0.0
         self.escalation_triggered: bool = False
@@ -107,8 +113,9 @@ class Orchestrator:
         self.restart_generation = 0
         self.auth_rejection_generations: set[int] = set()
         self.auth_evidence_seen: set[str] = set()
-        self.consecutive_leak_verdicts = 0
+        self.leak_verdict_times: deque[float] = deque()
         self.auto_start_times: deque[float] = deque()
+        self.running_state_warned_at: float | None = None
         self.lock_deferred_since: float | None = None
         self._lock_expiry_warned = False
         self._alerts_sent: dict[str, float] = {}
@@ -152,6 +159,8 @@ class Orchestrator:
             )
             is False
         ):
+            if not g.stop_active_services():
+                raise RuntimeError("Protected services could not be confirmed stopped.")
             if reset:
                 # The watchdog refuses to run under a marker, so hand recovery
                 # over now. Its budget writes a fresh marker if the tunnel
@@ -178,6 +187,8 @@ class Orchestrator:
             g.preflight(allow_recovery=False, defer_vpn_recovery=True, keep_running_gluetun=True)
             is False
         ):
+            if not g.stop_active_services():
+                raise RuntimeError("Protected services could not be confirmed stopped.")
             return
         services = g.enabled_runtime_services()
         g.log(f"Starting services: {', '.join(services)}.")
@@ -259,6 +270,12 @@ class Orchestrator:
         it, and hand over to the fail-safe if that keeps happening.
         """
         try:
+            if lockout_marker_present(self.guard.config.vpn_lockout_file):
+                self.guard.warn(
+                    "VPN lockout marker detected while watchdog is running; "
+                    "stopping stack and exiting without modifying the marker."
+                )
+                self._shutdown_and_exit_for_lockout("lockout_marker")
             with stack_lock(self.guard.config.root_dir) as held:
                 if held:
                     self.lock_deferred_since = None
@@ -376,6 +393,25 @@ class Orchestrator:
             if heartbeat:
                 notify("WATCHDOG=1")
 
+    def _shutdown_and_exit_for_lockout(self, reason: str) -> None:
+        try:
+            self.guard.stop_active_services()
+        finally:
+            try:
+                self.guard.stop_gluetun()
+            finally:
+                try:
+                    # After the shutdown, and bounded: an unreachable alert
+                    # endpoint must not delay stopping anything.
+                    self._alert(
+                        f"lockout:{reason}",
+                        "StremioGuard locked out",
+                        f"Circuit breaker tripped ({reason}). Services and the VPN "
+                        "container were stopped; run `./stremio restart` to recover.",
+                    )
+                finally:
+                    raise typer.Exit(code=CIRCUIT_BREAKER_EXIT_CODE)
+
     def _trip_circuit_breaker(self, reason: str, evidence: str | None = None) -> None:
         elapsed = (
             time.monotonic() - self.outage_started_at if self.outage_started_at is not None else 0.0
@@ -395,23 +431,7 @@ class Orchestrator:
         except Exception:
             logger.exception("Failed to write VPN lockout marker during circuit breaker trip.")
         finally:
-            try:
-                self.guard.stop_active_services()
-            finally:
-                try:
-                    self.guard.stop_gluetun()
-                finally:
-                    try:
-                        # After the shutdown, and bounded: an unreachable alert
-                        # endpoint must not delay stopping anything.
-                        self._alert(
-                            f"lockout:{reason}",
-                            "StremioGuard locked out",
-                            f"Circuit breaker tripped ({reason}). Services and the VPN "
-                            "container were stopped; run `./stremio restart` to recover.",
-                        )
-                    finally:
-                        raise typer.Exit(code=CIRCUIT_BREAKER_EXIT_CODE)
+            self._shutdown_and_exit_for_lockout(reason)
 
     def _handle_unhealthy_ip_assessment(
         self, assessment: PublicIPAssessment, services: list[str]
@@ -419,16 +439,22 @@ class Orchestrator:
         g = self.guard
         if assessment == PublicIPAssessment.UNSAFE_DEFINITIVE:
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
-            self.consecutive_leak_verdicts += 1
+            now = time.monotonic()
+            while (
+                self.leak_verdict_times and now - self.leak_verdict_times[0] > LEAK_WINDOW_SECONDS
+            ):
+                self.leak_verdict_times.popleft()
+            self.leak_verdict_times.append(now)
             g.warn(
                 "Definitive leak / unsafe IP detected "
-                f"({self.consecutive_leak_verdicts}/{LEAK_CONFIRMATIONS}). "
-                "Stopping active services immediately."
+                f"({len(self.leak_verdict_times)}/{LEAK_CONFIRMATIONS} within 24 hours). "
+                "Stopping active services immediately; a second failed check within 24 hours "
+                "locks the stack out."
             )
             self.public_ip_failures_since_summary += 1
             self.consecutive_ip_unknowns = 0
             g.stop_active_services(services=services)
-            if self.consecutive_leak_verdicts >= LEAK_CONFIRMATIONS:
+            if len(self.leak_verdict_times) >= LEAK_CONFIRMATIONS:
                 # A leak means the kill switch did not hold. Resuming on the
                 # next good probe would trust it again without evidence, and
                 # an intermittent verdict would stop and start services
@@ -437,14 +463,14 @@ class Orchestrator:
                     "egress_leak",
                     evidence=(
                         f"the tunnel egress failed the leak check "
-                        f"{self.consecutive_leak_verdicts} times in a row"
+                        f"{len(self.leak_verdict_times)} times within 24 hours"
                     ),
                 )
             self._alert(
                 "leak_verdict",
                 "StremioGuard stopped services: possible VPN leak",
                 "The tunnel egress failed the leak check. Services are stopped; a second "
-                "failed check locks the stack out.",
+                "failed check within 24 hours locks the stack out.",
             )
             self._maybe_log_summary()
         elif assessment == PublicIPAssessment.UNKNOWN:
@@ -575,6 +601,27 @@ class Orchestrator:
         self.auto_starts_since_summary += 1
         self.guard.start_services(services, build=True, check=False)
 
+    def _maybe_auto_start(self, services: list[str], *, log_healthy: bool) -> None:
+        g = self.guard
+        running_state = g.container_running(services=services)
+        if running_state is None:
+            now = time.monotonic()
+            if (
+                self.running_state_warned_at is None
+                or now - self.running_state_warned_at >= REPEAT_WARNING_SECONDS
+            ):
+                self.running_state_warned_at = now
+                g.warn(
+                    "Could not determine whether protected services are running; "
+                    "skipping auto-start on this tick."
+                )
+            return
+        self.running_state_warned_at = None
+        if not running_state:
+            if log_healthy:
+                g.log("Gluetun healthy; starting active services.")
+            self._auto_start(services)
+
     def watch_once(self) -> None:
         g = self.guard
         self.checks_since_summary += 1
@@ -584,15 +631,17 @@ class Orchestrator:
         # The observation behind that answer; None only when a caller
         # replaced gluetun_healthy, in which case identity is not tracked.
         gluetun = g.last_gluetun_state
+        now_mono = time.monotonic()
 
         if not healthy:
             budget = g.config.vpn_recovery_budget_seconds
-            now_mono = time.monotonic()
             now_wall = time.time()
 
             if self.outage_started_at is None:
                 self.outage_started_at = now_mono
                 self.outage_start_wall = now_wall
+                self.unhealthy_elapsed_seconds = 0.0
+                self.last_watch_tick_at = now_mono
                 self.last_auth_check_wall = now_wall
                 self.last_restart_at = now_mono
                 self.restart_generation = 0
@@ -628,7 +677,10 @@ class Orchestrator:
             self.last_auth_check_wall = now_wall
             self._note_auth_rejection(g.gluetun_auth_evidence(lines=200, since_epoch=check_since))
 
-            elapsed = now_mono - self.outage_started_at
+            if self.last_watch_tick_at is not None:
+                self.unhealthy_elapsed_seconds += max(0.0, now_mono - self.last_watch_tick_at)
+            self.last_watch_tick_at = now_mono
+            elapsed = self.unhealthy_elapsed_seconds
             if elapsed >= budget:
                 self._trip_circuit_breaker(
                     reason="recovery_budget_exhausted",
@@ -669,7 +721,9 @@ class Orchestrator:
             self._maybe_log_summary()
             return
 
-        # Gluetun is healthy
+        # Gluetun is healthy: healthy ticks do not charge the VPN recovery budget,
+        # but advance the tick timestamp so a subsequent unhealthy tick is charged.
+        self.last_watch_tick_at = now_mono
         if self.outage_started_at is not None:
             # The egress IP changes exactly on reconnect; never resume on a
             # verification cached from before the outage.
@@ -685,18 +739,17 @@ class Orchestrator:
 
             self.outage_started_at = None
             self.outage_start_wall = None
+            self.unhealthy_elapsed_seconds = 0.0
             self.last_auth_check_wall = None
             self.last_restart_at = 0.0
             self.escalation_triggered = False
             self.restart_generation = 0
             self.auth_rejection_generations.clear()
             self.auth_evidence_seen.clear()
-            self.consecutive_leak_verdicts = 0
             self.consecutive_ip_unknowns = 0
 
             self._reconcile_namespace(gluetun, services)
-            if not g.container_running(services=services):
-                self._auto_start(services)
+            self._maybe_auto_start(services, log_healthy=False)
 
             self.last_public_ip = g.last_observed_ip or self.last_public_ip
             self._maybe_log_summary()
@@ -712,13 +765,10 @@ class Orchestrator:
             g.log(f"Public IP check recovered after {self.consecutive_ip_unknowns} failures.")
         self.consecutive_ip_unknowns = 0
         self.ip_failure_warned_at = None
-        self.consecutive_leak_verdicts = 0
         self.last_public_ip = g.last_observed_ip or self.last_public_ip
 
         self._reconcile_namespace(gluetun, services)
-        if not g.container_running(services=services):
-            g.log("Gluetun healthy; starting active services.")
-            self._auto_start(services)
+        self._maybe_auto_start(services, log_healthy=True)
 
         self._maybe_log_summary()
 
@@ -792,7 +842,7 @@ class Orchestrator:
         else:
             logger.info(f"{int(age // 86400)} days old")
         logger.info("--- Lockout ---")
-        if g.config.vpn_lockout_file.exists():
+        if lockout_marker_present(g.config.vpn_lockout_file):
             lockout = g.read_vpn_lockout() or {}
             logger.warning(
                 f"ACTIVE: reason={lockout.get('reason', 'unreadable marker')} "
@@ -821,7 +871,12 @@ class Orchestrator:
         if not ip:
             raise RuntimeError("Could not determine public IPv4 address.")
 
-        if g.config.expected_vpn_ip and ip == g.config.expected_vpn_ip:
+        expected_vpn_ip = (
+            parse_public_ip(g.config.expected_vpn_ip) or g.config.expected_vpn_ip
+            if g.config.expected_vpn_ip
+            else None
+        )
+        if expected_vpn_ip and ip == expected_vpn_ip:
             raise RuntimeError(
                 f"Observed IP {ip} matches EXPECTED_VPN_IP; refusing to save it as the home "
                 "baseline. Disconnect any active VPN and rerun."
@@ -846,18 +901,34 @@ class Orchestrator:
         """
         g = self.guard
         g.warn("Watchdog supervision failed; stopping protected services to fail closed.")
+        marker_persisted = False
         try:
-            if g.config.vpn_lockout_file.exists():
+            if lockout_marker_present(g.config.vpn_lockout_file):
                 g.log("Keeping the existing lockout marker.")
             else:
                 g.write_vpn_lockout(reason="watchdog_unstable")
+            marker_persisted = read_lockout_marker(g.config.vpn_lockout_file) is not None
+            if not marker_persisted:
+                g.warn(
+                    f"Lockout marker at {g.config.vpn_lockout_file} could not be read back "
+                    "after fail-safe."
+                )
         except Exception:
             logger.exception("Failed to write the lockout marker during fail-safe shutdown.")
         finally:
-            # Refuse to verify against the wrong or an unreachable daemon:
-            # an unanswered query is not a stopped container.
-            g.require_commands()
-            stopped = g.stop_active_services()
+            daemon_error: Exception | None = None
+            try:
+                g.require_commands()
+            except Exception as error:
+                daemon_error = error
+                logger.exception("Docker/daemon check failed during fail-safe shutdown.")
+            stopped = False
+            try:
+                stopped = g.stop_active_services()
+            except Exception as error:
+                if daemon_error is None:
+                    daemon_error = error
+                logger.exception("Failed to stop active services during fail-safe shutdown.")
             self._alert(
                 "failsafe",
                 "StremioGuard fail-safe ran",
@@ -865,8 +936,14 @@ class Orchestrator:
                 + ("stopped" if stopped else "could NOT confirm it stopped")
                 + " the protected services. Run `./stremio restart` to recover.",
             )
+            if daemon_error is not None:
+                raise daemon_error
             if not stopped:
                 raise RuntimeError("Protected services could not be confirmed stopped.")
+            if not marker_persisted:
+                raise RuntimeError(
+                    f"Lockout marker at {g.config.vpn_lockout_file} could not be persisted."
+                )
 
 
 def configure_file_logging(config: Config) -> None:
@@ -892,6 +969,25 @@ def _deployment_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+@contextmanager
+def _preferred_stack_lock(root_dir: Path) -> Iterator[None]:
+    """Acquire the stack lock for teardown, proceeding if lock acquisition fails or times out."""
+    with ExitStack() as stack:
+        try:
+            held = stack.enter_context(
+                stack_lock(root_dir, wait_seconds=TEARDOWN_LOCK_WAIT_SECONDS)
+            )
+        except OSError as error:
+            logger.warning(f"Could not open stack lock ({error}); proceeding with teardown anyway.")
+        else:
+            if not held:
+                logger.warning(
+                    "Another StremioGuard command still holds the stack lock; "
+                    "proceeding anyway because stopping is never less safe."
+                )
+        yield
+
+
 def _run_command(
     action: Callable[[Orchestrator], None],
     *,
@@ -913,19 +1009,19 @@ def _run_command(
     root_dir = _deployment_root()
     try:
         if deployed:
-            config = Config.from_env(env_file=deployed_env_file(root_dir))
+            config = Config.from_env(root_dir, env_file=deployed_env_file(root_dir))
         else:
-            config = Config.from_env()
-    except (RuntimeError, ValueError) as error:
+            config = Config.from_env(root_dir)
+    except (RuntimeError, ValueError, OSError) as error:
         if not teardown:
             raise
         # Stopping is never less safe; a .env that no longer parses must not
         # block it. Paths do not come from .env, so the defaults reach the
         # same stack.
         logger.warning(f"Ignoring .env for teardown: {error}")
-        config = Config.from_env(env_file=Path(os.devnull))
+        config = Config.from_env(root_dir, env_file=Path(os.devnull))
     configure_file_logging(config)
-    guard = GluetunGuard(config, frozen=deployed and not teardown)
+    guard = GluetunGuard(config, frozen=deployed and not teardown, teardown=teardown)
     orch = Orchestrator(guard)
     try:
         if lock == "required":
@@ -936,12 +1032,7 @@ def _run_command(
             ):
                 action(orch)
         elif lock == "preferred":
-            with stack_lock(config.root_dir, wait_seconds=TEARDOWN_LOCK_WAIT_SECONDS) as held:
-                if not held:
-                    logger.warning(
-                        "Another StremioGuard command still holds the stack lock; "
-                        "proceeding anyway because stopping is never less safe."
-                    )
+            with _preferred_stack_lock(config.root_dir):
                 action(orch)
         else:
             action(orch)
