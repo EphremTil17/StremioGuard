@@ -465,10 +465,15 @@ class UnifiedCliTests(unittest.TestCase):
                 "start_watchdog",
                 side_effect=lambda *a, **k: calls.append("watchdog"),
             ) as start_watchdog,
+            mock.patch.object(
+                general_cmd_mod,
+                "_converge_comet_runtime",
+                side_effect=lambda: calls.append("converge"),
+            ),
         ):
             context = context_cls.create.return_value
             general_cmd_mod.start()
-        self.assertEqual(calls, ["prepare", "guard", "watchdog"])
+        self.assertEqual(calls, ["prepare", "guard", "watchdog", "converge"])
         run_guard.assert_called_once_with("start", context=context)
         start_watchdog.assert_called_once_with(context, units_changed=True)
 

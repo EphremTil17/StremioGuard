@@ -27,7 +27,7 @@ def comet_install(
         ),
     ),
 ) -> None:
-    """Clone/pin Comet and write local runtime configuration."""
+    """Pin/validate the Comet runtime image and write local configuration."""
     config = CometConfig.from_env(ROOT_DIR)
     if not is_interactive():
         fail("`./stremio comet install` needs an interactive terminal.")
@@ -141,13 +141,6 @@ def comet_logs(
     )
 
 
-def comet_vendor_sync() -> None:
-    """Sync the Comet vendor checkout to the pinned commit (for maintainers)."""
-    manager = _comet_manager()
-    manager.fetch_and_checkout_pinned()
-    logger.success("Synced Comet vendor checkout.")
-
-
 def comet_rotate_db_password() -> None:
     """Rotate Comet's Postgres password offline (requires the stack to be stopped)."""
     try:
@@ -189,4 +182,3 @@ def register(app: typer.Typer) -> None:
     app.command("probe-playback")(comet_probe_playback)
     app.command("logs")(comet_logs)
     app.command("rotate-db-password")(comet_rotate_db_password)
-    app.command("vendor-sync", hidden=True)(comet_vendor_sync)

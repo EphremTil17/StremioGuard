@@ -197,10 +197,11 @@ workflow.
 Token mutations (`add`, `revoke`, `rotate`, `use`) validate `tokens.json`,
 re-render `nginx.conf` and `tokens.map`, and reload the running gateway before
 reporting success (exiting non-zero if reload fails or the gateway's state is
-unknown). `./stremio start` re-renders `nginx.conf`, but does not apply config
-changes to an already-running gateway; run `./stremio comet gateway-reload` (or
-`./stremio restart`) after config or template updates to verify `nginx -t` and
-the in-container sha256 of both `nginx.conf` and `tokens.map` and reload nginx.
+unknown). `./stremio start` and `./stremio restart` also re-render `nginx.conf`
+and `tokens.map`, verify `nginx -t` and the in-container sha256 of both files,
+reload an already-running gateway, and recreate Comet if its mounted patch bundle
+is stale (exiting `1` after starting the watchdog if any convergence check fails);
+`./stremio comet gateway-reload` runs the checked gateway reload directly.
 
 ## Verification
 

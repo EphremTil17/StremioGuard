@@ -13,17 +13,42 @@ from urllib.parse import unquote
 _NOT_FOUND_BODY = b'{"detail":"Not Found"}'
 _BAD_GATEWAY_BODY = b'{"detail":"Bad Gateway"}'
 _STRIP_KEYS = frozenset({"infohash", "fileidx", "sources", "announce"})
+_UTF8_BOM = b"\xef\xbb\xbf"
+_JSON_WHITESPACE = frozenset(b" \t\n\r")
 
 
 def _is_torznab_path(path: str) -> bool:
     return any(unquote(segment).lower() == "torznab" for segment in path.split("/"))
 
 
-def _extract_media_type(headers: Sequence[tuple[bytes, bytes]]) -> bytes:
+def _extract_media_types(headers: Sequence[tuple[bytes, bytes]]) -> list[bytes]:
+    types: list[bytes] = []
     for name, value in headers:
         if name.lower() == b"content-type":
-            return value.split(b";", 1)[0].strip().lower()
-    return b""
+            types.append(value.split(b";", 1)[0].strip().lower())
+    return types
+
+
+def _is_json_media_type(media_type: bytes) -> bool:
+    if b"/" not in media_type:
+        return False
+    main, subtype = media_type.split(b"/", 1)
+    if not main or not subtype:
+        return False
+    return subtype == b"json" or (subtype.endswith(b"+json") and len(subtype) > len(b"+json"))
+
+
+def _classify_response(status: int, headers: Sequence[tuple[bytes, bytes]]) -> str:
+    media_types = _extract_media_types(headers)
+    if any(_is_json_media_type(media) for media in media_types):
+        return "inspect"
+    if status != 206 and (
+        not media_types
+        or all(not media for media in media_types)
+        or any(media == b"text/plain" for media in media_types)
+    ):
+        return "inspect" if _has_non_identity_encoding(headers) else "sniff"
+    return "passthrough"
 
 
 def _has_non_identity_encoding(headers: Sequence[tuple[bytes, bytes]]) -> bool:
@@ -151,33 +176,92 @@ class StremioGuardResponseGuard:
             (name, value) for name, value in raw_headers if name.lower() != b"accept-encoding"
         ]
 
-        passthrough: bool | None = None
+        mode: str | None = None
         start_message: MutableMapping[str, Any] | None = None
         body_chunks: list[bytes] = []
+        sniff_buf = bytearray()
+        sniff_pos = 0
+        bom_checked = False
 
         async def send_wrapper(message: MutableMapping[str, Any]) -> None:
-            nonlocal passthrough, start_message
+            nonlocal mode, start_message, sniff_pos, bom_checked
             msg_type = message.get("type")
 
             if msg_type == "http.response.start":
                 headers = message.get("headers") or ()
-                if _extract_media_type(headers) != b"application/json":
-                    passthrough = True
+                status = int(message.get("status", 0))
+                mode = _classify_response(status, headers)
+                if mode == "passthrough":
                     await send(message)
                     return
-                passthrough = False
                 start_message = message
                 return
 
             if msg_type == "http.response.body":
-                if passthrough or start_message is None:
+                if mode == "passthrough" or start_message is None:
                     await send(message)
                     return
                 chunk = message.get("body", b"")
-                if chunk:
-                    body_chunks.append(chunk)
-                if message.get("more_body", False):
-                    return
+                more_body = bool(message.get("more_body", False))
+
+                if mode == "sniff":
+                    if chunk:
+                        sniff_buf.extend(chunk)
+                    if not bom_checked:
+                        if len(sniff_buf) < len(_UTF8_BOM) and _UTF8_BOM.startswith(
+                            bytes(sniff_buf)
+                        ):
+                            if more_body:
+                                return
+                            mode = "passthrough"
+                            held = bytes(sniff_buf)
+                            sniff_buf.clear()
+                            await send(start_message)
+                            await send(
+                                {"type": "http.response.body", "body": held, "more_body": False}
+                            )
+                            return
+                        bom_checked = True
+                        if sniff_buf.startswith(_UTF8_BOM):
+                            sniff_pos = len(_UTF8_BOM)
+
+                    while sniff_pos < len(sniff_buf) and sniff_buf[sniff_pos] in _JSON_WHITESPACE:
+                        sniff_pos += 1
+
+                    if sniff_pos == len(sniff_buf):
+                        if more_body:
+                            return
+                        mode = "passthrough"
+                        held = bytes(sniff_buf)
+                        sniff_buf.clear()
+                        await send(start_message)
+                        await send({"type": "http.response.body", "body": held, "more_body": False})
+                        return
+
+                    if sniff_buf[sniff_pos] in (ord("{"), ord("[")):
+                        mode = "inspect"
+                        body_chunks.append(bytes(sniff_buf))
+                        sniff_buf.clear()
+                        if more_body:
+                            return
+                    else:
+                        mode = "passthrough"
+                        held = bytes(sniff_buf)
+                        sniff_buf.clear()
+                        await send(start_message)
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": held,
+                                "more_body": more_body,
+                            }
+                        )
+                        return
+                else:
+                    if chunk:
+                        body_chunks.append(chunk)
+                    if more_body:
+                        return
 
                 resp_headers: list[tuple[bytes, bytes]] = list(start_message.get("headers") or ())
                 if _has_non_identity_encoding(resp_headers):

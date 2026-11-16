@@ -1461,7 +1461,12 @@ NAMESPACE_INSPECT = (
 
 
 def test_gluetun_identity_change_restarts_a_stale_service(tmp_path: Path) -> None:
+    from stremioguard.config import PUBLISHED_COMPOSE_FILE, PUBLISHED_ENV_FILE, compose_command
+
     t1, t2 = "2026-11-11T10:00:00.5Z", "2026-11-11T11:00:00Z"
+    config = make_config(tmp_path)
+    (tmp_path / PUBLISHED_COMPOSE_FILE).touch()
+    (tmp_path / PUBLISHED_ENV_FILE).touch()
     runner = FakeRunner(
         {
             **compose_stack_responses(
@@ -1486,7 +1491,7 @@ def test_gluetun_identity_change_restarts_a_stale_service(tmp_path: Path) -> Non
             ],
         }
     )
-    guard = GluetunGuard(make_config(tmp_path), runner, frozen=True)
+    guard = GluetunGuard(config, runner, frozen=True)
     orch = Orchestrator(guard)
     events: list[str] = []
     running = {"stremio": True}
@@ -1518,7 +1523,7 @@ def test_gluetun_identity_change_restarts_a_stale_service(tmp_path: Path) -> Non
         assert orch.namespace_rejoins_since_summary == 1
         # The restart actually reached Compose.
         # Without --build: the frozen watchdog never rebuilds from the tree.
-        up = [*compose_args_prefix(tmp_path), "up", "-d", "--no-deps", "stremio"]
+        up = [*compose_command(tmp_path), "up", "-d", "--no-deps", "stremio"]
         assert runner.calls.count(up) == 1
 
         # Tick 2: same gluetun, nothing to reconcile and no Docker query for it.

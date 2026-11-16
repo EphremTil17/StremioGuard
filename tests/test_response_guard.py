@@ -495,3 +495,189 @@ def test_ac2_torznab_near_misses_reach_inner_app(path: str) -> None:
     assert status == 200
     assert b"".join(chunks) == b"ok"
     assert seen == [path]
+
+
+def _p2p_stream_payload() -> bytes:
+    return json.dumps(
+        {
+            "streams": [
+                {"name": "p2p", "infoHash": "0123456789abcdef0123456789abcdef01234567"},
+                {"name": "http", "url": "https://comet.example/playback/1"},
+            ]
+        }
+    ).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"content-type", b"application/json; charset=utf-8")],
+        [(b"content-type", b"Application/JSON")],
+        [(b"content-type", b"text/json")],
+        [(b"content-type", b"application/vnd.stremio+json")],
+        [],
+        [(b"content-type", b"")],
+        [(b"content-type", b"text/plain; charset=utf-8")],
+        [(b"content-type", b"text/html"), (b"content-type", b"application/json")],
+    ],
+)
+def test_ac18_abh_filters_p2p_across_json_missing_empty_and_text_plain(
+    headers: list[tuple[bytes, bytes]],
+) -> None:
+    """AC-18 (a), (b), (h): filters P2P streams for JSON subtypes, missing/empty, text/plain."""
+    raw = _p2p_stream_payload()
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [*headers, (b"content-length", str(len(raw)).encode("ascii"))],
+            }
+        )
+        await send({"type": "http.response.body", "body": raw, "more_body": False})
+
+    guard = StremioGuardResponseGuard(inner)
+    status, resp_headers, chunks = asyncio.run(
+        _run_asgi(guard, _http_scope("/stream/movie/tt1.json"))
+    )
+    body = b"".join(chunks)
+    assert status == 200
+    assert json.loads(body) == {
+        "streams": [{"name": "http", "url": "https://comet.example/playback/1"}]
+    }
+    assert _header_map(resp_headers)[b"content-length"] == str(len(body)).encode("ascii")
+
+
+def test_ac18_b_bom_and_one_byte_chunks_without_content_type() -> None:
+    """AC-18 (b): UTF-8 BOM + whitespace and 1-byte whitespace-prefixed chunks are filtered."""
+    raw = _p2p_stream_payload()
+    variants = [
+        [b"\xef\xbb\xbf  \t\r\n" + raw],
+        [bytes([b]) for b in b" \t\n" + raw],
+        [b"\xef", b"\xbb", b"\xbf", b" ", raw],
+    ]
+    for parts in variants:
+
+        async def inner(
+            scope: Any, receive: Any, send: Any, *, body_parts: list[bytes] = parts
+        ) -> None:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            for idx, part in enumerate(body_parts):
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": part,
+                        "more_body": idx < len(body_parts) - 1,
+                    }
+                )
+
+        guard = StremioGuardResponseGuard(inner)
+        status, _, chunks = asyncio.run(_run_asgi(guard, _http_scope("/stream/movie/tt1.json")))
+        assert status == 200
+        assert json.loads(b"".join(chunks)) == {
+            "streams": [{"name": "http", "url": "https://comet.example/playback/1"}]
+        }
+
+
+def test_ac18_c_no_content_type_with_gzip_encoding_returns_502() -> None:
+    """AC-18 (c): no content-type with real gzip.compress() P2P body and gzip encoding -> 502."""
+    compressed = gzip.compress(_p2p_stream_payload())
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-encoding", b"gzip")],
+            }
+        )
+        await send({"type": "http.response.body", "body": compressed, "more_body": False})
+
+    guard = StremioGuardResponseGuard(inner)
+    status, _, chunks = asyncio.run(_run_asgi(guard, _http_scope("/stream/movie/tt1.json")))
+    assert status == 502
+    assert b"".join(chunks) == b'{"detail":"Bad Gateway"}'
+
+
+@pytest.mark.parametrize(
+    ("status_code", "produced"),
+    [
+        (200, [b"\x1aE\xdf\xa3-0", b"chunk1", b"chunk2", b"chunk3", b"chunk4"]),
+        (206, [b'{"streams":[{"infoHash"', b':"0123"', b',"url":"x"', b"}]}", b""]),
+    ],
+)
+def test_ac18_de_sniff_non_json_and_206_stream_unbuffered(
+    status_code: int, produced: list[bytes]
+) -> None:
+    """AC-18 (d), (e): binary and 206 bodies forward each chunk before the next is produced."""
+
+    async def exercise() -> None:
+        chunk_ack = asyncio.Event()
+        received_chunks: list[bytes] = []
+
+        async def inner(scope: Any, receive: Any, send: Any) -> None:
+            await send({"type": "http.response.start", "status": status_code, "headers": []})
+            for idx, chunk in enumerate(produced):
+                if idx > 0:
+                    await asyncio.wait_for(chunk_ack.wait(), timeout=2.0)
+                    chunk_ack.clear()
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": chunk,
+                        "more_body": idx < len(produced) - 1,
+                    }
+                )
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def outer_send(message: MutableMapping[str, Any]) -> None:
+            if message["type"] == "http.response.body":
+                received_chunks.append(bytes(message["body"]))
+                chunk_ack.set()
+
+        guard = StremioGuardResponseGuard(inner)
+        await asyncio.wait_for(
+            guard(_http_scope("/stream/1"), receive, outer_send),
+            timeout=2.0,
+        )
+        assert received_chunks == produced
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("media_type", [b"video/mp4", b"application/octet-stream"])
+def test_ac18_f_binary_types_are_not_inspected(media_type: bytes) -> None:
+    """AC-18 (f): binary content types pass P2P-shaped bytes through unchanged."""
+    raw = _p2p_stream_payload()
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", media_type)],
+            }
+        )
+        await send({"type": "http.response.body", "body": raw, "more_body": False})
+
+    guard = StremioGuardResponseGuard(inner)
+    status, _, chunks = asyncio.run(_run_asgi(guard, _http_scope("/playback/1")))
+    assert status == 200
+    assert b"".join(chunks) == raw
+
+
+@pytest.mark.parametrize("body", [b"", b"  \t\r\n  "])
+def test_ac18_g_undecided_empty_and_whitespace_bodies_unchanged(body: bytes) -> None:
+    """AC-18 (g): no content-type with empty or whitespace-only body passes unchanged."""
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    guard = StremioGuardResponseGuard(inner)
+    status, _, chunks = asyncio.run(_run_asgi(guard, _http_scope("/health")))
+    assert status == 200
+    assert b"".join(chunks) == body

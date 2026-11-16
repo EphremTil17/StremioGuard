@@ -1,7 +1,4 @@
 {
-  "upstream_url": "https://github.com/g0ldyy/comet",
-  "pinned_commit": "581455f24206dc40a27f28f054077f1be9203466",
-  "default_branch": "main",
   "image": "g0ldyy/comet",
   "tested_digest": "sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea"
 }

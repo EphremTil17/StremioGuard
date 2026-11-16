@@ -129,7 +129,7 @@ class BootstrapActiveDigestTests(unittest.TestCase):
     def test_optional_failure_interactive_decline_falls_back_to_tested_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cfg = make_comet_config(Path(directory))
-            _write_lock(cfg.lock_file, commit="deadbeef", tested_digest=SHA_FALLBACK)
+            _write_lock(cfg.lock_file, tested_digest=SHA_FALLBACK)
             pull_fallback = ("docker", "pull", f"g0ldyy/comet@{SHA_FALLBACK}")
             responses = _latest_pull_and_inspect(SHA_LATEST)
             responses[pull_fallback] = completed(list(pull_fallback), "")
@@ -149,7 +149,7 @@ class BootstrapActiveDigestTests(unittest.TestCase):
     def test_required_failure_falls_back_to_tested_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cfg = make_comet_config(Path(directory))
-            _write_lock(cfg.lock_file, commit="deadbeef", tested_digest=SHA_FALLBACK)
+            _write_lock(cfg.lock_file, tested_digest=SHA_FALLBACK)
             pull_fallback = ("docker", "pull", f"g0ldyy/comet@{SHA_FALLBACK}")
             responses = _latest_pull_and_inspect(SHA_LATEST)
             responses[pull_fallback] = completed(list(pull_fallback), "")
@@ -172,7 +172,7 @@ class BootstrapActiveDigestTests(unittest.TestCase):
     def test_required_failure_and_fallback_failure_raises_generator_bug(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cfg = make_comet_config(Path(directory))
-            _write_lock(cfg.lock_file, commit="deadbeef", tested_digest=SHA_FALLBACK)
+            _write_lock(cfg.lock_file, tested_digest=SHA_FALLBACK)
             pull_fallback = ("docker", "pull", f"g0ldyy/comet@{SHA_FALLBACK}")
             responses = _latest_pull_and_inspect(SHA_LATEST)
             responses[pull_fallback] = completed(list(pull_fallback), "")
@@ -319,7 +319,7 @@ class ValidateCompatibilityStageTests(unittest.TestCase):
 
     def _manager_ready_to_render(self, tmp_path: Path) -> CometManager:
         cfg = make_comet_config(tmp_path)
-        _write_lock(cfg.lock_file, commit="deadbeef")
+        _write_lock(cfg.lock_file)
         _write_valid_sources_without_torrentio(cfg)
         image_ref = f"g0ldyy/comet@{SHA_OTHER}"
         inspect_cmd = ("docker", "image", "inspect", image_ref)
@@ -649,6 +649,7 @@ class PromoteCandidateTests(unittest.TestCase):
                 mock.patch.object(
                     manager, "compose_fresh", side_effect=record("up")
                 ) as compose_fresh,
+                mock.patch.object(manager, "converge_running_stack"),
             ):
                 manager.promote_candidate()
 
@@ -723,6 +724,7 @@ class RollbackTests(unittest.TestCase):
                 mock.patch.object(manager, "prepare_runtime"),
                 mock.patch.object(manager, "validate_compatibility") as validate_compat,
                 mock.patch.object(manager, "compose_fresh") as compose_fresh,
+                mock.patch.object(manager, "converge_running_stack"),
             ):
                 manager.rollback()
 
@@ -821,7 +823,7 @@ class BundleActivationTests(unittest.TestCase):
             "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=0\n", encoding="utf-8"
         )
         cfg = make_comet_config(tmp_path, patch_episode_pack_results=False)
-        _write_lock(cfg.lock_file, commit="deadbeef")
+        _write_lock(cfg.lock_file)
         _write_valid_sources_without_torrentio(cfg)
         up_cmd = [*compose_args_prefix(tmp_path), "up", "-d", "--no-deps", *cfg.runtime_services]
         manager = CometManager(cfg, FakeRunner({tuple(up_cmd): completed(up_cmd)}))
@@ -861,6 +863,7 @@ class BundleActivationTests(unittest.TestCase):
             )
         )
         stack.enter_context(mock.patch.object(manager, "validate_compatibility"))
+        stack.enter_context(mock.patch.object(manager, "converge_running_stack"))
         return stack
 
     def test_failed_render_leaves_state_and_running_bundle_byte_for_byte(self) -> None:

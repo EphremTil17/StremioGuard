@@ -1691,6 +1691,8 @@ def test_stale_namespace_services_is_unknown_when_the_two_queries_disagree(
 
 
 def test_frozen_guard_never_rebuilds_from_the_working_tree(tmp_path: Path) -> None:
+    from stremioguard.config import PUBLISHED_COMPOSE_FILE, PUBLISHED_ENV_FILE, compose_command
+
     # A build reads docker/stremio/ from the checkout; the watchdog must not
     # deploy it. The CLI's own guard still builds when asked to.
     for frozen, expected in (
@@ -1698,7 +1700,9 @@ def test_frozen_guard_never_rebuilds_from_the_working_tree(tmp_path: Path) -> No
         (False, ["up", "-d", "--no-deps", "--build", "stremio"]),
     ):
         cfg = make_config(tmp_path)
-        cmd = [*compose_args_prefix(tmp_path), *expected]
+        (tmp_path / PUBLISHED_COMPOSE_FILE).touch()
+        (tmp_path / PUBLISHED_ENV_FILE).touch()
+        cmd = [*compose_command(tmp_path), *expected]
         runner = FakeRunner({tuple(cmd): completed(cmd)})
         guard = GluetunGuard(cfg, runner, frozen=frozen)
         with mock.patch.object(guard, "write_compose_override"):

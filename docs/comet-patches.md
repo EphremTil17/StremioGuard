@@ -40,8 +40,6 @@ The patch strategy is dynamically compiled and verified:
   own layer structure (e.g. `g0ldyy/comet@sha256:...`) at runtime.
 - We generate override files dynamically under `.stremio/comet/` and mount
   them read-only into the container.
-- The local `vendor/comet` checkout is demoted to a maintainer aid used only
-  for local diffing and anchor alignment via `./stremio comet vendor-sync`.
 
 ### Patch Specs & Requirements
 
@@ -59,7 +57,7 @@ Each patch is managed as a declarative spec with an explicit requirement class:
 | `orchestration` | Preserves episode-pack season priority and badges | `OPTIONAL` | Season pack items are dropped or ranked below single files. |
 | `logger` | Secret redaction in the startup log: upstream's `censor()` printed the first half of every secret (the TorBox key, admin and configure-page passwords, database credentials), `censor_url()` masked only URLs containing `://`, and the protected API prefix showed ten characters of the public API token. `censor()` and the token preview now print `********`, `censor_url()` masks userinfo with or without a scheme, and `DATABASE_URL` always carries the `postgresql://` scheme | `REQUIRED` | Hard failure; a candidate whose masking code moved is rejected rather than allowed to leak. |
 | `api_app` | Hardened API key management and response guard installation: logs each request's route template (`/s/{token}/{b64config}/…`, via upstream's `_metrics_route`) instead of the raw path containing user credentials, and installs `StremioGuardResponseGuard` as the outermost user middleware on `app` | `REQUIRED` | Hard failure; a drifted candidate or missing `app = FastAPI(` line is rejected so the guard cannot be silently omitted. |
-| `response_guard` | Response-boundary P2P filter and torznab block (`StremioGuardResponseGuard` pure-ASGI middleware): enforces that no top-level JSON `streams` list leaves Comet with a P2P entry (`infoHash` or `magnet:` `url`/`externalUrl`) and answers every request with a `torznab` path segment with 404 (alongside `DISABLE_TORRENT_STREAMS=True`) | `REQUIRED` | Hard failure; Comet cannot run without the response-boundary guard mounted. |
+| `response_guard` | Response-boundary P2P filter and torznab block (`StremioGuardResponseGuard` pure-ASGI middleware): enforces that no top-level JSON `streams` list leaves Comet with a P2P entry (`infoHash` or `magnet:` `url`/`externalUrl`) across any JSON media type (`<type>/json`, `<type>/<subtype>+json`) as well as non-206 responses with missing/empty `content-type` or `text/plain` whose body begins (after optional UTF-8 BOM and JSON whitespace) with `{` or `[` (refusing non-identity `content-encoding` with 502 while streaming binary/206/non-JSON bodies unbuffered), and answers every request with a `torznab` path segment with 404 (alongside `DISABLE_TORRENT_STREAMS=True`) | `REQUIRED` | Hard failure; Comet cannot run without the response-boundary guard mounted. |
 
 ### Canary & PR Flow for Maintainers
 

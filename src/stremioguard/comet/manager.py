@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,6 +43,7 @@ from stremioguard.comet_gateway import (
     CometGatewayManager,
 )
 from stremioguard.config import (
+    DOCKER_QUERY_TIMEOUT_SECONDS,
     STREMTHRU_INTERNAL_URL,
     CometConfig,
     Runner,
@@ -50,6 +51,7 @@ from stremioguard.config import (
     compose_command,
     service_container_id,
 )
+from stremioguard.digests import is_image_digest, require_image_digest
 from stremioguard.env import (
     atomic_write_text,
     ensure_directory,
@@ -186,6 +188,22 @@ print(response.read().decode())
 # its `torz` feature; without it the route is a plain-text 404.
 STREMTHRU_REQUIRED_ROUTE = "/v0/store/magnets/check"
 
+_CONTAINER_BUNDLE_HASH_SCRIPT = (
+    "import hashlib, json, sys\n"
+    "print(json.dumps({p: hashlib.sha256(open(p, 'rb').read()).hexdigest() "
+    "for p in sys.argv[1:]}))\n"
+)
+
+
+def _normalize_repository_name(repository: str) -> str:
+    for prefix in ("docker.io/", "index.docker.io/"):
+        if repository.startswith(prefix):
+            repository = repository[len(prefix) :]
+            break
+    if repository.startswith("library/"):
+        repository = repository[len("library/") :]
+    return repository
+
 
 def build_postgres_database_url(password: str, *, user: str = "comet") -> str:
     """Build Comet's PostgreSQL URL with scheme and percent-encoded credentials."""
@@ -222,6 +240,18 @@ class CometManager:
         ensure_directory(self.config.state_dir)
         state.save(self.state_file())
 
+    def _update_state(
+        self, transform: Callable[[CometState], CometState], *, purpose: str
+    ) -> CometState:
+        with required_stack_lock(
+            self.config.root_dir,
+            wait_seconds=STACK_LOCK_WAIT_SECONDS,
+            purpose=purpose,
+        ):
+            updated = transform(self.load_state())
+            self.save_state(updated)
+            return updated
+
     def active_image_ref(self) -> str:
         """The digest-pinned reference compose/validation must use.
 
@@ -233,44 +263,6 @@ class CometManager:
         if state.active_digest:
             return f"{self.config.image}@{state.active_digest}"
         return self.config.image
-
-    def repo_exists(self) -> bool:
-        return (self.config.repo_dir / ".git").exists()
-
-    def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        return self.runner.run(["git", *args], check=check)
-
-    def clone_if_missing(self) -> None:
-        if self.repo_exists():
-            return
-        lock = self.load_lock()
-        self.config.vendor_dir.mkdir(parents=True, exist_ok=True)
-        self.log(f"Cloning Comet into {self.config.repo_dir}.")
-        self._git("clone", lock.upstream_url, str(self.config.repo_dir))
-
-    def fetch_and_checkout_pinned(self) -> None:
-        lock = self.load_lock()
-        self.clone_if_missing()
-
-        dirty = self._git("-C", str(self.config.repo_dir), "status", "--porcelain", check=False)
-        if (dirty.stdout or "").strip():
-            self.warn(
-                f"Comet checkout at {self.config.repo_dir} has local changes. "
-                "Leaving them in place, but switching commits may fail."
-            )
-
-        self.log("Fetching latest upstream refs for Comet.")
-        self._git("-C", str(self.config.repo_dir), "fetch", "origin")
-        self.log(f"Checking out pinned Comet commit {lock.pinned_commit}.")
-        self._git("-C", str(self.config.repo_dir), "checkout", "--detach", lock.pinned_commit)
-
-    def current_commit(self) -> str | None:
-        if not self.repo_exists():
-            return None
-        result = self._git("-C", str(self.config.repo_dir), "rev-parse", "HEAD", check=False)
-        if result.returncode != 0:
-            return None
-        return (result.stdout or "").strip() or None
 
     def gateway_config(self) -> CometGatewayConfig:
         return CometGatewayConfig.from_env(self.config.root_dir, env_file=self.config.env_file)
@@ -354,12 +346,28 @@ class CometManager:
             env_file_value(existing, "ADMIN_DASHBOARD_PASSWORD") if existing else None
         ) or secrets.token_urlsafe(18)
         # .env is the source of truth: a password changed there must take
-        # effect; the generated value only fills in when none is configured.
-        configure_password = (
-            self.config.configure_page_password
-            or (env_file_value(existing, "CONFIGURE_PAGE_PASSWORD") if existing else None)
-            or secrets.token_urlsafe(18)
+        # effect; when omitted, an existing runtime password is kept so the
+        # operator is never locked out, and a random one is generated only on
+        # initial setup.
+        existing_configure_password = (
+            env_file_value(existing, "CONFIGURE_PAGE_PASSWORD") if existing else None
         )
+        if self.config.configure_page_password:
+            configure_password = self.config.configure_page_password
+        elif existing_configure_password:
+            configure_password = existing_configure_password
+            self.warn(
+                "COMET_CONFIGURE_PAGE_PASSWORD is not set in .env, so Comet keeps the "
+                "configure-page password stored in .stremio/comet/.env. To change it, "
+                "set COMET_CONFIGURE_PAGE_PASSWORD in .env and run ./stremio start."
+            )
+        else:
+            configure_password = secrets.token_urlsafe(18)
+            self.warn(
+                "COMET_CONFIGURE_PAGE_PASSWORD is not set in .env; generated a random "
+                "configure-page password and stored it in .stremio/comet/.env. To choose "
+                "one, set COMET_CONFIGURE_PAGE_PASSWORD in .env and run ./stremio start."
+            )
         proxy_password = (
             env_file_value(existing, "PROXY_DEBRID_STREAM_PASSWORD") if existing else None
         ) or secrets.token_urlsafe(18)
@@ -451,16 +459,36 @@ class CometManager:
             digests = json.loads((result.stdout or "").strip() or "[]")
         except json.JSONDecodeError:
             digests = []
+        expected_repo = _normalize_repository_name(self.config.image)
+        selected_digests: list[str] = []
         if isinstance(digests, list):
             for value in digests:
-                if isinstance(value, str) and "@" in value:
-                    return value.rsplit("@", 1)[1]
+                if not isinstance(value, str) or "@" not in value:
+                    continue
+                repo_part, digest_part = value.split("@", 1)
+                if _normalize_repository_name(repo_part) != expected_repo:
+                    continue
+                if not is_image_digest(digest_part):
+                    raise RuntimeError(
+                        f"Comet image {image_ref!r} has a malformed RepoDigests entry "
+                        f"for {self.config.image}: {ascii(digest_part)[:80]}."
+                    )
+                selected_digests.append(digest_part)
+        if selected_digests:
+            if len(set(selected_digests)) > 1:
+                raise RuntimeError(
+                    f"Comet image {image_ref!r} has conflicting RepoDigests entries "
+                    f"for {self.config.image}."
+                )
+            return selected_digests[0]
         image_id = self.runner.run(
             ["docker", "image", "inspect", image_ref, "--format", "{{.Id}}"], check=False
         )
         value = (image_id.stdout or "").strip()
         if image_id.returncode == 0 and value:
-            return value
+            return require_image_digest(
+                value, source=f"docker image inspect {image_ref!r} {{{{.Id}}}}"
+            )
         raise RuntimeError(f"Comet image {image_ref!r} has no inspectable digest or image ID.")
 
     def ensure_image(self, image_ref: str | None = None) -> str:
@@ -499,11 +527,19 @@ class CometManager:
             return None
         if result.returncode != 0:
             return None
-        raw = (result.stdout or "").strip().strip('"')
-        return raw or None
+        raw = (result.stdout or "").strip()
+        if raw.startswith('"') and raw.endswith('"'):
+            raw = raw[1:-1]
+        if not is_image_digest(raw):
+            self.warn(
+                f"Registry returned an invalid or empty digest for {self.config.image}:{tag}; "
+                "ignoring remote result."
+            )
+            return None
+        return raw
 
     def _compatibility_cache_valid(
-        self, image_digest: str, source_commit: str, patch_fingerprint: str, *, deep: bool = False
+        self, image_digest: str, patch_fingerprint: str, *, deep: bool = False
     ) -> bool:
         cache_file = self.config.state_dir / "compatibility.json"
         if not cache_file.exists():
@@ -512,8 +548,11 @@ class CometManager:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
+        if not isinstance(cached, dict):
+            return False
         required_rank = _VALIDATION_STAGE_RANK["deep" if deep else "import"]
-        cached_rank = _VALIDATION_STAGE_RANK.get(cached.get("stage"), 0)
+        stage = cached.get("stage")
+        cached_rank = _VALIDATION_STAGE_RANK.get(stage, 0) if isinstance(stage, str) else 0
         return (
             cached_rank >= required_rank
             and all(
@@ -521,7 +560,6 @@ class CometManager:
                 for key, value in {
                     "image": self.config.image,
                     "image_digest": image_digest,
-                    "source_commit": source_commit,
                     "patch_fingerprint": patch_fingerprint,
                     "result_format_style": self.config.result_format_style,
                     "patch_episode_pack_results": self.config.patch_episode_pack_results,
@@ -601,6 +639,11 @@ class CometManager:
             if final.exists():
                 # A running container keeps the files it mounted (bind mounts
                 # hold the inode), so moving the old directory aside is safe.
+                # A kill between these two renames leaves no directory for the
+                # active digest. That state fails closed (publishing refuses via
+                # _require_valid_manifest, and a container restart fails to
+                # mount) and heals on the next prepare_runtime(), which renders
+                # the bundle again and prunes any orphan directories.
                 retired = final.with_name(f".retired-{final.name}-{secrets.token_hex(4)}")
                 os.rename(final, retired)
             try:
@@ -684,10 +727,9 @@ class CometManager:
         """Validate the active image, or ``digest`` before it becomes active."""
         image_ref = f"{self.config.image}@{digest}" if digest else self.active_image_ref()
         image_digest = self.ensure_image(image_ref)
-        source_commit = self.current_commit() or self.load_lock().pinned_commit
         patch_fingerprint = self._managed_patch_fingerprint()
         if not force and self._compatibility_cache_valid(
-            image_digest, source_commit, patch_fingerprint, deep=deep
+            image_digest, patch_fingerprint, deep=deep
         ):
             return
 
@@ -742,7 +784,6 @@ class CometManager:
             "status": "passed",
             "image": self.config.image,
             "image_digest": image_digest,
-            "source_commit": source_commit,
             "patch_fingerprint": patch_fingerprint,
             "result_format_style": self.config.result_format_style,
             "patch_episode_pack_results": self.config.patch_episode_pack_results,
@@ -942,22 +983,30 @@ class CometManager:
         )
 
     def prepare_runtime(self, *, deep: bool = False, publish: bool = True) -> None:
-        self.write_runtime_env()
-        if self.gateway_config().enabled:
-            # nginx.conf is generated, not mounted from the repo: render it on
-            # every start so template changes (e.g. log masking) actually deploy.
-            self.gateway_manager().prepare_runtime()
-        state = self.load_state()
-        if state.active_digest is None:
-            self._bootstrap_active_digest(deep=deep)
+        with required_stack_lock(
+            self.config.root_dir,
+            wait_seconds=STACK_LOCK_WAIT_SECONDS,
+            purpose="prepare the Comet runtime",
+        ):
+            # Load and validate state.json before writing any file so a
+            # malformed state refuses with every runtime and generation file
+            # untouched.
             state = self.load_state()
+            self.write_runtime_env()
+            if self.gateway_config().enabled:
+                # nginx.conf is generated, not mounted from the repo: render it on
+                # every start so template changes (e.g. log masking) actually deploy.
+                self.gateway_manager().prepare_runtime()
+            if state.active_digest is None:
+                self._bootstrap_active_digest(deep=deep)
+                state = self.load_state()
 
-        assert state.active_digest is not None
-        self._render_bundle(state.active_digest)
-        self._prune_bundles({state.active_digest, state.previous_digest})
-        self._remove_legacy_flat_bundle()
-        if publish:
-            self.write_stack_override_file()
+            assert state.active_digest is not None
+            self._render_bundle(state.active_digest)
+            self._prune_bundles({state.active_digest, state.previous_digest})
+            self._remove_legacy_flat_bundle()
+            if publish:
+                self.write_stack_override_file()
 
     def check_bind_addresses(self) -> None:
         verify_bind_addresses(
@@ -968,12 +1017,17 @@ class CometManager:
         )
 
     def start(self) -> None:
-        self.require_commands()
-        self.prepare_runtime()
-        self.validate_compatibility()
-        self.check_bind_addresses()
-        self.log("Starting Comet stack.")
-        self._up()
+        with required_stack_lock(
+            self.config.root_dir,
+            wait_seconds=STACK_LOCK_WAIT_SECONDS,
+            purpose="start Comet",
+        ):
+            self.require_commands()
+            self.prepare_runtime()
+            self.validate_compatibility()
+            self.check_bind_addresses()
+            self.log("Starting Comet stack.")
+            self._up()
         self.advisory_update_check()
 
     def advisory_update_check(self) -> None:
@@ -1007,11 +1061,10 @@ class CometManager:
         `comet update check` command) can. Never pulls, never touches running
         services."""
         remote_digest = self._remote_digest()
-        state = self.load_state()
-        self.save_state(
-            dataclasses.replace(
-                state, last_remote_check=datetime.now(UTC).isoformat(timespec="seconds")
-            )
+        checked_at = datetime.now(UTC).isoformat(timespec="seconds")
+        self._update_state(
+            lambda state: dataclasses.replace(state, last_remote_check=checked_at),
+            purpose="record the remote Comet check",
         )
         return remote_digest
 
@@ -1030,14 +1083,17 @@ class CometManager:
     def validate_candidate(self, digest: str, *, deep: bool = False) -> dict[str, object]:
         """Validate `digest` in isolation and record it as the candidate.
         Never touches running services or the live bundle manifest."""
+        digest = require_image_digest(digest, source="candidate digest")
         report = self._validate_digest(digest, deep=deep)
-        state = self.load_state()
         candidate = CandidateDigest(
             digest=digest,
             checked_at=datetime.now(UTC).isoformat(timespec="seconds"),
             validation=report,
         )
-        self.save_state(dataclasses.replace(state, candidate=candidate))
+        self._update_state(
+            lambda state: dataclasses.replace(state, candidate=candidate),
+            purpose="record a validated Comet candidate",
+        )
         return report
 
     def promote_candidate(self) -> None:
@@ -1050,42 +1106,52 @@ class CometManager:
         one atomic write. A failure at any earlier step leaves the active
         digest, its bundle and the running stack untouched.
         """
-        state = self.load_state()
-        if state.candidate is None:
-            raise RuntimeError("No candidate digest recorded. Run a remote check first.")
-        digest = state.candidate.digest
-        report = self._validate_digest(digest)
-        if report["status"] != "passed":
-            raise RuntimeError(
-                f"Candidate {digest} failed re-validation and cannot be promoted:\n"
-                f"{report['detail']}"
+        with required_stack_lock(
+            self.config.root_dir,
+            wait_seconds=STACK_LOCK_WAIT_SECONDS,
+            purpose="promote a Comet update",
+        ):
+            state = self.load_state()
+            if state.candidate is None:
+                raise RuntimeError("No candidate digest recorded. Run a remote check first.")
+            digest = state.candidate.digest
+            report = self._validate_digest(digest)
+            if report["status"] != "passed":
+                raise RuntimeError(
+                    f"Candidate {digest} failed re-validation and cannot be promoted:\n"
+                    f"{report['detail']}"
+                )
+            self._activate_digest(
+                digest,
+                CometState(
+                    active_digest=digest,
+                    previous_digest=state.active_digest,
+                    candidate=None,
+                    last_remote_check=state.last_remote_check,
+                ),
+                f"Promoted Comet to {self.config.image}@{digest}. Restarting the Comet stack.",
             )
-        self._activate_digest(
-            digest,
-            CometState(
-                active_digest=digest,
-                previous_digest=state.active_digest,
-                candidate=None,
-                last_remote_check=state.last_remote_check,
-            ),
-            f"Promoted Comet to {self.config.image}@{digest}. Restarting the Comet stack.",
-        )
 
     def rollback(self) -> None:
         """Swap active/previous digest one level deep and restart."""
-        state = self.load_state()
-        if not state.previous_digest:
-            raise RuntimeError("No previous digest recorded; nothing to roll back to.")
-        self._activate_digest(
-            state.previous_digest,
-            CometState(
-                active_digest=state.previous_digest,
-                previous_digest=state.active_digest,
-                candidate=None,
-                last_remote_check=state.last_remote_check,
-            ),
-            f"Rolled back Comet to {self.config.image}@{state.previous_digest}. Restarting.",
-        )
+        with required_stack_lock(
+            self.config.root_dir,
+            wait_seconds=STACK_LOCK_WAIT_SECONDS,
+            purpose="roll back Comet",
+        ):
+            state = self.load_state()
+            if not state.previous_digest:
+                raise RuntimeError("No previous digest recorded; nothing to roll back to.")
+            self._activate_digest(
+                state.previous_digest,
+                CometState(
+                    active_digest=state.previous_digest,
+                    previous_digest=state.active_digest,
+                    candidate=None,
+                    last_remote_check=state.last_remote_check,
+                ),
+                f"Rolled back Comet to {self.config.image}@{state.previous_digest}. Restarting.",
+            )
 
     def _activate_digest(self, digest: str, new_state: CometState, message: str) -> None:
         # Prepare: nothing here changes what the stack runs.
@@ -1106,6 +1172,193 @@ class CometManager:
             )
             raise
 
+    def _running_container_id(self, service: str) -> str | None:
+        cmd = compose_command(self.config.root_dir, "ps", "-q", service)
+        try:
+            result = self.runner.run(cmd, check=False, timeout=DOCKER_QUERY_TIMEOUT_SECONDS)
+        except (subprocess.SubprocessError, OSError) as error:
+            raise RuntimeError(
+                f"Could not query running container for service {service!r}: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown Docker error").strip()
+            raise RuntimeError(
+                f"Could not query running container for service {service!r}: {detail}"
+            )
+        return next(
+            (line.strip() for line in (result.stdout or "").splitlines() if line.strip()),
+            None,
+        )
+
+    def _inspect_scalar(self, args: list[str], *, description: str) -> str:
+        try:
+            result = self.runner.run(args, check=False, timeout=DOCKER_QUERY_TIMEOUT_SECONDS)
+        except (subprocess.SubprocessError, OSError) as error:
+            raise RuntimeError(f"Could not inspect {description}: {error}") from error
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown Docker error").strip()
+            raise RuntimeError(f"Could not inspect {description}: {detail}")
+        value = (result.stdout or "").strip()
+        if not value:
+            raise RuntimeError(f"Could not inspect {description}: empty Docker output.")
+        return value
+
+    def verify_running_image(self, *, require_running: bool) -> None:
+        container_id = self._running_container_id(self.config.service_name)
+        if not container_id:
+            if require_running:
+                raise RuntimeError("Comet container is not running.")
+            return
+        active_digest = self.load_state().active_digest
+        if not active_digest:
+            raise RuntimeError("No active Comet image digest is recorded.")
+        active_image_ref = f"{self.config.image}@{active_digest}"
+        running_image_id = self._inspect_scalar(
+            ["docker", "inspect", container_id, "--format", "{{.Image}}"],
+            description=f"running Comet container {container_id} image",
+        )
+        active_image_id = self._inspect_scalar(
+            ["docker", "image", "inspect", active_image_ref, "--format", "{{.Id}}"],
+            description=f"active Comet image {active_image_ref}",
+        )
+        if running_image_id != active_image_id:
+            raise RuntimeError(
+                f"Running container's image ({running_image_id}) does not match "
+                f"active image ({active_image_id})."
+            )
+
+    def _container_bundle_hashes(
+        self, container_id: str, container_paths: list[str]
+    ) -> dict[str, str]:
+        try:
+            result = self.runner.run(
+                [
+                    "docker",
+                    "exec",
+                    container_id,
+                    "/app/.venv/bin/python",
+                    "-c",
+                    _CONTAINER_BUNDLE_HASH_SCRIPT,
+                    *container_paths,
+                ],
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
+        except (subprocess.SubprocessError, OSError) as error:
+            raise RuntimeError(
+                f"Could not hash mounted bundle files in Comet container {container_id}: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown Docker error").strip()
+            raise RuntimeError(
+                f"Could not hash mounted bundle files in Comet container {container_id}: {detail}"
+            )
+        try:
+            parsed = json.loads((result.stdout or "").strip())
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"Invalid bundle hash output from Comet container {container_id}: {error}"
+            ) from error
+        if not isinstance(parsed, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+        ):
+            raise RuntimeError(
+                f"Unexpected bundle hash output shape from Comet container {container_id}."
+            )
+        return parsed
+
+    def ensure_running_bundle(self) -> None:
+        container_id = self._running_container_id(self.config.service_name)
+        if not container_id:
+            return
+        active_digest = self.load_state().active_digest
+        if not active_digest:
+            raise RuntimeError("No active Comet image digest is recorded.")
+        manifest = self.active_bundle_manifest()
+        if manifest is None:
+            raise RuntimeError("Bundle manifest for the active image is missing or unreadable.")
+        outputs = manifest.get("outputs")
+        if not isinstance(outputs, dict) or not outputs:
+            raise RuntimeError("Bundle manifest for the active image has no valid 'outputs'.")
+
+        bundle_dir = self.config.bundle_dir(active_digest)
+        host_hashes: dict[str, str] = {}
+        container_paths: list[str] = []
+        for output_name, container_path in outputs.items():
+            if not isinstance(output_name, str) or not isinstance(container_path, str):
+                raise RuntimeError("Bundle manifest for the active image has an invalid output.")
+            host_file = bundle_dir / output_name
+            try:
+                host_hashes[container_path] = hashlib.sha256(host_file.read_bytes()).hexdigest()
+            except OSError as error:
+                raise RuntimeError(
+                    f"Active Comet bundle file {host_file} is unreadable: {error}"
+                ) from error
+            container_paths.append(container_path)
+
+        container_hashes = self._container_bundle_hashes(container_id, container_paths)
+        if all(container_hashes.get(path) == host_hashes[path] for path in container_paths):
+            return
+
+        self.log(
+            f"Running Comet container ({container_id}) has an older patch bundle; recreating it."
+        )
+        try:
+            self.compose(
+                "up",
+                "-d",
+                "--no-deps",
+                "--force-recreate",
+                self.config.service_name,
+                check=True,
+                capture=False,
+            )
+        except (subprocess.SubprocessError, OSError) as error:
+            raise RuntimeError(
+                f"Recreating Comet to apply the active patch bundle failed: {error}"
+            ) from error
+
+        new_container_id = self._running_container_id(self.config.service_name)
+        if not new_container_id:
+            raise RuntimeError("Comet container is not running after recreate.")
+        updated_hashes = self._container_bundle_hashes(new_container_id, container_paths)
+        if not all(updated_hashes.get(path) == host_hashes[path] for path in container_paths):
+            raise RuntimeError(
+                "Running Comet container still does not match the active patch bundle "
+                "after recreate."
+            )
+
+    def apply_gateway_config(self) -> None:
+        if not self.config.enabled:
+            return
+        gateway_config = self.gateway_config()
+        if not gateway_config.enabled:
+            return
+        gateway = self.gateway_manager()
+        running = gateway.container_running()
+        if running is None:
+            raise RuntimeError(
+                "Could not determine whether the Comet gateway container is running."
+            )
+        if running:
+            gateway.reload_nginx()
+            self.log("Reloaded Comet gateway configuration.")
+        else:
+            self.log(
+                "Comet gateway container is not running; it will read the current config "
+                "when it starts."
+            )
+
+    def converge_running_stack(self, *, require_comet: bool = False) -> None:
+        with required_stack_lock(
+            self.config.root_dir,
+            wait_seconds=STACK_LOCK_WAIT_SECONDS,
+            purpose="apply the Comet configuration to running containers",
+        ):
+            self.verify_running_image(require_running=require_comet)
+            self.ensure_running_bundle()
+            self.apply_gateway_config()
+
     def _up(self) -> None:
         # `--no-deps`: never let a Comet restart recreate gluetun (see
         # GluetunGuard.start_services). If gluetun is not running, joining its
@@ -1118,6 +1371,7 @@ class CometManager:
             self.compose_fresh(
                 "up", "-d", "--no-deps", *self.config.runtime_services, capture=False
             )
+            self.converge_running_stack(require_comet=True)
 
     def stop(self) -> None:
         self.require_commands()
@@ -1126,14 +1380,37 @@ class CometManager:
         with stack_lock(self.config.root_dir, wait_seconds=60):
             self.compose("stop", *self.config.runtime_services, check=False, capture=False)
 
+    def _image_revision_label(self, image_ref: str) -> str:
+        try:
+            result = self.runner.run(
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    image_ref,
+                    "--format",
+                    '{{index .Config.Labels "org.opencontainers.image.revision"}}',
+                ],
+                check=False,
+                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return "unknown"
+        if result.returncode != 0:
+            return "unknown"
+        value = (result.stdout or "").strip()
+        if not value or value == "<no value>":
+            return "unknown"
+        return value
+
     def status(self) -> None:
-        current = self.current_commit()
+        state = self.load_state()
         lock = self.load_lock()
-        self.log(f"Vendored repo: {self.config.repo_dir}")
-        self.log(f"Pinned commit: {lock.pinned_commit}")
-        self.log(f"Current commit: {current or 'missing'}")
-        if current and current != lock.pinned_commit:
-            self.warn("Comet checkout is not on the pinned commit.")
+        active_ref = f"{self.config.image}@{state.active_digest}" if state.active_digest else None
+        self.log(f"Active image: {active_ref or 'none recorded yet'}")
+        revision = self._image_revision_label(active_ref) if active_ref else "unknown"
+        self.log(f"Image revision: {revision}")
+        self.log(f"Tested digest: {lock.tested_digest}")
         self.require_commands()
         result = self.compose("ps", *self.config.runtime_services, check=False)
         self.log((result.stdout or "").rstrip() or "No Comet compose output available.")
@@ -1272,24 +1549,7 @@ class CometManager:
         return f"http://{host}:{self.config.host_port}"
 
     def _verify_doctor_image_and_manifest(self) -> None:
-        comet_id = self.service_container_id(self.config.service_name)
-        if not comet_id:
-            raise RuntimeError("Comet container is not running.")
-
-        active_image_ref = self.active_image_ref()
-        running_image_id = self.runner.run(
-            ["docker", "inspect", comet_id, "--format", "{{.Image}}"],
-            check=True,
-        ).stdout.strip()
-        active_image_id = self.runner.run(
-            ["docker", "image", "inspect", active_image_ref, "--format", "{{.Id}}"],
-            check=True,
-        ).stdout.strip()
-        if running_image_id != active_image_id:
-            raise RuntimeError(
-                f"Running container's image ({running_image_id}) does not match "
-                f"active image ({active_image_id})."
-            )
+        self.verify_running_image(require_running=True)
 
         # Check mounted bundle manifest matches active digest
         manifest = self.active_bundle_manifest()
@@ -1297,7 +1557,7 @@ class CometManager:
             raise RuntimeError("Bundle manifest for the active image is missing or unreadable.")
         manifest_digest = manifest.get("image_digest")
 
-        active_digest = self._image_digest(active_image_ref)
+        active_digest = self._image_digest(self.active_image_ref())
         if manifest_digest != active_digest:
             raise RuntimeError(
                 f"Mounted bundle manifest digest ({manifest_digest}) does not match "

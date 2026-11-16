@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import fcntl
 import os
 import re
 import tempfile
@@ -211,26 +212,31 @@ def write_env_settings(env_path: Path, settings: Mapping[str, str]) -> None:
     The LAST assignment of a key is the one every reader uses, so that is the
     line replaced; an `export ` prefix on it is kept.
     """
-    raw = env_path.read_bytes().decode("utf-8")
-    if raw == "":
-        lines: list[str] = []
-    elif raw.endswith("\n"):
-        lines = raw[:-1].split("\n")
-    else:
-        lines = raw.split("\n")
-    for key, value in settings.items():
-        rendered = render_env_value(value, key=key)
-        target = None
-        for index, line in enumerate(lines):
-            match = _KEY_PATTERN.match(line.strip())
-            if match and match.group(1) == key and not line.lstrip().startswith("#"):
-                target = index
-        if target is None:
-            lines.append(f"{key}={rendered}")
+    dir_fd = os.open(env_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        raw = env_path.read_bytes().decode("utf-8")
+        if raw == "":
+            lines: list[str] = []
+        elif raw.endswith("\n"):
+            lines = raw[:-1].split("\n")
         else:
-            prefix = "export " if re.match(r"^\s*export\s+", lines[target]) else ""
-            lines[target] = f"{prefix}{key}={rendered}"
-    atomic_write_text(env_path, "\n".join(lines) + "\n", mode=0o600)
+            lines = raw.split("\n")
+        for key, value in settings.items():
+            rendered = render_env_value(value, key=key)
+            target = None
+            for index, line in enumerate(lines):
+                match = _KEY_PATTERN.match(line.strip())
+                if match and match.group(1) == key and not line.lstrip().startswith("#"):
+                    target = index
+            if target is None:
+                lines.append(f"{key}={rendered}")
+            else:
+                prefix = "export " if re.match(r"^\s*export\s+", lines[target]) else ""
+                lines[target] = f"{prefix}{key}={rendered}"
+        atomic_write_text(env_path, "\n".join(lines) + "\n", mode=0o600)
+    finally:
+        os.close(dir_fd)
 
 
 def ensure_directory(path: Path, *, mode: int = 0o700) -> None:

@@ -111,10 +111,10 @@ first-class part of the same Docker product: when enabled, Comet shares
 `gluetun`'s network namespace and the root `./stremio` commands manage it
 automatically.
 
-- Upstream source lives in `vendor/comet` and is pinned by `vendor/comet.lock.json`.
+- `vendor/comet.lock.json` pins the fallback `tested_digest` for `g0ldyy/comet`; runtime patch bundles are extracted directly from the pinned Comet image.
 - Local Comet runtime state lives under `.stremio/comet/`.
 - StremioGuard generates the Comet runtime `.env` plus mounted runtime overrides;
-  it does not edit the upstream Comet checkout itself.
+  it does not require a local Comet git checkout.
 - Comet reaches debrid services through a self-hosted
   [StremThru](https://github.com/MunifTanjim/stremthru) container (`stremthru`),
   pinned by digest. Comet's default is a public instance run by a third party,
@@ -141,7 +141,11 @@ automatically.
   so setup does not require pasting a secret-bearing native Torrentio addon URL
   into the root `.env`.
 - `./stremio comet install` now protects Comet's `/configure` page by default so
-  a shared domain does not let other users rewrite addon settings.
+  a shared domain does not let other users rewrite addon settings. If
+  `COMET_CONFIGURE_PAGE_PASSWORD` is omitted or empty in `.env`, Comet keeps the
+  existing password stored in `.stremio/comet/.env` and warns how to change it
+  (rather than silently locking you out); on initial setup, it generates a
+  random password and warns where it is stored. Password values are never logged.
 - The Comet setup flow also offers an optional episode-pack preservation patch
   so Torrentio/Zilean-backed episode results inside season packs survive more
   like native Torrentio. When enabled (`COMET_PATCH_EPISODE_PACK_RESULTS=1`), this
@@ -190,12 +194,12 @@ Comet commands:
 
 To ensure absolute configuration coherence and prevent upstream Comet updates from silently breaking your deployment, StremioGuard enforces a **digest-pinned model**:
 
-1. **Digest Pinning:** After initial resolution, the stack runs Comet from a specific image digest (e.g., `g0ldyy/comet@sha256:...`) instead of a floating tag. The first resolution evaluates the current upstream `:latest` image against the managed patch suite and persists the accepted digest; the maintainer-tested lock digest is the fallback when required compatibility fails. This is a reproducibility and compatibility control, not a provenance/signature verification policy.
+1. **Digest Pinning:** After initial resolution, the stack runs Comet from a specific image digest (e.g., `g0ldyy/comet@sha256:...`) instead of a floating tag. The first resolution evaluates the current upstream `:latest` image against the managed patch suite and persists the accepted digest; the maintainer-tested lock digest is the fallback when required compatibility fails. This is a reproducibility and compatibility control, not a provenance/signature verification policy. `./stremio comet status` prints the active image reference, its `org.opencontainers.image.revision` label (`unknown` if unavailable), and `vendor/comet.lock.json`'s `tested_digest`.
 2. **Advisory Start-Time Checks:** Once every 24 hours, running `./stremio start` or `./stremio restart` triggers a throttled check against the upstream `:latest` registry tag. If an update is available, it prints a single notification line without blocking startup.
 3. **Comet Update Suite:**
    - `./stremio comet update check`: Resolves the remote registry digest, extracts the code, compiles it in isolation, runs a mandatory container-isolated `import-smoke` check (importing every patched module, scanning all code objects for undefined names, and probing the ASGI app to prove `StremioGuardResponseGuard` is outermost, strips P2P entries, and blocks torznab), and logs a feature diff (applied/skipped patches). Use `--deep` to run an ephemeral boot test with no network access.
-   - `./stremio comet update apply`: Promotes the validated candidate digest to active state and restarts the Comet stack.
-   - `./stremio comet update rollback`: Reverts to the previous active digest.
+   - `./stremio comet update apply`: Promotes the validated candidate digest to active state and restarts the Comet stack, proving Comet runs the active image with the active bundle and reloading a running gateway (exiting non-zero if convergence cannot be proven).
+   - `./stremio comet update rollback`: Reverts to the previous active digest, proving the running Comet and gateway converged (exiting non-zero otherwise). `./stremio comet start` enforces the same convergence checks.
 
 Recommended phase-1 shape:
 
@@ -238,9 +242,11 @@ addon, stream-discovery, and playback relay.
   LAN or tailnet (Kodi pairing through the gateway is unsupported).
 - The gateway clears all 14 Comet client-IP headers and client-supplied
   `X-Forwarded-Prefix`/`X-Forwarded-Host`, and preserves `$http_host` (including
-  non-default ports). `./stremio start` re-renders `nginx.conf` without applying
-  it to an already-running gateway; run `./stremio comet gateway-reload` to
-  apply changes live.
+  non-default ports). `./stremio start` and `./stremio restart` re-render
+  `nginx.conf` and `tokens.map`, reload a running gateway, recreate a running
+  Comet whose mounted patch bundle is stale, and exit `1` (after starting the
+  watchdog) when that convergence cannot be shown; `./stremio comet gateway-reload`
+  runs the checked gateway reload directly.
 - Raw Comet is published only on `COMET_HOST_PORT` on your configured bind
   addresses for local/tailnet operator access and diagnostics.
 - Public reverse proxies should point at `COMET_GATEWAY_HOST_PORT`, not the raw
@@ -395,7 +401,7 @@ Restarting services never touches gluetun (`docker compose up --no-deps`), so th
 
 ### What the stack runs from
 
-`./stremio start` and `./stremio restart` publish a generation under `.stremio/`: a copy of `docker-compose.yml` (`compose.base.yml`), a normalized snapshot of `.env` (`env.snapshot`), gluetun's share of it (`gluetun.env`), the generated override, and one patch bundle per Comet image digest (`comet/bundles/`). Every Compose call and the watchdog use those files, not the working tree. Editing `.env`, editing `docker-compose.yml` or running `git pull` therefore changes nothing until the next start or restart, and a mistake in an edit is reported by the command you ran, not by the watchdog during a later VPN recovery. The Comet commands (`./stremio comet start`, `comet update apply|rollback`, `comet token ...`) act on the running stack, so they read the published snapshot rather than `.env`: they change the Comet image, its bundle or the token map, and never deploy a pending edit.
+`./stremio start` and `./stremio restart` publish a generation under `.stremio/`: a copy of `docker-compose.yml` (`compose.base.yml`), a normalized snapshot of `.env` (`env.snapshot`), gluetun's share of it (`gluetun.env`), the generated override, and one patch bundle per Comet image digest (`comet/bundles/`). Containers are only ever created from that published generation (lifecycle commands publish first, and the watchdog refuses to start any container from an incomplete generation missing the override, `compose.base.yml`, or `env.snapshot`), so container settings come from `env.snapshot` rather than the working tree. Before the first start, or when the generation is incomplete, read-only queries and teardown fall back to the working tree's `docker-compose.yml` and `.env`. Editing `.env`, editing `docker-compose.yml` or running `git pull` therefore changes nothing in running containers until the next start or restart, and a mistake in an edit is reported by the command you ran, not by the watchdog during a later VPN recovery. The Comet commands (`./stremio comet start`, `comet update apply|rollback`, `comet token ...`) act on the running stack, so they read the published snapshot rather than `.env`: they change the Comet image, its bundle or the token map, and never deploy a pending edit. Note as a known limit that a variable of the same name exported in the environment of the process running Compose (your shell, for `./stremio`) still takes precedence over `env.snapshot` for Compose's `${…}` interpolation.
 
 `.env` is read by one parser, and Compose only ever sees the normalized snapshot, so the two cannot disagree about a value. Lines end at `\n`, and CRLF is accepted; any non-comment line carrying another line separator or NUL (literally or via a `\n` or `\r` escape) is refused with its line number. Optional `export`, single or double quotes, `#` after whitespace starting a comment, and the last assignment of a key winning behave as usual, except that `$` is always literal (never expanded) and the supported double-quote escapes are `\t`, `\\`, `\"` and `\$` (producing a tab, `\`, `"` and `$`, as in Compose); a `\n` or `\r` escape is refused like a literal line break, and any other escape drops its backslash, unlike Compose.
 

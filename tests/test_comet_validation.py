@@ -461,7 +461,7 @@ class ValidatorScriptTests(unittest.TestCase):
     `.env` or gateway token state.
     """
 
-    IMAGE = "g0ldyy/comet@sha256:digest"
+    IMAGE = f"g0ldyy/comet@sha256:{'a' * 64}"
 
     def _run(
         self,

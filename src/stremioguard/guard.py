@@ -35,6 +35,7 @@ from stremioguard.config import (
     Runner,
     SubprocessRunner,
     compose_command,
+    missing_published_files,
     parse_bind_addresses,
     parse_public_ip,
     service_container_id,
@@ -573,10 +574,19 @@ class GluetunGuard:
         Comet unpatched from a floating tag.
         """
         if self.frozen:
-            if not (self.config.root_dir / GENERATED_COMPOSE_FILE).exists():
+            missing = missing_published_files(self.config.root_dir)
+            if missing:
+                override = self.config.root_dir / GENERATED_COMPOSE_FILE
+                if override in missing:
+                    raise RuntimeError(
+                        "No published stack configuration exists; refusing to start services "
+                        "from the base compose file alone. Run `./stremio start`."
+                    )
+                missing_names = ", ".join(str(path) for path in missing)
                 raise RuntimeError(
-                    "No published stack configuration exists; refusing to start services "
-                    "from the base compose file alone. Run `./stremio start`."
+                    f"Published stack configuration is incomplete (missing {missing_names}); "
+                    "refusing to start services from the base compose file or raw .env. "
+                    "Run `./stremio start`."
                 )
         else:
             self.write_compose_override()

@@ -36,18 +36,15 @@ from .conftest import (
 
 def _write_lock(
     path: Path,
-    commit: str = "abc123",
     *,
+    image: str = "g0ldyy/comet",
     tested_digest: str = "sha256:" + "a" * 64,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
-                "upstream_url": "https://github.com/g0ldyy/comet",
-                "pinned_commit": commit,
-                "default_branch": "main",
-                "image": "g0ldyy/comet",
+                "image": image,
                 "tested_digest": tested_digest,
             }
         ),
@@ -461,11 +458,8 @@ class CometManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
-            _write_lock(cfg.lock_file, commit="deadbeef", tested_digest="sha256:" + "b" * 64)
+            _write_lock(cfg.lock_file, tested_digest="sha256:" + "b" * 64)
             lock = comet_mod.CometLock.load(cfg.lock_file)
-            self.assertEqual(lock.upstream_url, "https://github.com/g0ldyy/comet")
-            self.assertEqual(lock.pinned_commit, "deadbeef")
-            self.assertEqual(lock.default_branch, "main")
             self.assertEqual(lock.image, "g0ldyy/comet")
             self.assertEqual(lock.tested_digest, "sha256:" + "b" * 64)
 
@@ -474,73 +468,9 @@ class CometManagerTests(unittest.TestCase):
             tmp_path = Path(directory)
             cfg = make_comet_config(tmp_path)
             cfg.lock_file.parent.mkdir(parents=True, exist_ok=True)
-            cfg.lock_file.write_text(
-                json.dumps(
-                    {
-                        "upstream_url": "https://github.com/g0ldyy/comet",
-                        "pinned_commit": "deadbeef",
-                        "default_branch": "main",
-                    }
-                ),
-                encoding="utf-8",
-            )
+            cfg.lock_file.write_text(json.dumps({"image": "g0ldyy/comet"}), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "missing 'tested_digest'"):
                 comet_mod.CometLock.load(cfg.lock_file)
-
-    def test_fetch_and_checkout_pinned_runs_clone_fetch_and_checkout(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            cfg = make_comet_config(tmp_path)
-            _write_lock(cfg.lock_file, commit="deadbeef")
-            runner = FakeRunner(
-                {
-                    (
-                        "git",
-                        "clone",
-                        "https://github.com/g0ldyy/comet",
-                        str(cfg.repo_dir),
-                    ): completed(["git", "clone"], ""),
-                    ("git", "-C", str(cfg.repo_dir), "status", "--porcelain"): completed(
-                        ["git", "status"], ""
-                    ),
-                    ("git", "-C", str(cfg.repo_dir), "fetch", "origin"): completed(
-                        ["git", "fetch"], ""
-                    ),
-                    ("git", "-C", str(cfg.repo_dir), "checkout", "--detach", "deadbeef"): completed(
-                        ["git", "checkout"], ""
-                    ),
-                }
-            )
-            manager = CometManager(cfg, runner)
-            manager.fetch_and_checkout_pinned()
-            self.assertIn(
-                ["git", "clone", "https://github.com/g0ldyy/comet", str(cfg.repo_dir)],
-                runner.calls,
-            )
-
-    def test_fetch_and_checkout_warns_on_dirty_repo(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            cfg = make_comet_config(tmp_path)
-            _write_lock(cfg.lock_file, commit="deadbeef")
-            (cfg.repo_dir / ".git").mkdir(parents=True, exist_ok=True)
-            runner = FakeRunner(
-                {
-                    ("git", "-C", str(cfg.repo_dir), "status", "--porcelain"): completed(
-                        ["git", "status"], " M README.md\n"
-                    ),
-                    ("git", "-C", str(cfg.repo_dir), "fetch", "origin"): completed(
-                        ["git", "fetch"], ""
-                    ),
-                    ("git", "-C", str(cfg.repo_dir), "checkout", "--detach", "deadbeef"): completed(
-                        ["git", "checkout"], ""
-                    ),
-                }
-            )
-            manager = CometManager(cfg, runner)
-            with mock.patch.object(manager, "warn") as warn:
-                manager.fetch_and_checkout_pinned()
-            warn.assert_called_once()
 
     def test_render_runtime_env_uses_public_base_when_gateway_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -869,7 +799,7 @@ class CometManagerTests(unittest.TestCase):
             tmp_path = Path(directory)
             make_config(tmp_path)
             cfg = make_comet_config(tmp_path, bind_addresses=("127.0.0.1",))
-            _write_lock(cfg.lock_file, commit="deadbeef")
+            _write_lock(cfg.lock_file)
             (cfg.repo_dir / ".git").mkdir(parents=True, exist_ok=True)
             _write_upstream_patch_sources(cfg)
             cfg.runtime_env_file.parent.mkdir(parents=True, exist_ok=True)
@@ -961,7 +891,7 @@ class CometManagerTests(unittest.TestCase):
             tmp_path = Path(directory)
             make_config(tmp_path)
             cfg = make_comet_config(tmp_path)
-            _write_lock(cfg.lock_file, commit="deadbeef")
+            _write_lock(cfg.lock_file)
             (cfg.repo_dir / ".git").mkdir(parents=True, exist_ok=True)
             _write_upstream_patch_sources(cfg)
             cfg.runtime_env_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1086,7 +1016,7 @@ class CometManagerTests(unittest.TestCase):
                         "{{json .RepoDigests}}",
                     ): completed(
                         ["docker", "image", "inspect"],
-                        '["g0ldyy/comet@sha256:digest"]\n',
+                        f'["g0ldyy/comet@{TEST_COMET_DIGEST}"]\n',
                     ),
                 }
             )
@@ -1100,7 +1030,7 @@ class CometManagerTests(unittest.TestCase):
             # A legacy flat manifest directly in state_dir is not the active
             # digest's bundle and must not satisfy the check.
             (cfg.state_dir / "bundle-manifest.json").write_text(
-                '{"image_digest": "sha256:digest"}', encoding="utf-8"
+                json.dumps({"image_digest": TEST_COMET_DIGEST}), encoding="utf-8"
             )
             with self.assertRaisesRegex(RuntimeError, "missing or unreadable"):
                 manager._verify_doctor_image_and_manifest()
@@ -1109,7 +1039,9 @@ class CometManagerTests(unittest.TestCase):
             bundle_dir = cfg.bundle_dir(TEST_COMET_DIGEST)
             bundle_dir.mkdir(parents=True, exist_ok=True)
             manifest_file = bundle_dir / "bundle-manifest.json"
-            manifest_file.write_text('{"image_digest": "sha256:different"}', encoding="utf-8")
+            manifest_file.write_text(
+                json.dumps({"image_digest": "sha256:" + "d" * 64}), encoding="utf-8"
+            )
 
             # 2. Digest mismatch -> RuntimeError
             with self.assertRaises(RuntimeError) as ctx:
@@ -1117,7 +1049,9 @@ class CometManagerTests(unittest.TestCase):
             self.assertIn("Mounted bundle manifest digest", str(ctx.exception))
 
             # 3. Matches -> Success
-            manifest_file.write_text('{"image_digest": "sha256:digest"}', encoding="utf-8")
+            manifest_file.write_text(
+                json.dumps({"image_digest": TEST_COMET_DIGEST}), encoding="utf-8"
+            )
             manager._verify_doctor_image_and_manifest()
 
 
@@ -1130,7 +1064,6 @@ class CompatibilityTests(unittest.TestCase):
                 "status": "passed",
                 "image": cfg.image,
                 "image_digest": "sha256:image",
-                "source_commit": "commit",
                 "patch_fingerprint": "patches",
                 "result_format_style": cfg.result_format_style,
                 "patch_episode_pack_results": cfg.patch_episode_pack_results,
@@ -1139,16 +1072,9 @@ class CompatibilityTests(unittest.TestCase):
             }
             cfg.state_dir.mkdir(parents=True, exist_ok=True)
             (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
-            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "commit", "patches"))
-            self.assertFalse(
-                manager._compatibility_cache_valid("sha256:changed", "commit", "patches")
-            )
-            self.assertFalse(
-                manager._compatibility_cache_valid("sha256:image", "changed", "patches")
-            )
-            self.assertFalse(
-                manager._compatibility_cache_valid("sha256:image", "commit", "changed")
-            )
+            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "patches"))
+            self.assertFalse(manager._compatibility_cache_valid("sha256:changed", "patches"))
+            self.assertFalse(manager._compatibility_cache_valid("sha256:image", "changed"))
 
     def test_compatibility_cache_stage_must_cover_the_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1158,7 +1084,6 @@ class CompatibilityTests(unittest.TestCase):
                 "status": "passed",
                 "image": cfg.image,
                 "image_digest": "sha256:image",
-                "source_commit": "commit",
                 "patch_fingerprint": "patches",
                 "result_format_style": cfg.result_format_style,
                 "patch_episode_pack_results": cfg.patch_episode_pack_results,
@@ -1168,17 +1093,15 @@ class CompatibilityTests(unittest.TestCase):
             cfg.state_dir.mkdir(parents=True, exist_ok=True)
             (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
             # An import-level cache entry satisfies a plain (non-deep) request...
-            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "commit", "patches"))
+            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "patches"))
             # ...but not an explicit --deep request, and a pre-Phase-6 cache
             # entry with no "stage" key at all must never satisfy either.
             self.assertFalse(
-                manager._compatibility_cache_valid("sha256:image", "commit", "patches", deep=True)
+                manager._compatibility_cache_valid("sha256:image", "patches", deep=True)
             )
             cache.pop("stage")
             (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
-            self.assertFalse(
-                manager._compatibility_cache_valid("sha256:image", "commit", "patches")
-            )
+            self.assertFalse(manager._compatibility_cache_valid("sha256:image", "patches"))
 
     def test_compatibility_cache_invalidated_when_render_settings_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1197,7 +1120,6 @@ class CompatibilityTests(unittest.TestCase):
                 "status": "passed",
                 "image": cfg.image,
                 "image_digest": "sha256:image",
-                "source_commit": "commit",
                 "patch_fingerprint": "patches",
                 "result_format_style": "plain",
                 "patch_episode_pack_results": False,
@@ -1206,12 +1128,10 @@ class CompatibilityTests(unittest.TestCase):
             }
             cfg.state_dir.mkdir(parents=True, exist_ok=True)
             (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
-            self.assertFalse(
-                manager._compatibility_cache_valid("sha256:image", "commit", "patches")
-            )
+            self.assertFalse(manager._compatibility_cache_valid("sha256:image", "patches"))
             cache["result_format_style"] = "emoji"
             (cfg.state_dir / "compatibility.json").write_text(json.dumps(cache), encoding="utf-8")
-            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "commit", "patches"))
+            self.assertTrue(manager._compatibility_cache_valid("sha256:image", "patches"))
 
     def test_render_runtime_env_quotes_secrets_with_special_characters(self) -> None:
         from stremioguard.env import read_env_file
@@ -1757,7 +1677,10 @@ class StremThruAndScraperTests(unittest.TestCase):
             )
             runner = FakeRunner({tuple(up_cmd): completed(up_cmd)})
             manager = CometManager(make_comet_config(tmp_path), runner)
-            with mock.patch.object(manager, "write_stack_override_file"):
+            with (
+                mock.patch.object(manager, "write_stack_override_file"),
+                mock.patch.object(manager, "converge_running_stack"),
+            ):
                 manager._up()
             self.assertEqual(
                 runner.calls[-1][-6:],

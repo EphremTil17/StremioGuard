@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
+from stremioguard.digests import require_image_digest
 from stremioguard.env import (
     DEFAULT_STREMIO_CONTAINER_PORT,
     DEFAULT_STREMIO_HOST_PORT,
@@ -126,6 +127,16 @@ def parse_public_ip(text: str) -> str | None:
     return str(ip)
 
 
+def missing_published_files(root_dir: Path) -> list[Path]:
+    """Published generation files required before the stack can run from it."""
+    candidates = (
+        root_dir / GENERATED_COMPOSE_FILE,
+        root_dir / PUBLISHED_COMPOSE_FILE,
+        root_dir / PUBLISHED_ENV_FILE,
+    )
+    return [path for path in candidates if not path.exists()]
+
+
 def compose_command(root_dir: Path, *args: str) -> list[str]:
     """`docker compose` for this stack, the one way every caller builds it.
 
@@ -139,7 +150,7 @@ def compose_command(root_dir: Path, *args: str) -> list[str]:
     override = root_dir / GENERATED_COMPOSE_FILE
     published_base = root_dir / PUBLISHED_COMPOSE_FILE
     published_env = root_dir / PUBLISHED_ENV_FILE
-    if override.exists() and published_base.exists() and published_env.exists():
+    if not missing_published_files(root_dir):
         return [
             "docker",
             "compose",
@@ -539,7 +550,8 @@ class CometConfig:
         beside the running one, so the active digest always points at a
         complete bundle and a failed render changes nothing.
         """
-        return self.state_dir / "bundles" / digest.replace(":", "-")
+        validated = require_image_digest(digest, source="Comet bundle digest")
+        return self.state_dir / "bundles" / validated.replace(":", "-")
 
     @property
     def stremthru_state_dir(self) -> Path:

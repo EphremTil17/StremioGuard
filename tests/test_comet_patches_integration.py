@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
     reason="set STREMIOGUARD_DOCKER_TESTS=1 to run Docker integration tests",
 )
 
-CONTAINER_PREFIX = "sgfix9-"
+CONTAINER_PREFIX = os.environ.get("STREMIOGUARD_TEST_PREFIX", "sgfix9-")
 
 COMET_LIVE_IMAGE = (
     "g0ldyy/comet@sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea"

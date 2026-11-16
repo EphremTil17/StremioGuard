@@ -233,6 +233,20 @@ def _pull_and_restart() -> None:
     restart()
 
 
+def _converge_comet_runtime() -> None:
+    try:
+        manager = _comet_manager()
+        if not manager.config.enabled:
+            return
+        manager.converge_running_stack()
+    except (RuntimeError, ValueError, subprocess.SubprocessError, OSError) as error:
+        fail(
+            "Services are running and watched, but applying the Comet or gateway "
+            f"configuration failed ({error}). Run `./stremio comet gateway-reload` "
+            "or `./stremio restart`."
+        )
+
+
 def start() -> None:
     """Initialize if needed, start active services, and start the supervised watchdog."""
     _warn_for_optional_stremio_settings()
@@ -245,6 +259,7 @@ def start() -> None:
     except ValueError as error:
         fail(str(error))
     _run_guard_then_watch("start", context, units_changed=units_changed)
+    _converge_comet_runtime()
 
 
 def restart() -> None:
@@ -259,6 +274,7 @@ def restart() -> None:
     if not supervisor.stop_watchdog():
         fail("The watchdog could not be confirmed stopped; refusing to reset the stack under it.")
     _run_guard_then_watch("reset", context, units_changed=units_changed)
+    _converge_comet_runtime()
 
 
 def _run_guard_then_watch(action: str, context: RunContext, *, units_changed: bool) -> None:
@@ -313,7 +329,7 @@ def logs(lines: int = typer.Option(120, "--lines", "-n", help="Initial lines to 
     if not log_file:
         fail(f"No run logs found in {LOG_DIR}.")
     logger.info(f"Tailing {log_file}")
-    subprocess.run(["tail", "-n", str(lines), "-f", str(log_file)], check=False)
+    subprocess.run(["tail", "-n", str(lines), "-f", "--", str(log_file)], check=False)
 
 
 def record_home_ip() -> None:
