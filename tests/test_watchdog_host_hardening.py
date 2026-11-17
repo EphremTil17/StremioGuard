@@ -687,7 +687,9 @@ def test_ac7_resolver_cache_age_bounds_and_invalid_forms(tmp_path: Path) -> None
             "timestamp": ts,
         }
 
-    with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("offline")):
+    with mock.patch.object(
+        resolver_mod, "open_with_deadline", side_effect=urllib.error.URLError("offline")
+    ):
         # 2 hours old -> returned
         write_cache(base_obj(now - 2 * 3600))
         assert resolver_mod.resolve_nordvpn_endpoint(
@@ -773,19 +775,21 @@ def test_ac7_resolver_cache_age_bounds_and_invalid_forms(tmp_path: Path) -> None
             "locations": [{"country": {"name": "United States", "city": {"name": "Denver"}}}],
         }
     ]
-    mock_resp = mock.MagicMock()
-    mock_resp.read.return_value = json.dumps(live_payload).encode("utf-8")
-    mock_resp.__enter__.return_value = mock_resp
+    live_bytes = json.dumps(live_payload).encode("utf-8")
 
     write_cache(base_obj(now - 1800))
-    with mock.patch("urllib.request.urlopen", return_value=mock_resp) as m_open:
+    with mock.patch.object(
+        resolver_mod, "open_with_deadline", return_value=(200, live_bytes)
+    ) as m_open:
         assert resolver_mod.resolve_nordvpn_endpoint(
             country="United States", city="Denver", cache_path=cache_path
         ) == ("us1.nordvpn.com", PUBLIC_IPV4_STATION)
         m_open.assert_not_called()
 
     write_cache(base_obj(now + 3600))
-    with mock.patch("urllib.request.urlopen", return_value=mock_resp) as m_open:
+    with mock.patch.object(
+        resolver_mod, "open_with_deadline", return_value=(200, live_bytes)
+    ) as m_open:
         assert resolver_mod.resolve_nordvpn_endpoint(
             country="United States", city="Denver", cache_path=cache_path
         ) == ("us-live.nordvpn.com", PUBLIC_IPV4_ALT)
@@ -952,7 +956,9 @@ def test_ac9_wiring_guard_restarts_and_run_context_env(
     restart_cmd = [*prefix, "restart", "gluetun"]
     up_cmd = [*prefix, "up", "-d", "--no-deps", "--force-recreate", "gluetun"]
 
-    with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+    with mock.patch.object(
+        resolver_mod, "open_with_deadline", side_effect=urllib.error.URLError("down")
+    ):
         # (a) 25-hour-old cache -> compose restart gluetun, no force-recreate
         cache_path.write_text(
             json.dumps(
@@ -1734,7 +1740,9 @@ def test_ac19_resolver_handles_deeply_nested_json_without_raising(
 
         # (b) API failing and cache holding 60 KB deeply nested JSON -> None
         cache_path.write_bytes(deep_cache_body)
-        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+        with mock.patch.object(
+            resolver_mod, "open_with_deadline", side_effect=urllib.error.URLError("down")
+        ):
             assert (
                 resolver_mod.resolve_nordvpn_endpoint(
                     country="United States",

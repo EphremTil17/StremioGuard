@@ -42,6 +42,9 @@ DOCKER_QUERY_TIMEOUT_SECONDS = 30
 WATCHDOG_MUTATION_TIMEOUT_SECONDS = 240
 # Bound on one teardown `compose stop` (fail-safe / `./stremio stop`).
 TEARDOWN_MUTATION_TIMEOUT_SECONDS = 120
+# Hard ceiling on a single IP probe step so operator-configured timeouts
+# cannot exceed WatchdogSec - WATCHDOG_STEP_MARGIN_SECONDS.
+PUBLIC_IP_TIMEOUT_MAX_SECONDS = 60
 # While a failure persists, repeat its warning at most this often.
 REPEAT_WARNING_SECONDS = 300
 DEFAULT_COMET_HOST_PORT = 18000

@@ -6,15 +6,13 @@ import http.client
 import ipaddress
 import json
 import os
-import socket
-import ssl
 import stat
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
-from contextlib import suppress
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -28,6 +26,7 @@ from stremioguard.config import (
     DOCKER_QUERY_TIMEOUT_SECONDS,
     GENERATED_COMPOSE_FILE,
     MANAGED_STACK_ENV,
+    PUBLIC_IP_TIMEOUT_MAX_SECONDS,
     REPEAT_WARNING_SECONDS,
     TEARDOWN_MUTATION_TIMEOUT_SECONDS,
     WATCHDOG_MUTATION_TIMEOUT_SECONDS,
@@ -42,6 +41,11 @@ from stremioguard.config import (
     service_container_id,
 )
 from stremioguard.env import atomic_write_text, env_file_value, read_regular_file
+from stremioguard.httpdeadline import (
+    ConnectionTracker,
+    DeadlineHTTPHandler,
+    DeadlineHTTPSHandler,
+)
 from stremioguard.preflight import (
     require_docker,
     require_matching_daemon,
@@ -202,169 +206,6 @@ class GluetunUnavailableError(RuntimeError):
     """
 
 
-class _ProbeConnectionTracker:
-    """Tracks sockets opened during one probe attempt so deadline expiry aborts any phase."""
-
-    def __init__(self, deadline: float) -> None:
-        self.deadline = deadline
-        self._lock = threading.Lock()
-        self._cancelled = False
-        self._sockets: list[socket.socket] = []
-
-    def remaining(self) -> float:
-        with self._lock:
-            if self._cancelled:
-                raise TimeoutError("probe deadline exceeded")
-        rem = self.deadline - time.monotonic()
-        if rem <= 0:
-            raise TimeoutError("probe deadline exceeded")
-        return rem
-
-    def register(self, sock: socket.socket) -> None:
-        with self._lock:
-            if self._cancelled:
-                with suppress(OSError):
-                    sock.close()
-                raise TimeoutError("probe deadline exceeded")
-            self._sockets.append(sock)
-
-    def replace(self, old_sock: socket.socket, new_sock: socket.socket) -> None:
-        """Swap a wrapped raw socket for its SSLSocket before handshake I/O begins."""
-        with self._lock:
-            if old_sock in self._sockets:
-                self._sockets.remove(old_sock)
-            if self._cancelled:
-                with suppress(OSError):
-                    new_sock.close()
-                raise TimeoutError("probe deadline exceeded")
-            self._sockets.append(new_sock)
-
-    def unregister_and_close(self, sock: socket.socket) -> None:
-        with self._lock:
-            if sock in self._sockets:
-                self._sockets.remove(sock)
-        with suppress(OSError):
-            sock.close()
-
-    def cancel(self) -> None:
-        with self._lock:
-            self._cancelled = True
-            for sock in self._sockets:
-                with suppress(OSError):
-                    if sock.fileno() != -1:
-                        socket.socket.shutdown(sock, socket.SHUT_RDWR)
-
-    def close_all(self) -> None:
-        with self._lock:
-            sockets = list(self._sockets)
-            self._sockets.clear()
-        for sock in sockets:
-            with suppress(OSError):
-                sock.close()
-
-    @property
-    def cancelled(self) -> bool:
-        with self._lock:
-            return self._cancelled
-
-
-def _tracked_create_connection(
-    tracker: _ProbeConnectionTracker,
-    address: tuple[str, int],
-    timeout: float | None = None,
-    source_address: tuple[str, int] | None = None,
-) -> socket.socket:
-    host, port = address
-    err: OSError | None = None
-    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
-        af, socktype, proto, _, sa = res
-        sock: socket.socket | None = None
-        try:
-            sock = socket.socket(af, socktype, proto)
-            rem = tracker.remaining()
-            sock.settimeout(rem if timeout is None else min(timeout, rem))
-            if source_address:
-                sock.bind(source_address)
-            tracker.register(sock)
-            sock.connect(sa)
-            err = None
-            return sock
-        except OSError as exc:
-            err = exc
-            if sock is not None:
-                tracker.unregister_and_close(sock)
-    if err is not None:
-        raise err
-    raise OSError("getaddrinfo returns an empty list")
-
-
-class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
-    def __init__(self, tracker: _ProbeConnectionTracker) -> None:
-        super().__init__()
-        self._tracker = tracker
-
-    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
-        tracker = self._tracker
-
-        class _Conn(http.client.HTTPConnection):
-            def connect(self) -> None:
-                self._create_connection = lambda address, timeout=None, source_address=None: (
-                    _tracked_create_connection(tracker, address, timeout, source_address)
-                )
-                super().connect()
-
-        return self.do_open(_Conn, req)
-
-
-class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(
-        self,
-        tracker: _ProbeConnectionTracker,
-        context: ssl.SSLContext | None = None,
-    ) -> None:
-        self._ssl_context = context if context is not None else ssl.create_default_context()
-        super().__init__(context=self._ssl_context)
-        self._tracker = tracker
-
-    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
-        tracker = self._tracker
-        ssl_context = self._ssl_context
-
-        class _Conn(http.client.HTTPSConnection):
-            def connect(self) -> None:
-                self._create_connection = lambda address, timeout=None, source_address=None: (
-                    _tracked_create_connection(tracker, address, timeout, source_address)
-                )
-                # Connect TCP (and HTTP tunnel if configured) first, then wrap without
-                # handshaking so the SSLSocket is tracked before any TLS I/O runs.
-                http.client.HTTPConnection.connect(self)
-                raw_sock = self.sock
-                assert raw_sock is not None
-                server_hostname: str = getattr(self, "_tunnel_host", None) or self.host
-                ssl_sock: ssl.SSLSocket | None = None
-                try:
-                    ssl_sock = ssl_context.wrap_socket(
-                        raw_sock,
-                        server_hostname=server_hostname,
-                        do_handshake_on_connect=False,
-                    )
-                    self.sock = ssl_sock
-                    tracker.replace(raw_sock, ssl_sock)
-                    rem = tracker.remaining()
-                    current_timeout = ssl_sock.gettimeout()
-                    ssl_sock.settimeout(
-                        rem if current_timeout is None else min(current_timeout, rem)
-                    )
-                    ssl_sock.do_handshake()
-                except BaseException:
-                    tracker.unregister_and_close(raw_sock)
-                    if ssl_sock is not None:
-                        tracker.unregister_and_close(ssl_sock)
-                    raise
-
-        return self.do_open(_Conn, req, context=ssl_context)
-
-
 class GluetunGuard:
     def __init__(
         self,
@@ -380,6 +221,7 @@ class GluetunGuard:
         """
         self.config = config
         self.runner = runner or SubprocessRunner()
+        self.on_step: Callable[[], None] = lambda: None
         self._env_path = self.config.env_file or self.config.root_dir / ".env"
         self.frozen = frozen
         self.teardown = teardown
@@ -404,6 +246,10 @@ class GluetunGuard:
         self._host_ip_warned_at: float | None = None
         self._verified_dns_block_identity: tuple[str, str] | None = None
         self._dns_block_warned_at: float | None = None
+
+    @property
+    def probe_timeout_seconds(self) -> int:
+        return min(self.config.public_ip_timeout_seconds, PUBLIC_IP_TIMEOUT_MAX_SECONDS)
 
     def log(self, message: str) -> None:
         logger.info(message)
@@ -769,11 +615,11 @@ class GluetunGuard:
         url: str,
         timeout: float,
         *,
-        tracker: _ProbeConnectionTracker | None = None,
+        tracker: ConnectionTracker | None = None,
     ) -> str | None:
         """Fetch up to 128 bytes from ``url`` under a strict wall-clock deadline."""
         timeout_seconds = max(0.0, timeout)
-        active_tracker = tracker or _ProbeConnectionTracker(time.monotonic() + timeout_seconds)
+        active_tracker = tracker or ConnectionTracker(time.monotonic() + timeout_seconds)
         result: list[str | None] = [None]
         done = threading.Event()
         request = urllib.request.Request(url, headers=dict(PROBE_REQUEST_HEADERS))
@@ -816,14 +662,15 @@ class GluetunGuard:
         skipped rather than returned, because comparing an IPv6 host address
         with an IPv4 tunnel egress could never match and would pass silently.
         """
-        timeout = float(self.config.public_ip_timeout_seconds)
+        timeout = float(self.probe_timeout_seconds)
         for url in self.config.ip_check_urls:
-            tracker = _ProbeConnectionTracker(time.monotonic() + max(0.0, timeout))
+            tracker = ConnectionTracker(time.monotonic() + max(0.0, timeout))
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({}),
-                _DeadlineHTTPHandler(tracker),
-                _DeadlineHTTPSHandler(tracker),
+                DeadlineHTTPHandler(tracker),
+                DeadlineHTTPSHandler(tracker),
             )
+            self.on_step()
             body = self._fetch_ip_url(opener, url, timeout, tracker=tracker)
             if body is None:
                 continue
@@ -839,7 +686,7 @@ class GluetunGuard:
             return None
         if not container_id:
             return None
-        t = self.config.public_ip_timeout_seconds
+        t = self.probe_timeout_seconds
         for url in self.config.ip_check_urls:
             try:
                 result = self.runner.run(
@@ -883,7 +730,7 @@ class GluetunGuard:
         # No -q: quiet mode suppresses the HTTP status line on stderr, which is
         # the only way to distinguish an auth/route failure (permanent) from a
         # transient one. The response body still arrives alone on stdout.
-        t = self.config.public_ip_timeout_seconds
+        t = self.probe_timeout_seconds
         try:
             result = self.runner.run(
                 [
@@ -1482,6 +1329,7 @@ class GluetunGuard:
         """
         self.log("Restarting gluetun service (best-effort candidate reselection).")
         self.capture_gluetun_evidence("restart")
+        self.on_step()
         env_override = nordvpn_endpoint_env(
             self._env_path,
             self.config.root_dir / ".stremio" / "nordvpn-endpoint-cache.json",

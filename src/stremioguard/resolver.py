@@ -14,6 +14,7 @@ from loguru import logger
 
 from stremioguard.config import parse_public_ip
 from stremioguard.env import atomic_write_text, ensure_directory, env_file_value, read_regular_file
+from stremioguard.httpdeadline import open_with_deadline
 
 RECOMMENDATIONS_API_URL = "https://api.nordvpn.com/v1/servers/recommendations"
 DEFAULT_CACHE_TTL_SECONDS = 3600.0  # 1 hour
@@ -53,15 +54,18 @@ def _fetch_nordvpn_recommendations(
         "Accept": "application/json",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-        raw_bytes = response.read(MAX_RECOMMENDATIONS_BYTES + 1)
-        if len(raw_bytes) > MAX_RECOMMENDATIONS_BYTES:
-            raise ValueError("NordVPN recommendations response exceeded 4 MiB limit")
-        raw_body = raw_bytes.decode("utf-8")
-        data = json.loads(raw_body)
-        if not isinstance(data, list):
-            raise ValueError("NordVPN recommendations response was not a JSON list")
-        return [s for s in data if isinstance(s, dict)]
+    _, raw_bytes = open_with_deadline(
+        req,
+        timeout=timeout_seconds,
+        max_bytes=MAX_RECOMMENDATIONS_BYTES + 1,
+    )
+    if len(raw_bytes) > MAX_RECOMMENDATIONS_BYTES:
+        raise ValueError("NordVPN recommendations response exceeded 4 MiB limit")
+    raw_body = raw_bytes.decode("utf-8")
+    data = json.loads(raw_body)
+    if not isinstance(data, list):
+        raise ValueError("NordVPN recommendations response was not a JSON list")
+    return [s for s in data if isinstance(s, dict)]
 
 
 def _server_load(s: dict[str, Any]) -> int:

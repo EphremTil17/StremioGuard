@@ -86,13 +86,13 @@ class ResolverTests(unittest.TestCase):
             }
             cache_path.write_text(json.dumps(cache_payload), encoding="utf-8")
 
-            with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            with mock.patch.object(resolver, "open_with_deadline") as mock_open:
                 result = resolver.resolve_nordvpn_endpoint(
                     country="United States", city="Denver", cache_path=cache_path
                 )
 
             self.assertEqual(result, ("us-cached.nordvpn.com", PUBLIC_IPV4_STATION))
-            mock_urlopen.assert_not_called()
+            mock_open.assert_not_called()
 
     def test_resolve_nordvpn_endpoint_fetches_and_updates_cache_on_miss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -108,11 +108,12 @@ class ResolverTests(unittest.TestCase):
                     ],
                 }
             ]
-            mock_response = mock.MagicMock()
-            mock_response.read.return_value = json.dumps(payload).encode("utf-8")
-            mock_response.__enter__.return_value = mock_response
 
-            with mock.patch("urllib.request.urlopen", return_value=mock_response):
+            with mock.patch.object(
+                resolver,
+                "open_with_deadline",
+                return_value=(200, json.dumps(payload).encode("utf-8")),
+            ):
                 result = resolver.resolve_nordvpn_endpoint(
                     country="United States", city="Denver", cache_path=cache_path
                 )
@@ -135,8 +136,10 @@ class ResolverTests(unittest.TestCase):
             }
             cache_path.write_text(json.dumps(cache_payload), encoding="utf-8")
 
-            with mock.patch(
-                "urllib.request.urlopen", side_effect=urllib.error.URLError("No route")
+            with mock.patch.object(
+                resolver,
+                "open_with_deadline",
+                side_effect=urllib.error.URLError("No route"),
             ):
                 result = resolver.resolve_nordvpn_endpoint(
                     country="United States", city="Denver", cache_path=cache_path
@@ -147,11 +150,12 @@ class ResolverTests(unittest.TestCase):
     def test_resolve_nordvpn_endpoint_returns_none_when_no_match_and_no_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "cache.json"
-            mock_response = mock.MagicMock()
-            mock_response.read.return_value = json.dumps([]).encode("utf-8")
-            mock_response.__enter__.return_value = mock_response
 
-            with mock.patch("urllib.request.urlopen", return_value=mock_response):
+            with mock.patch.object(
+                resolver,
+                "open_with_deadline",
+                return_value=(200, json.dumps([]).encode("utf-8")),
+            ):
                 result = resolver.resolve_nordvpn_endpoint(
                     country="Nonexistent", city="Nowhere", cache_path=cache_path
                 )

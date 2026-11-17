@@ -24,6 +24,7 @@ from stremioguard.config import (
     REPEAT_WARNING_SECONDS,
     CometConfig,
     Config,
+    Runner,
     deployed_env_file,
     docker_daemon_help,
     docker_permission_help,
@@ -50,6 +51,9 @@ app = typer.Typer(
 
 # Upper bound on one sleep between heartbeats; far below the unit's WatchdogSec.
 HEARTBEAT_SLEEP_CHUNK_SECONDS = 30.0
+# Hard ceiling on step heartbeats inside one check so an endless loop cannot
+# extend WatchdogSec= indefinitely.
+TICK_HEARTBEAT_CEILING_SECONDS = 3600
 LOOP_ERRORS_BEFORE_STOP = 3
 # A leak verdict stops services at once; a second one within 24 hours locks out.
 LEAK_CONFIRMATIONS = 2
@@ -84,6 +88,34 @@ if os.environ.get("STREMIO_BACKGROUND") != "1":
         colorize=sys.stdout.isatty(),
         diagnose=False,
     )
+
+
+class StepHeartbeatRunner:
+    """Runner wrapper that signals progress right before each command step."""
+
+    def __init__(self, inner: Runner, on_step: Callable[[], None]) -> None:
+        self.inner = inner
+        self.on_step = on_step
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        check: bool = False,
+        capture: bool = True,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
+        input: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        self.on_step()
+        return self.inner.run(
+            args,
+            check=check,
+            capture=capture,
+            timeout=timeout,
+            env=env,
+            input=input,
+        )
 
 
 class Orchestrator:
@@ -122,6 +154,7 @@ class Orchestrator:
         self.lock_deferred_since: float | None = None
         self._lock_expiry_warned = False
         self._alerts_sent: dict[str, float] = {}
+        self._tick_started_at: float | None = None
         if self.guard.config.log_session:
             self._log_session_start()
 
@@ -135,8 +168,26 @@ class Orchestrator:
             f"run_id={cfg.run_id} "
             f"deployment_profile={self.guard.deployment_profile()} "
             f"watch_interval_seconds={cfg.watch_interval_seconds} "
-            f"watchdog_log_interval_seconds={cfg.watchdog_log_interval_seconds}"
+            f"watchdog_log_interval_seconds={cfg.watchdog_log_interval_seconds} "
+            f"tick_heartbeat_ceiling_seconds={TICK_HEARTBEAT_CEILING_SECONDS}"
         )
+
+    def _attach_step_heartbeat(self) -> None:
+        if not isinstance(self.guard.runner, StepHeartbeatRunner):
+            self.guard.runner = StepHeartbeatRunner(self.guard.runner, self._step_heartbeat)
+        self.guard.on_step = self._step_heartbeat
+
+    def _step_heartbeat(self) -> None:
+        if self._tick_started_at is None:
+            return
+        if self.consecutive_loop_errors >= LOOP_ERRORS_BEFORE_STOP:
+            return
+        if time.monotonic() - self._tick_started_at >= TICK_HEARTBEAT_CEILING_SECONDS:
+            return
+        try:
+            notify("WATCHDOG=1")
+        except Exception as error:
+            logger.debug(f"Step heartbeat notify failed: {type(error).__name__}")
 
     def setup_active_services(self, *, reset: bool = True) -> None:
         g = self.guard
@@ -236,6 +287,7 @@ class Orchestrator:
             f"{', '.join(g.enabled_public_services())} "
             f"every {g.config.watch_interval_seconds}s."
         )
+        self._attach_step_heartbeat()
         notify("READY=1")
         try:
             self._watch_loop()
@@ -273,39 +325,46 @@ class Orchestrator:
     def _tick(self) -> bool:
         """Run one check; return whether it completed.
 
-        Heartbeats follow completed checks only. A watchdog that keeps failing
-        is not watching, so systemd must see it stall (WatchdogSec=), restart
-        it, and hand over to the fail-safe if that keeps happening.
+        A heartbeat precedes every bounded step of the check
+        (``_step_heartbeat()``) and follows a completed check. Step heartbeats
+        stop after ``LOOP_ERRORS_BEFORE_STOP`` consecutive failed checks and
+        ``TICK_HEARTBEAT_CEILING_SECONDS`` into one check, so a watchdog that
+        keeps failing, or a check that never ends, still goes silent and systemd
+        restarts it and hands over to the fail-safe if that keeps happening.
         """
+        self._tick_started_at = time.monotonic()
         try:
-            if lockout_marker_present(self.guard.config.vpn_lockout_file):
-                self.guard.warn(
-                    "VPN lockout marker detected while watchdog is running; "
-                    "stopping stack and exiting without modifying the marker."
-                )
-                self._shutdown_and_exit_for_lockout("lockout_marker")
-            with stack_lock(self.guard.config.root_dir) as held:
-                if held:
-                    self.lock_deferred_since = None
-                    self._lock_expiry_warned = False
-                elif not self._lock_defer_expired():
-                    # A CLI command owns the stack right now. Stand aside from
-                    # everything that changes it, but keep looking for a leak.
-                    self._deferred_leak_check()
-                    return True
-                self.watch_once()
-        except (typer.Exit, SystemExit, KeyboardInterrupt):
-            raise
-        except Exception:
-            logger.exception("Watchdog loop iteration encountered an error.")
-            self.consecutive_loop_errors += 1
-            self.loop_errors_since_summary += 1
-            if self.consecutive_loop_errors >= LOOP_ERRORS_BEFORE_STOP:
-                self._stop_after_loop_errors()
-            return False
-        self.consecutive_loop_errors = 0
-        notify("WATCHDOG=1")
-        return True
+            try:
+                if lockout_marker_present(self.guard.config.vpn_lockout_file):
+                    self.guard.warn(
+                        "VPN lockout marker detected while watchdog is running; "
+                        "stopping stack and exiting without modifying the marker."
+                    )
+                    self._shutdown_and_exit_for_lockout("lockout_marker")
+                with stack_lock(self.guard.config.root_dir) as held:
+                    if held:
+                        self.lock_deferred_since = None
+                        self._lock_expiry_warned = False
+                    elif not self._lock_defer_expired():
+                        # A CLI command owns the stack right now. Stand aside from
+                        # everything that changes it, but keep looking for a leak.
+                        self._deferred_leak_check()
+                        return True
+                    self.watch_once()
+            except (typer.Exit, SystemExit, KeyboardInterrupt):
+                raise
+            except Exception:
+                logger.exception("Watchdog loop iteration encountered an error.")
+                self.consecutive_loop_errors += 1
+                self.loop_errors_since_summary += 1
+                if self.consecutive_loop_errors >= LOOP_ERRORS_BEFORE_STOP:
+                    self._stop_after_loop_errors()
+                return False
+            self.consecutive_loop_errors = 0
+            notify("WATCHDOG=1")
+            return True
+        finally:
+            self._tick_started_at = None
 
     def _lock_defer_expired(self) -> bool:
         """Whether the watchdog has yielded the stack lock for too long."""
@@ -364,6 +423,7 @@ class Orchestrator:
             if last is not None and now - last < ALERT_REPEAT_SECONDS:
                 return
             self._alerts_sent[event] = now
+            self._step_heartbeat()
             send_alert(self.guard.config.alert_url, title=title, message=message)
         except Exception:
             logger.opt(exception=True).debug("Alert delivery raised unexpectedly.")

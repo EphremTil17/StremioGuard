@@ -53,11 +53,13 @@ RESTART_STEPS = 6
 RESTART_MAX_DELAY_SEC = 300
 START_LIMIT_INTERVAL_SEC = 3600
 START_LIMIT_BURST = 6
-# Upper bound on one watchdog tick (a Docker call, a cached image build)
-# before systemd treats the process as hung and restarts it. Six of these plus
-# the backoff must fit in START_LIMIT_INTERVAL_SEC, or a hang loop would never
-# hit the start limit and the fail-safe would never run.
+# Upper bound on the silence between two heartbeats. The watchdog sends one
+# before every bounded step of a check, so this must exceed the longest step
+# (WATCHDOG_MUTATION_TIMEOUT_SECONDS) by WATCHDOG_STEP_MARGIN_SECONDS. Six of
+# these plus the backoff must fit in START_LIMIT_INTERVAL_SEC, or a hang loop
+# would never hit the start limit and the fail-safe would never run.
 WATCHDOG_SEC = 300
+WATCHDOG_STEP_MARGIN_SECONDS = 60
 # Slow-success worst-case `fail_safe()` duration across a 5-service stack
 # (stremio, comet-gateway, comet, stremthru, comet-postgres), where every call
 # runs for its full timeout and then answers:

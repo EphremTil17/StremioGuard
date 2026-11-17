@@ -16,11 +16,12 @@ raises, so an unreachable endpoint cannot delay or abort a shutdown.
 
 from __future__ import annotations
 
-import urllib.error
 import urllib.parse
 import urllib.request
 
 from loguru import logger
+
+from stremioguard.httpdeadline import open_with_deadline
 
 ALERT_TIMEOUT_SECONDS = 5.0
 
@@ -47,10 +48,13 @@ def send_alert(url: str | None, *, title: str, message: str, urgent: bool = True
                 "User-Agent": "stremioguard-alert/1",
             },
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(request, timeout=ALERT_TIMEOUT_SECONDS) as response:
-            delivered = 200 <= response.status < 300
-    except (OSError, urllib.error.URLError, ValueError) as error:
+        status, _ = open_with_deadline(
+            request,
+            timeout=ALERT_TIMEOUT_SECONDS,
+            max_bytes=0,
+        )
+        delivered = 200 <= status < 300
+    except Exception as error:
         # Never the URL itself: ntfy topics and webhook paths are credentials.
         logger.warning(f"Alert could not be delivered ({type(error).__name__}).")
         return False

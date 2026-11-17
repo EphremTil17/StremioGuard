@@ -24,7 +24,9 @@ def notify(state: str) -> bool:
     if address.startswith("@"):
         address = "\0" + address[1:]
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC) as sock:
+        with socket.socket(
+            socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK
+        ) as sock:
             sock.connect(address)
             sock.sendall(state.encode("utf-8"))
     except OSError:
