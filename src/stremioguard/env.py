@@ -21,7 +21,8 @@ WIREGUARD_KEY_PLACEHOLDER = "<paste-key-here>"
 OPENVPN_USER_PLACEHOLDER = "<paste-service-username-here>"
 OPENVPN_PASSWORD_PLACEHOLDER = "<paste-service-password-here>"
 DEFAULT_STREMIO_HOST_PORT = 11470
-DEFAULT_STREMIO_CONTAINER_PORT = 11470
+# The image's nginx: basic auth applies there, never on the server's own 11470.
+DEFAULT_STREMIO_CONTAINER_PORT = 8080
 
 
 def fail(message: str) -> NoReturn:

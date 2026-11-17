@@ -546,6 +546,9 @@ http {{
     proxy_hide_header X-Content-Type-Options;
     proxy_hide_header X-Frame-Options;
     proxy_hide_header Referrer-Policy;
+    # Comet allows no credentialed cross-site reads; never pass a credentials
+    # grant through from any upstream response either.
+    proxy_hide_header Access-Control-Allow-Credentials;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "same-origin" always;

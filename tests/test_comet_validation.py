@@ -60,6 +60,8 @@ def _runner_with_entrypoint(
 _GUARD_OUTPUTS = {
     "app.py": "/app/comet/api/app.py",
     "stremioguard_response_guard.py": "/app/comet/stremioguard_response_guard.py",
+    "playback.py": "/app/comet/api/endpoints/playback.py",
+    "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
 }
 
 
@@ -122,8 +124,10 @@ class ImportSmokeTestTests(unittest.TestCase):
             args[image_index + 5 :],
             [
                 "comet.api.app",
+                "comet.api.endpoints.playback",
                 "comet.api.endpoints.stream",
                 "comet.stremioguard_response_guard",
+                "comet.stremioguard_stream_guard",
             ],
         )
 

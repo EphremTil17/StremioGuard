@@ -138,7 +138,9 @@ class Orchestrator:
         self.outage_start_wall: float | None = None
         self.unhealthy_elapsed_seconds: float = 0.0
         self.last_watch_tick_at: float | None = None
-        self.last_auth_check_wall: float | None = None
+        # Monotonic: a wall-clock cursor would skip log lines after the clock
+        # steps back. It becomes a wall-clock `--since` only when a scan runs.
+        self.last_auth_check_mono: float | None = None
         self.last_restart_at: float = 0.0
         self.escalation_triggered: bool = False
         # The gluetun (container, start time) whose namespace the services
@@ -609,7 +611,7 @@ class Orchestrator:
         # start of this check would attribute a line the OLD process logged
         # just before it was restarted to the new one, and confirm a
         # rejection that was only ever seen once.
-        self.last_auth_check_wall = time.time()
+        self.last_auth_check_mono = time.monotonic()
         return True
 
     def _reconcile_namespace(self, gluetun: GluetunState | None, services: list[str]) -> None:
@@ -710,7 +712,7 @@ class Orchestrator:
                 self.outage_start_wall = now_wall
                 self.unhealthy_elapsed_seconds = 0.0
                 self.last_watch_tick_at = now_mono
-                self.last_auth_check_wall = now_wall
+                self.last_auth_check_mono = now_mono
                 self.last_restart_at = now_mono
                 self.restart_generation = 0
                 self.auth_rejection_generations.clear()
@@ -741,8 +743,15 @@ class Orchestrator:
                 g.stop_active_services(services=services)
 
             # Incremental bounded log check since previous probe
-            check_since = self.last_auth_check_wall or self.outage_start_wall
-            self.last_auth_check_wall = now_wall
+            cursor = (
+                self.last_auth_check_mono
+                if self.last_auth_check_mono is not None
+                else self.outage_started_at
+            )
+            self.last_auth_check_mono = now_mono
+            # The wall-clock moment `cursor` was, measured back from now on the
+            # monotonic clock, so a clock step since then cannot hide new lines.
+            check_since = now_wall - max(0.0, now_mono - cursor) if cursor is not None else None
             self._note_auth_rejection(g.gluetun_auth_evidence(lines=200, since_epoch=check_since))
 
             if self.last_watch_tick_at is not None:
@@ -808,7 +817,7 @@ class Orchestrator:
             self.outage_started_at = None
             self.outage_start_wall = None
             self.unhealthy_elapsed_seconds = 0.0
-            self.last_auth_check_wall = None
+            self.last_auth_check_mono = None
             self.last_restart_at = 0.0
             self.escalation_triggered = False
             self.restart_generation = 0

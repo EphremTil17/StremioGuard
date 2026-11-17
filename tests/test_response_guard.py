@@ -681,3 +681,97 @@ def test_ac18_g_undecided_empty_and_whitespace_bodies_unchanged(body: bytes) -> 
     status, _, chunks = asyncio.run(_run_asgi(guard, _http_scope("/health")))
     assert status == 200
     assert b"".join(chunks) == body
+
+
+# Security hardening for edge cases: P2P markers beyond infoHash, other list
+# formats, and paced login attempts.
+
+
+def _json_app(payload: Any) -> Any:
+    body = json.dumps(payload).encode("utf-8")
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    return app
+
+
+def _guarded_json(payload: Any) -> Any:
+    guard = StremioGuardResponseGuard(_json_app(payload))
+    status, _, chunks = asyncio.run(_run_asgi(guard, _http_scope("/s/x/stream/movie/tt1.json")))
+    assert status == 200
+    return json.loads(b"".join(chunks))
+
+
+def test_tracker_sources_without_an_infohash_count_as_p2p() -> None:
+    payload = {
+        "streams": [
+            {"name": "trackers only", "sources": ["tracker:udp://t.example:1337/announce"]},
+            {
+                "name": "http with trackers",
+                "url": "https://cdn.example/v.mkv",
+                "sources": ["dht:abc"],
+            },
+            {"name": "plain http", "url": "https://cdn.example/w.mkv", "sources": []},
+        ]
+    }
+    out = _guarded_json(payload)
+    assert [s["name"] for s in out["streams"]] == ["http with trackers", "plain http"]
+    assert "sources" not in out["streams"][0]
+    assert out["streams"][1]["url"] == "https://cdn.example/w.mkv"
+
+
+def test_top_level_sources_lists_are_filtered_like_streams() -> None:
+    payload = {
+        "sources": [
+            {"url": "magnet:?xt=urn:btih:" + "a" * 40},
+            {"infoHash": "b" * 40, "fileIdx": 0},
+            {"url": "https://cdn.example/ok.mkv", "infoHash": "c" * 40},
+        ]
+    }
+    out = _guarded_json(payload)
+    assert out == {"sources": [{"url": "https://cdn.example/ok.mkv"}]}
+
+
+def _login_scope(path: str, method: str = "POST") -> dict[str, Any]:
+    scope = _http_scope(path)
+    scope["method"] = method
+    return scope
+
+
+def test_login_attempts_share_a_paced_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    import stremioguard.overrides.response_guard as guard_mod
+
+    now = [1000.0]
+    monkeypatch.setattr(guard_mod, "_LOGIN_BUDGET", guard_mod._LoginBudget(clock=lambda: now[0]))
+    reached: list[str] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        reached.append(scope["path"])
+        await send({"type": "http.response.start", "status": 303, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    guard = StremioGuardResponseGuard(app)
+
+    def status_of(path: str, method: str = "POST") -> int:
+        return asyncio.run(_run_asgi(guard, _login_scope(path, method)))[0]
+
+    statuses = [status_of("/configure/login") for _ in range(4)]
+    statuses += [status_of("/admin/login/"), status_of("/admin/login")]
+    assert statuses == [303] * 5 + [429]
+    # Reading the pages, and every other route, is never paced.
+    assert status_of("/configure/login", "GET") == 303
+    assert status_of("/configure", "POST") == 303
+    # The budget refills at 6 a minute.
+    now[0] += 10.0
+    assert status_of("/configure/login") == 303
+    assert status_of("/configure/login") == 429
+    # Four POSTs, the GET, and the one after the refill: never a refused attempt.
+    assert reached.count("/configure/login") == 6

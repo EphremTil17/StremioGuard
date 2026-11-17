@@ -359,8 +359,8 @@ class GluetunGuardTests(unittest.TestCase):
             override = (tmp_path / ".stremio" / "docker-compose.bindings.yml").read_text(
                 encoding="utf-8"
             )
-            self.assertIn('"192.168.1.10:12470:11470"', override)
-            self.assertIn('"100.64.0.10:12470:11470"', override)
+            self.assertIn('"192.168.1.10:12470:8080"', override)
+            self.assertIn('"100.64.0.10:12470:8080"', override)
 
     def test_compose_override_supports_zero_bind_addresses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -445,7 +445,10 @@ class GluetunGuardTests(unittest.TestCase):
         # the IP check already passed against the old container.
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+            (tmp_path / ".env").write_text(
+                "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+                encoding="utf-8",
+            )
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
             with (
                 mock.patch.object(guard, "require_commands"),
@@ -471,7 +474,8 @@ class GluetunGuardTests(unittest.TestCase):
             tmp_path = Path(directory)
             (tmp_path / ".env").write_text(
                 "STREMIO_BIND_ADDRS=127.0.0.1\nOPENVPN_ENDPOINT_IP=198.51.100.1\n"
-                "VPN_TYPE=openvpn\nSERVER_COUNTRIES=Canada\n",
+                "VPN_TYPE=openvpn\nSERVER_COUNTRIES=Canada\n"
+                "STREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
                 encoding="utf-8",
             )
             env_inspect = ("docker", "inspect", "--format", "{{json .Config.Env}}", "gluetun")
@@ -522,7 +526,10 @@ class GluetunGuardTests(unittest.TestCase):
         # abort before it starts; no protected-service promotion is permitted.
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+            (tmp_path / ".env").write_text(
+                "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+                encoding="utf-8",
+            )
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
             with (
                 mock.patch.object(guard, "require_commands"),
@@ -545,7 +552,10 @@ class GluetunGuardTests(unittest.TestCase):
     def test_preflight_rejects_unverifiable_ip_without_recovery_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+            (tmp_path / ".env").write_text(
+                "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+                encoding="utf-8",
+            )
             guard = GluetunGuard(make_config(tmp_path), FakeRunner({}))
             with (
                 mock.patch.object(guard, "require_commands"),
@@ -561,7 +571,10 @@ class GluetunGuardTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         tmp_path = Path(directory.name)
-        (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+        (tmp_path / ".env").write_text(
+            "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+            encoding="utf-8",
+        )
         cfg = make_config(tmp_path)
         for suffix in (["pull", "gluetun"], ["up", "-d", "gluetun"]):
             cmd = [*compose_args_prefix(tmp_path), *suffix]
@@ -908,7 +921,10 @@ class DaemonIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             env_path = tmp_path / ".env"
-            env_path.write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+            env_path.write_text(
+                "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+                encoding="utf-8",
+            )
             guard = GluetunGuard(
                 make_config(tmp_path),
                 FakeRunner(
@@ -1566,7 +1582,10 @@ def test_frozen_compose_fresh_refuses_without_a_published_override(tmp_path: Pat
 
     config = make_config(tmp_path)
     (tmp_path / ".stremio" / "docker-compose.bindings.yml").unlink()
-    (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+        encoding="utf-8",
+    )
     runner = FakeRunner({})
     guard = GluetunGuard(config, runner, frozen=True)
     with pytest.raises(RuntimeError, match="No published stack configuration"):

@@ -28,7 +28,8 @@ testpaths = ["tests"]
 include = ["src", "tests"]
 venvPath = "."
 venv = ".venv"
-exclude = ["vendor/comet"]
+# stream_guard.py is source for Comet; it imports Comet-only packages.
+exclude = ["vendor/comet", "src/stremioguard/overrides/stream_guard.py"]
 
 [tool.ruff]
 line-length = 100

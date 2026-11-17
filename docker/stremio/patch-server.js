@@ -61,12 +61,14 @@ const ESSENTIAL_PATCHES = [
   {
     name: "normalize converter media url",
     from: "mediaURL: req.query.mediaURL,",
-    to: "mediaURL: normalizeMediaURL(req.query.mediaURL, req, protocol),",
+    // No `protocol` variable is in scope here: derive the scheme from the
+    // request's own socket (the forwarded headers take precedence anyway).
+    to: 'mediaURL: normalizeMediaURL(req.query.mediaURL, req, req.socket && req.socket.encrypted ? "https://" : "http://"),',
   },
   {
     name: "normalize hls probe media url",
     from: "mediaURL: req.query.mediaURL\n                });",
-    to: "mediaURL: normalizeMediaURL(req.query.mediaURL, req, protocol)\n                });",
+    to: 'mediaURL: normalizeMediaURL(req.query.mediaURL, req, req.socket && req.socket.encrypted ? "https://" : "http://")\n                });',
   },
   {
     name: "derive streaming server url from forwarded request origin",

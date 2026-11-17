@@ -63,7 +63,10 @@ def test_a_missing_directory_is_not_an_error(tmp_path: Path) -> None:
 def test_start_preflight_tightens_state_and_log_files() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+        (root / ".env").write_text(
+            "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+            encoding="utf-8",
+        )
         config = make_config(root, log_file=root / "logs" / "stremio-now.log")
         state_dir = config.vpn_lockout_file.parent
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -86,3 +89,46 @@ def test_start_preflight_tightens_state_and_log_files() -> None:
             guard.preflight()
         assert _mode(state_dir / "daemon-id") == 0o600
         assert _mode(old_log) == 0o600
+
+
+def _stremio_guard(root: Path, env: str) -> GluetunGuard:
+    (root / ".env").write_text(env, encoding="utf-8")
+    return GluetunGuard(make_config(root), FakeRunner({}))
+
+
+def test_stremio_without_credentials_is_refused(tmp_path: Path) -> None:
+    import pytest
+
+    for env in (
+        "STREMIO_ENABLED=1\n",
+        "STREMIO_ENABLED=1\nSTREMIO_USERNAME=me\n",
+        "STREMIO_ENABLED=1\nSTREMIO_USERNAME=me\nSTREMIO_PASSWORD=short\n",
+        "STREMIO_USERNAME=me\nSTREMIO_PASSWORD=long-enough-pass\n".replace("me\n", "\n", 1),
+        "",  # Stremio is on by default
+    ):
+        with pytest.raises(RuntimeError, match="STREMIO_PASSWORD"):
+            _stremio_guard(tmp_path, env).check_stremio_auth()
+
+
+def test_stremio_with_credentials_disabled_or_opted_out_passes(tmp_path: Path) -> None:
+    for env in (
+        "STREMIO_USERNAME=me\nSTREMIO_PASSWORD=long-enough-pass\n",
+        "STREMIO_ENABLED=0\n",
+        "STREMIO_ALLOW_NO_AUTH=1\n",
+    ):
+        guard = _stremio_guard(tmp_path, env)
+        with mock.patch.object(guard, "warn") as warn:
+            guard.check_stremio_auth()
+        assert warn.called == ("ALLOW" in env)
+
+
+def test_stremio_must_publish_the_port_where_auth_applies(tmp_path: Path) -> None:
+    import pytest
+
+    creds = "STREMIO_USERNAME=me\nSTREMIO_PASSWORD=long-enough-pass\n"
+    with pytest.raises(RuntimeError, match="publishes a port without auth"):
+        _stremio_guard(tmp_path, creds + "STREMIO_CONTAINER_PORT=11470\n").check_stremio_auth()
+    _stremio_guard(tmp_path, creds + "STREMIO_CONTAINER_PORT=8080\n").check_stremio_auth()
+    guard = _stremio_guard(tmp_path, "STREMIO_ALLOW_NO_AUTH=1\nSTREMIO_CONTAINER_PORT=11470\n")
+    with mock.patch.object(guard, "warn"):
+        guard.check_stremio_auth()

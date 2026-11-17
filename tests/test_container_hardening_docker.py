@@ -947,7 +947,7 @@ def test_ac11_minimality_removing_each_hardening_item_fails(tmp_path: Path) -> N
     for missing in ("CHOWN", "SETGID", "SETUID", "/tmp", "/var/cache/nginx"):
         name = f"{PREFIX}ac11-gw-{missing.strip('/').replace('/', '_')}-{suffix}"
         caps = [c for c in gw_base["cap_add"] if c != missing]
-        tmpfs = [t for t in gw_base["tmpfs"] if t != missing]
+        tmpfs = [t for t in gw_base["tmpfs"] if t.split(":", 1)[0] != missing]
         cmd = [
             "run",
             "-d",

@@ -14,6 +14,7 @@ import urllib.parse
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -114,7 +115,7 @@ def sources(
     patched = root / "patched" / "comet"
     shutil.copytree(upstream, patched)
     for spec in SPECS:
-        if spec.name in {"logger", "api_app", "response_guard"}:
+        if spec.name in {"logger", "api_app", "response_guard", "stream_guard", "playback"}:
             target = patched / spec.container_path.removeprefix("/app/comet/")
             rendered = spec.render(upstream.parent, CONTEXT)
             assert rendered is not None
@@ -122,6 +123,7 @@ def sources(
     # Upstream's app.py imports nothing of ours; give both trees the guard module
     # so only the patched files differ.
     shutil.copy(patched / "stremioguard_response_guard.py", upstream)
+    shutil.copy(patched / "stremioguard_stream_guard.py", upstream)
     yield image, upstream, patched
 
 
@@ -214,3 +216,147 @@ def test_patched_comet_never_allows_credentialed_cross_origin_reads(
         assert allow_origin == "*"
         if is_addon == "True":
             assert status == "200"  # addon clients keep uncredentialed access
+
+
+STDLIB_LOG_PROBE = """
+import logging, os, time
+import comet.core.logger as comet_logger
+key = os.environ["TORBOX_API_KEY"]
+logging.getLogger("mediaflow_proxy.handlers").error(
+    "Upstream service error: url='https://cdn.example/dl/%s/v.mkv?token=%s'", key, key)
+try:
+    raise RuntimeError("failed for " + key)
+except RuntimeError:
+    logging.getLogger("aiohttp.client").exception("library traceback")
+comet_logger.logger.complete()
+time.sleep(0.5)
+"""
+
+
+def test_library_logging_goes_through_the_scrubber(sources: tuple[str, Path, Path]) -> None:
+    image, upstream, patched = sources
+    upstream_out = _run(image, upstream, STDLIB_LOG_PROBE)
+    assert CANARIES["TORBOX_API_KEY"] in upstream_out, "positive control: upstream must leak"
+    patched_out = _run(image, patched, STDLIB_LOG_PROBE)
+    assert _leaks(patched_out) == []
+    assert "mediaflow_proxy.handlers: Upstream service error: url='https://cdn.example'" in (
+        patched_out
+    )
+    assert "aiohttp.client: library traceback" in patched_out
+
+
+STREAM_PROBE = r"""
+import asyncio, json, threading, http.server
+from starlette.requests import Request
+import mediaflow_proxy.handlers as handlers
+import mediaflow_proxy.utils.http_utils as http_utils
+import comet.api.endpoints.playback  # installs the guard when patched
+
+class Internal(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/hop":
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:%d/internal" % internal_port)
+            self.end_headers()
+            return
+        body = b'{"internal": "namespace-only data"}'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+
+internal = http.server.HTTPServer(("127.0.0.1", 0), Internal)
+internal_port = internal.server_address[1]
+hop = http.server.HTTPServer(("127.0.0.2", 0), Internal)
+for server in (internal, hop):
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+scope = {
+    "type": "http", "method": "GET", "path": "/playback/x",
+    "query_string": b"h_authorization=Bearer+SMUGGLED&r_set-cookie=admin%3Dpwn"
+    b"&x_headers=content-type",
+    "headers": [(b"range", b"bytes=0-")],
+}
+request = Request(scope)
+playback_headers = (
+    comet.api.endpoints.playback._sg_safe_proxy_headers(request)
+    if hasattr(comet.api.endpoints.playback, "_sg_safe_proxy_headers")
+    else http_utils.get_proxy_headers(request)
+)
+print("HEADERS", json.dumps({
+    "request": playback_headers.request, "response": playback_headers.response,
+    "remove": playback_headers.remove, "propagate": playback_headers.propagate}))
+
+patched = hasattr(comet.api.endpoints.playback, "_sg_safe_proxy_headers")
+if patched:
+    import comet.stremioguard_stream_guard as guard
+    print("PUBLIC", json.dumps({a: guard.is_public_address(a) for a in [
+        "8.8.8.8", "127.0.0.1", "10.1.2.3", "172.18.0.2", "192.168.1.5", "169.254.169.254",
+        "100.64.0.1", "0.0.0.0", "::1", "fe80::1", "fd00::1", "::ffff:127.0.0.1",
+        "2002:7f00:1::", "224.0.0.1", "2606:4700:4700::1111", "not-an-ip"]}))
+else:
+    print("PUBLIC {}")
+
+async def fetch(url):
+    response = await handlers.handle_stream_request("GET", url, playback_headers)
+    body = b""
+    if hasattr(response, "body_iterator"):
+        async for chunk in response.body_iterator:
+            body += chunk if isinstance(chunk, bytes) else chunk.encode()
+        if response.background:
+            await response.background()
+    else:
+        body = response.body
+    return response.status_code, body.decode(errors="replace")
+
+internal_url = "http://127.0.0.1:%d/internal" % internal_port
+print("DIRECT", json.dumps(asyncio.run(fetch(internal_url))))
+print("NAMED", json.dumps(asyncio.run(fetch("http://localhost:%d/internal" % internal_port))))
+# A first hop the guard is told to trust, redirecting into the namespace:
+if patched:
+    guard.is_public_address = lambda address: address == "127.0.0.2"
+print("REDIRECT", json.dumps(asyncio.run(fetch("http://127.0.0.2:%d/hop" % hop.server_address[1]))))
+"""
+
+
+def _stream_results(image: str, comet_dir: Path) -> dict[str, Any]:
+    import json
+
+    out = _run(image, comet_dir, STREAM_PROBE)
+    rows = {}
+    for line in out.splitlines():
+        tag, _, payload = line.partition(" ")
+        if tag in {"HEADERS", "PUBLIC", "DIRECT", "NAMED", "REDIRECT"}:
+            rows[tag] = json.loads(payload)
+    assert set(rows) == {"HEADERS", "PUBLIC", "DIRECT", "NAMED", "REDIRECT"}, out[-3000:]
+    return rows
+
+
+def test_stream_proxy_hardening(sources: tuple[str, Path, Path]) -> None:
+    image, upstream, patched = sources
+    # The guard module exists in both trees; only the patched playback imports
+    # it (the probe imports it only when patched), so the upstream run is the
+    # unhardened library.
+    before = _stream_results(image, upstream)
+    assert before["HEADERS"]["response"] == {"set-cookie": "admin=pwn"}, "positive control"
+    assert before["HEADERS"]["request"]["authorization"] == "Bearer SMUGGLED"
+    assert "namespace-only data" in before["DIRECT"][1], "positive control"
+    assert "namespace-only data" in before["REDIRECT"][1], "positive control: redirect followed"
+
+    after = _stream_results(image, patched)
+    headers = after["HEADERS"]
+    assert headers["request"] == {
+        "range": "bytes=0-",
+        "user-agent": headers["request"]["user-agent"],
+    }
+    assert headers["response"] == {} and headers["remove"] == [] and headers["propagate"] == {}
+    public = after["PUBLIC"]
+    assert public.pop("8.8.8.8") is True and public.pop("2606:4700:4700::1111") is True
+    assert not any(public.values()), public
+    for tag in ("DIRECT", "NAMED", "REDIRECT"):
+        status, body = after[tag]
+        assert status >= 400, (tag, status, body)
+        assert "namespace-only data" not in body, tag
+        assert "127.0.0.1" not in body and "localhost" not in body, (tag, body)

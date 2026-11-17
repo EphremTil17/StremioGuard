@@ -420,7 +420,8 @@ def test_ac7_dns_block_identity_caching_orchestrator_and_preflight(tmp_path: Pat
     # (f) preflight(defer_vpn_recovery=True) and preflight(defer_vpn_recovery=False)
     pre_cfg = make_config(tmp_path / "preflight")
     (pre_cfg.root_dir / ".env").write_text(
-        "VPN_SERVICE_PROVIDER=nordvpn\nSTREMIO_ENABLED=1\nCOMET_ENABLED=0\n",
+        "VPN_SERVICE_PROVIDER=nordvpn\nSTREMIO_ENABLED=1\nCOMET_ENABLED=0\n"
+        "STREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
         encoding="utf-8",
     )
     pre_guard = GluetunGuard(pre_cfg, FakeRunner({}))

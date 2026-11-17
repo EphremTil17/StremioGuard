@@ -319,6 +319,8 @@ MINIMAL_BUNDLE_OUTPUTS = {
     "media_search.py": "/app/comet/services/media_search.py",
     "config.py": "/app/comet/api/endpoints/config.py",
     "index.html": "/app/comet/templates/index.html",
+    "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
+    "playback.py": "/app/comet/api/endpoints/playback.py",
 }
 
 
@@ -482,6 +484,8 @@ REQUIRED_PATCH_OUTPUTS = {
     "stremioguard_response_guard.py": "/app/comet/stremioguard_response_guard.py",
     "logger.py": "/app/comet/core/logger.py",
     "stream.py": "/app/comet/api/endpoints/stream.py",
+    "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
+    "playback.py": "/app/comet/api/endpoints/playback.py",
 }
 
 
@@ -497,7 +501,29 @@ def write_comet_logger(repo_root: Path, source: str = COMET_LOGGER_SOURCE) -> No
     logger_file.write_text(source, encoding="utf-8")
 
 
+# The upstream shape of comet/api/endpoints/playback.py where the playback override patches.
+COMET_PLAYBACK_SOURCE = """\
+import mediaflow_proxy.utils.http_utils
+from fastapi import Request
+
+
+async def playback(request: Request, download_url: str):
+    return await custom_handle_stream_request(
+            request.method,
+            download_url,
+            mediaflow_proxy.utils.http_utils.get_proxy_headers(request),
+    )
+"""
+
+
+def write_comet_playback(repo_root: Path, source: str = COMET_PLAYBACK_SOURCE) -> None:
+    target = repo_root / "comet" / "api" / "endpoints" / "playback.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+
+
 def write_required_comet_sources(repo_root: Path) -> None:
     """Upstream files every required override patches."""
     write_comet_api_app(repo_root)
     write_comet_logger(repo_root)
+    write_comet_playback(repo_root)

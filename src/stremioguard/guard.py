@@ -42,8 +42,10 @@ from stremioguard.config import (
     service_container_id,
 )
 from stremioguard.env import (
+    DEFAULT_STREMIO_CONTAINER_PORT,
     atomic_write_text,
     env_file_value,
+    env_flag_enabled,
     read_regular_file,
     tighten_private_files,
 )
@@ -102,6 +104,7 @@ DNS_BLOCK_RULE = "-A OUTPUT -d 127.0.0.11/32 -j REJECT --reject-with icmp-port-u
 # `docker compose ps --status` values. Start and health checks want running
 # containers; stop paths must also stop, or wait out, any container that
 # still holds a process or will come back: paused, restarting, removing.
+STREMIO_MIN_PASSWORD_LENGTH = 12
 RUNNING_STATES = ("running",)
 ACTIVE_STATES = ("running", "restarting", "paused", "removing")
 
@@ -1001,6 +1004,44 @@ class GluetunGuard:
             )
             self._warned_stale_home_ip = True
 
+    def check_stremio_auth(self) -> None:
+        """Refuse an unauthenticated Stremio server unless the owner opted in.
+
+        The image's nginx puts basic auth on every server route except raw
+        stream URLs, but only when it is given credentials; without them the
+        settings, proxy, subtitle and torrent-creation routes are open to
+        anyone who can reach the port, and they make requests from inside the
+        VPN namespace. Security hardening: require credentials by default.
+        """
+        env = self._env_path
+        if not env_flag_enabled("STREMIO_ENABLED", True, env_path=env):
+            return
+        if env_flag_enabled("STREMIO_ALLOW_NO_AUTH", False, env_path=env):
+            self.warn(
+                "STREMIO_ALLOW_NO_AUTH=1: the Stremio server accepts unauthenticated requests "
+                "on every route. Set STREMIO_USERNAME and STREMIO_PASSWORD to require auth."
+            )
+            return
+        container_port = env_file_value(env, "STREMIO_CONTAINER_PORT") or str(
+            DEFAULT_STREMIO_CONTAINER_PORT
+        )
+        if container_port.strip() != str(DEFAULT_STREMIO_CONTAINER_PORT):
+            raise RuntimeError(
+                f"STREMIO_CONTAINER_PORT={container_port.strip()} publishes a port without "
+                f"auth; only {DEFAULT_STREMIO_CONTAINER_PORT} (the image's nginx) enforces "
+                "STREMIO_USERNAME and STREMIO_PASSWORD. Remove the setting, or set "
+                "STREMIO_ALLOW_NO_AUTH=1 to accept an open server."
+            )
+        username = env_file_value(env, "STREMIO_USERNAME") or ""
+        password = env_file_value(env, "STREMIO_PASSWORD") or ""
+        if not username or len(password) < STREMIO_MIN_PASSWORD_LENGTH:
+            raise RuntimeError(
+                "The Stremio server needs credentials: set STREMIO_USERNAME and a "
+                f"STREMIO_PASSWORD of at least {STREMIO_MIN_PASSWORD_LENGTH} characters in .env "
+                "(every server route except raw stream URLs then requires them), set "
+                "STREMIO_ENABLED=0, or set STREMIO_ALLOW_NO_AUTH=1 to accept an open server."
+            )
+
     def check_bind_addresses(self) -> None:
         if os.environ.get("SKIP_BIND_PREFLIGHT") == "1":
             self.log("SKIP_BIND_PREFLIGHT=1 is set; skipping bind address validation.")
@@ -1106,6 +1147,7 @@ class GluetunGuard:
             )
         self.check_vpn_lockout(allow_recovery=allow_recovery)
         self.check_bind_addresses()
+        self.check_stremio_auth()
         private_dirs = [self.config.vpn_lockout_file.parent]
         if self.config.log_file is not None:
             private_dirs.append(self.config.log_file.parent)

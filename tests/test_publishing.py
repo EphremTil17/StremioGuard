@@ -580,7 +580,7 @@ def test_publishing_from_the_snapshot_rewrites_only_the_override(tmp_path: Path)
     before = {path: path.read_bytes() for path in published}
     override = tmp_path / ".stremio" / "docker-compose.bindings.yml"
     deployed_override = override.read_text(encoding="utf-8")
-    assert '"127.0.0.1:11470:11470"' in deployed_override
+    assert '"127.0.0.1:11470:8080"' in deployed_override
 
     (tmp_path / ".env").write_text(
         "COMET_ENABLED=0\nSTREMIO_BIND_ADDRS=0.0.0.0\nTZ=Europe/Berlin\n", encoding="utf-8"
@@ -595,6 +595,6 @@ def test_publishing_from_the_snapshot_rewrites_only_the_override(tmp_path: Path)
 
     # A deploy picks all of it up.
     StackPublisher(tmp_path).publish()
-    assert '"0.0.0.0:11470:11470"' in override.read_text(encoding="utf-8")
+    assert '"0.0.0.0:11470:8080"' in override.read_text(encoding="utf-8")
     assert "Europe/Berlin" in (tmp_path / PUBLISHED_ENV_FILE).read_text(encoding="utf-8")
     assert "changed" in (tmp_path / PUBLISHED_COMPOSE_FILE).read_text(encoding="utf-8")

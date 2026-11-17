@@ -85,7 +85,10 @@ def scrubber_source() -> str:
     """The scrubber's code, as inserted into Comet's logger (docstring dropped)."""
     text = (Path(__file__).parent / "comet_log_scrubber.py").read_text(encoding="utf-8")
     body = text.split('"""', 2)[2].lstrip("\n")
-    return f"\n# StremioGuard: secret scrubbing for every log sink.\n{body}\n"
+    return (
+        f"\n# StremioGuard: secret scrubbing for every log sink.\n{body}\n"
+        "_sg_route_stdlib_logging()\n"
+    )
 
 
 def render_logger_override(repo_dir: Path) -> str:

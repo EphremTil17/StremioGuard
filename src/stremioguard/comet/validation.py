@@ -27,6 +27,8 @@ IMPORT_SMOKE_TIMEOUT_SECONDS = 60
 _REQUIRED_GUARD_CONTAINER_PATHS = (
     "/app/comet/api/app.py",
     "/app/comet/stremioguard_response_guard.py",
+    "/app/comet/api/endpoints/playback.py",
+    "/app/comet/stremioguard_stream_guard.py",
 )
 # Comet's single gunicorn worker runs its anime-mapping refresh synchronously
 # at startup and won't answer ANY request, including /health, until it's

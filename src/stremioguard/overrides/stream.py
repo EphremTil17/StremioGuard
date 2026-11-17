@@ -28,12 +28,22 @@ def _forwarded_external_base(request) -> str:
     forwarded_prefix = (
         (request.headers.get("x-forwarded-prefix") or "").split(",", 1)[0].strip().rstrip("/")
     )
-    if forwarded_proto in ("http", "https") and forwarded_host:
+    # Security hardening: only a plain host[:port] and a plain path prefix are
+    # trusted; anything else falls back to the request's own URL.
+    import re
+
+    host_ok = re.fullmatch(
+        r"(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?",
+        forwarded_host,
+    )
+    if forwarded_proto in ("http", "https") and forwarded_host and host_ok:
         prefix = (
             forwarded_prefix
             if not forwarded_prefix or forwarded_prefix.startswith("/")
             else f"/{forwarded_prefix}"
         )
+        if prefix and not re.fullmatch(r"(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._~-]+)+", prefix):
+            prefix = ""
         return f"{forwarded_proto}://{forwarded_host}{prefix}"
     return f"{request.url.scheme}://{request.url.netloc}"
 

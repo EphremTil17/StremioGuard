@@ -1,11 +1,22 @@
-"""Pure-ASGI response guard that strips P2P streams and blocks torznab.
+"""Pure-ASGI response guard that strips P2P streams, blocks torznab and paces logins.
 
 Runs inside the Comet container with standard-library imports only.
+
+Security hardening for edge cases:
+
+- An entry counts as P2P when it has an infoHash, a magnet URL, or a
+  non-empty `sources` list (trackers): P2P fields are stripped, and an entry
+  with no HTTP URL left is dropped. Top-level `sources` lists (another addon
+  format) are filtered the same way as `streams`.
+- Password attempts on `/configure/login` and `/admin/login` share one
+  in-process budget (6 a minute, 5 at once; excess gets 429), so guessing is
+  paced on every path to Comet, the host's own loopback port included.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Awaitable, Callable, MutableMapping, Sequence
 from typing import Any
 from urllib.parse import unquote
@@ -15,6 +26,33 @@ _BAD_GATEWAY_BODY = b'{"detail":"Bad Gateway"}'
 _STRIP_KEYS = frozenset({"infohash", "fileidx", "sources", "announce"})
 _UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_WHITESPACE = frozenset(b" \t\n\r")
+_LIST_KEYS = ("streams", "sources")
+_LOGIN_PATHS = frozenset({"/configure/login", "/admin/login"})
+_LOGIN_RATE_PER_SECOND = 6 / 60
+_LOGIN_BURST = 5.0
+_TOO_MANY_LOGINS_BODY = b'{"detail":"Too many login attempts; wait a minute and try again."}'
+
+
+class _LoginBudget:
+    """A token bucket shared by every login attempt in this process."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._tokens = _LOGIN_BURST
+        self._updated = clock()
+
+    def allow(self) -> bool:
+        now = self._clock()
+        elapsed = max(0.0, now - self._updated)
+        self._updated = now
+        self._tokens = min(_LOGIN_BURST, self._tokens + elapsed * _LOGIN_RATE_PER_SECOND)
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return True
+        return False
+
+
+_LOGIN_BUDGET = _LoginBudget()
 
 
 def _is_torznab_path(path: str) -> bool:
@@ -63,6 +101,7 @@ def _filter_stream_entry(entry: Any) -> tuple[bool, Any, bool]:
         return True, entry, False
 
     has_infohash = False
+    has_p2p_sources = False
     has_http_url = False
     has_strip_key = False
 
@@ -84,10 +123,12 @@ def _filter_stream_entry(entry: Any) -> tuple[bool, Any, bool]:
             has_http_url = True
         if lowered == "infohash":
             has_infohash = True
+        if lowered == "sources" and value:
+            has_p2p_sources = True
         if lowered in _STRIP_KEYS:
             has_strip_key = True
 
-    if not has_infohash:
+    if not (has_infohash or has_p2p_sources):
         return True, entry, False
     if not has_http_url:
         return False, None, True
@@ -103,23 +144,26 @@ def _filter_stream_entry(entry: Any) -> tuple[bool, Any, bool]:
 
 
 def _filter_payload(payload: Any) -> tuple[Any, bool]:
-    if not isinstance(payload, dict) or not isinstance(payload.get("streams"), list):
-        return payload, False
-
-    changed = False
-    filtered_streams: list[Any] = []
-    for item in payload["streams"]:
-        keep, transformed, item_changed = _filter_stream_entry(item)
-        if item_changed:
-            changed = True
-        if keep:
-            filtered_streams.append(transformed)
-
-    if not changed:
+    if not isinstance(payload, dict):
         return payload, False
 
     updated = dict(payload)
-    updated["streams"] = filtered_streams
+    changed = False
+    for list_key in _LIST_KEYS:
+        items = payload.get(list_key)
+        if not isinstance(items, list):
+            continue
+        filtered: list[Any] = []
+        for item in items:
+            keep, transformed, item_changed = _filter_stream_entry(item)
+            if item_changed:
+                changed = True
+            if keep:
+                filtered.append(transformed)
+        updated[list_key] = filtered
+
+    if not changed:
+        return payload, False
     return updated, True
 
 
@@ -168,6 +212,14 @@ class StremioGuardResponseGuard:
 
         if _is_torznab_path(str(scope.get("path") or "")):
             await _send_json_response(send, 404, _NOT_FOUND_BODY)
+            return
+
+        if (
+            str(scope.get("method") or "").upper() == "POST"
+            and str(scope.get("path") or "").rstrip("/") in _LOGIN_PATHS
+            and not _LOGIN_BUDGET.allow()
+        ):
+            await _send_json_response(send, 429, _TOO_MANY_LOGINS_BODY)
             return
 
         inner_scope = dict(scope)

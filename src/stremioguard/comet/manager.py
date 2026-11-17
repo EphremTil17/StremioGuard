@@ -374,6 +374,12 @@ class CometManager:
         gateway_config = self.gateway_config()
         public_base_url = "" if gateway_config.enabled else self.config.public_base_url or ""
         api_key = self.config.default_debrid_apikey or ""
+        if self.config.proxy_debrid_stream and self.config.proxy_max_connections < 0:
+            self.warn(
+                "COMET_PROXY_MAX_CONNECTIONS is unlimited (-1): every stream proxied through "
+                "Comet holds a connection and memory with no ceiling. Set it to a finite "
+                "number in .env, such as 10, and run ./stremio start."
+            )
         entries = (
             ("DATABASE_TYPE", "postgresql"),
             ("DATABASE_URL", build_postgres_database_url(self._resolve_postgres_password())),

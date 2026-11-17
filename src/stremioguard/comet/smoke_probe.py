@@ -243,6 +243,18 @@ def verify_response_guard() -> list[str]:
     return findings
 
 
+def verify_stream_guard() -> list[str]:
+    """The playback endpoint is patched and the stream proxy hardening is installed."""
+    findings: list[str] = []
+    playback = importlib.import_module("comet.api.endpoints.playback")
+    guard = importlib.import_module("comet.stremioguard_stream_guard")
+    if getattr(playback, "_sg_safe_proxy_headers", None) is not guard.safe_proxy_headers:
+        findings.append("playback does not build proxy headers through the stream guard")
+    if not guard.installed():
+        findings.append("stream guard is not installed in the proxy library")
+    return findings
+
+
 def run_probe(module_names: list[str]) -> dict[str, Any]:
     findings: list[str] = []
     imported: list[types.ModuleType] = []
@@ -268,6 +280,11 @@ def run_probe(module_names: list[str]) -> dict[str, Any]:
             findings.extend(verify_response_guard())
         except Exception as error:
             findings.append(f"guard probe failed: {type(error).__name__}: {error}")
+    if not findings:
+        try:
+            findings.extend(verify_stream_guard())
+        except Exception as error:
+            findings.append(f"stream guard probe failed: {type(error).__name__}: {error}")
 
     return {"ok": not findings, "findings": findings}
 

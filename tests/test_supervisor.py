@@ -328,3 +328,21 @@ def test_no_snapshot_means_no_generation_key(sandbox_deployment_paths: Path) -> 
     supervisor.write_watchdog_env({"WATCH_INTERVAL_SECONDS": "10"})
     content = supervisor.watchdog_env_file().read_text(encoding="utf-8")
     assert supervisor.CONFIG_GENERATION_KEY not in content
+
+
+def test_units_carry_the_proven_hardening() -> None:
+    from stremioguard.cli import supervisor
+
+    for render in (
+        supervisor.render_watchdog_unit,
+        supervisor.render_failsafe_unit,
+        supervisor.render_boot_unit,
+    ):
+        unit = render()
+        for line in supervisor.UNIT_HARDENING.splitlines():
+            assert line in unit.splitlines(), (render.__name__, line)
+        # Mount-namespace sandboxing cuts the Docker CLI off from the rootless socket.
+        for absent in ("PrivateTmp=", "ProtectSystem=", "ProtectHome=", "SystemCallFilter="):
+            assert absent not in unit, (render.__name__, absent)
+    assert "UMask=0077" in supervisor.render_watchdog_unit()
+    assert "UMask=0077" in supervisor.render_failsafe_unit()

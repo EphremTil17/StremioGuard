@@ -104,6 +104,11 @@ def _fake_comet_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     parsing = types.ModuleType("comet.utils.parsing")
     parsing.associate_urls_credentials = lambda urls, passwords: []  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "comet.utils.parsing", parsing)
+    # The rendered logger routes the standard library's root logger into loguru;
+    # keep that out of the test process.
+    import logging
+
+    monkeypatch.setattr(logging.getLogger(), "handlers", list(logging.getLogger().handlers))
 
 
 def _render(tmp_path: Path, source: str) -> str:

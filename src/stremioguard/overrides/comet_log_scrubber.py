@@ -3,6 +3,9 @@
 Every loguru sink Comet configures writes through `_sg_scrubbed_sink`, which
 masks the value of each configured secret wherever it appears in the final
 text (message, exception text, traceback), whatever logging call produced it.
+Python's standard logging, which libraries such as the stream proxy use, is
+routed into loguru by `_sg_route_stdlib_logging`, with every URL cut to its
+scheme and host first, so no library output reaches stderr around the sinks.
 Scraper error lines use `_sg_scraper_origin` and `_sg_describe_error`, which
 never print a bare API key and cut every URL to its scheme and host.
 
@@ -11,10 +14,14 @@ self-contained (standard library only, no `from __future__` import), and it
 is read, not imported, when the bundle is rendered.
 """
 
+import logging as _sg_logging
 import os as _sg_os
 import re as _sg_re
 import sys as _sg_sys
+import traceback as _sg_traceback
 import urllib.parse as _sg_parse
+
+from loguru import logger as _sg_loguru
 
 _SG_MASK = "********"
 _SG_SECRET_SUFFIXES = frozenset(
@@ -135,3 +142,35 @@ def _sg_describe_error(error):
         text = ""
     text = _SG_URL.sub(_sg_origin_only, text)
     return f"{label}: {text}" if text else label
+
+
+_SG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
+class _SGStdlibToLoguru(_sg_logging.Handler):
+    """Standard-library log records, through Comet's scrubbed loguru sinks.
+
+    Without a handler, a library's warning goes to stderr through
+    `logging.lastResort`, around every sink. URLs are cut to scheme and host
+    because library messages carry whole upstream URLs (signed links, configs).
+    """
+
+    def emit(self, record):
+        try:
+            text = record.getMessage()
+            if record.exc_info:
+                text += "\n" + "".join(_sg_traceback.format_exception(*record.exc_info))
+            text = _SG_URL.sub(_sg_origin_only, f"{record.name}: {text}")
+            level = record.levelname if record.levelname in _SG_LEVELS else "WARNING"
+            _sg_loguru.log(level, text)
+        except Exception:
+            try:  # noqa: SIM105 - no contextlib import in Comet's logger module
+                _sg_sys.stderr.write(_SG_WITHHELD)
+            except Exception:
+                pass
+
+
+def _sg_route_stdlib_logging():
+    root = _sg_logging.getLogger()
+    if not any(isinstance(handler, _SGStdlibToLoguru) for handler in root.handlers):
+        root.addHandler(_SGStdlibToLoguru())

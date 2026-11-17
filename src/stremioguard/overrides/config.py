@@ -4,21 +4,20 @@ from pathlib import Path
 
 from stremioguard.overrides._patching import replace_first_matching
 
-
-def render_config_override(repo_dir: Path) -> str:
-    config_file = repo_dir / "comet" / "api" / "endpoints" / "config.py"
-    if not config_file.exists():
-        raise RuntimeError(f"Comet config endpoint file not found at {config_file}.")
-    content = config_file.read_text(encoding="utf-8")
-
-    marker = "def _next_url(request: Request):\n"
-    if "_forwarded_prefix(" not in content:
-        helper = """
+_PREFIX_HELPERS = r"""
 def _forwarded_prefix(request: Request) -> str:
+    # Security hardening: only a plain path prefix (the gateway sends
+    # `/comet/<token>`). Anything else, such as `//host`, a scheme, a
+    # backslash or an encoded character, is ignored rather than trusted.
+    import re
+
     prefix = request.headers.get("x-forwarded-prefix", "").split(",", 1)[0].strip().rstrip("/")
     if not prefix:
         return ""
-    return prefix if prefix.startswith("/") else f"/{prefix}"
+    prefix = prefix if prefix.startswith("/") else f"/{prefix}"
+    if not re.fullmatch(r"(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._~-]+)+", prefix):
+        return ""
+    return prefix
 
 
 def _prefixed_path(request: Request, path: str) -> str:
@@ -44,6 +43,17 @@ def _is_secure_request(request: Request) -> bool:
 
 
 """
+
+
+def render_config_override(repo_dir: Path) -> str:
+    config_file = repo_dir / "comet" / "api" / "endpoints" / "config.py"
+    if not config_file.exists():
+        raise RuntimeError(f"Comet config endpoint file not found at {config_file}.")
+    content = config_file.read_text(encoding="utf-8")
+
+    marker = "def _next_url(request: Request):\n"
+    if "_forwarded_prefix(" not in content:
+        helper = _PREFIX_HELPERS
         if marker not in content:
             raise RuntimeError(
                 "Unable to apply managed Comet config-prefix patch; upstream "

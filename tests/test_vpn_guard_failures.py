@@ -942,7 +942,10 @@ def test_ac11_unwritable_state_dir_and_cli_failsafe_gating(
     # (a) .stremio/ mode 0500 -> stop runs, fail_safe() raises, _run_command exits non-zero
     state_dir = tmp_path / ".stremio"
     state_dir.mkdir(exist_ok=True)
-    (tmp_path / ".env").write_text("STREMIO_ENABLED=1\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "STREMIO_ENABLED=1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+        encoding="utf-8",
+    )
     (state_dir / "docker-compose.bindings.yml").touch()
     (state_dir / "daemon-id").write_text("daemon-a\n", encoding="utf-8")
     prefix = compose_args_prefix(tmp_path)
@@ -1135,7 +1138,10 @@ def test_ac12_atomic_write_text_fsyncs_parent_directory(tmp_path: Path) -> None:
 
 def test_ac13_start_and_restart_without_safe_stops_services_and_confirms(tmp_path: Path) -> None:
     """AC-13 (INV-9): start/reset on preflight=False stops all protected services and confirms."""
-    (tmp_path / ".env").write_text("STREMIO_ENABLED=1\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "STREMIO_ENABLED=1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+        encoding="utf-8",
+    )
     prefix = compose_args_prefix(tmp_path)
     ps_stremio_all = (*prefix, "ps", "-a", "-q", "stremio")
     cfg_services = (*prefix, "config", "--services")
@@ -1398,7 +1404,10 @@ def test_ac15_running_watchdog_stops_and_exits_78_on_new_marker(tmp_path: Path) 
 
 def test_ac16_failsafe_still_attempts_stop_when_daemon_check_fails(tmp_path: Path) -> None:
     """AC-16 (INV-11): unreadable daemon-id or daemon mismatch still attempts compose stop."""
-    (tmp_path / ".env").write_text("STREMIO_ENABLED=1\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "STREMIO_ENABLED=1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+        encoding="utf-8",
+    )
     prefix = compose_args_prefix(tmp_path)
     cfg_cmd = (*prefix, "config", "--services")
     ps_running = (*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio")

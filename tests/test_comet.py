@@ -472,6 +472,20 @@ class CometManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "missing 'tested_digest'"):
                 comet_mod.CometLock.load(cfg.lock_file)
 
+    def test_unlimited_proxy_connections_warn_and_a_limit_does_not(self) -> None:
+        for limit, proxied, warned in ((-1, True, True), (10, True, False), (-1, False, False)):
+            with tempfile.TemporaryDirectory() as directory:
+                tmp_path = Path(directory)
+                (tmp_path / ".env").write_text("COMET_GATEWAY_ENABLED=0\n", encoding="utf-8")
+                cfg = make_comet_config(
+                    tmp_path, proxy_max_connections=limit, proxy_debrid_stream=proxied
+                )
+                manager = CometManager(cfg, FakeRunner({}))
+                with mock.patch.object(manager, "warn") as warn:
+                    manager.render_runtime_env()
+                messages = " ".join(str(call.args[0]) for call in warn.call_args_list)
+                self.assertEqual("COMET_PROXY_MAX_CONNECTIONS is unlimited" in messages, warned)
+
     def test_render_runtime_env_uses_public_base_when_gateway_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)

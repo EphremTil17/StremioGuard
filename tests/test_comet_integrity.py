@@ -395,7 +395,9 @@ def test_ac6_stack_lock_refuses_concurrent_process_and_allows_nested_preflight(
     tmp_path: Path,
 ) -> None:
     """AC-6: child process stack.lock blocks all 7 Comet mutations; nested preflight succeeds."""
-    (tmp_path / ".env").write_text("COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=0\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=0\nSTREMIO_ENABLED=0\n", encoding="utf-8"
+    )
     cfg = make_comet_config(tmp_path, gateway_enabled=False, patch_episode_pack_results=False)
     CometState(
         active_digest=SHA_A,
@@ -1383,7 +1385,10 @@ def test_ac13_configure_page_password_preservation_and_warnings(tmp_path: Path) 
 def test_ac14_incomplete_generation_refused_by_frozen_guard_and_tick(tmp_path: Path) -> None:
     """AC-14: frozen guard refuses when env.snapshot or compose.base.yml is missing."""
     (tmp_path / "docker-compose.yml").write_text("services:\n  gluetun: {}\n", encoding="utf-8")
-    (tmp_path / ".env").write_text("STREMIO_BIND_ADDRS=127.0.0.1\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "STREMIO_BIND_ADDRS=127.0.0.1\nSTREMIO_USERNAME=sg\nSTREMIO_PASSWORD=sg-test-password\n",
+        encoding="utf-8",
+    )
     config = make_config(tmp_path)
 
     # Override exists, env.snapshot and compose.base.yml missing -> raises before runner call

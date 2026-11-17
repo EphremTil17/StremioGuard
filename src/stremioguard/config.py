@@ -711,7 +711,7 @@ class CometConfig:
             raise RuntimeError("COMET_GATEWAY_ENABLED requires COMET_ENABLED=1")
 
         proxy_debrid_stream = env_flag_enabled("COMET_PROXY_DEBRID_STREAM", True, env_path=env_file)
-        proxy_max_connections = env_int_value(env_file, "COMET_PROXY_MAX_CONNECTIONS", -1)
+        proxy_max_connections = env_int_value(env_file, "COMET_PROXY_MAX_CONNECTIONS", 10)
         healthcheck_interval_seconds = env_int_value(
             env_file, "COMET_HEALTHCHECK_INTERVAL_SECONDS", 300, minimum=1
         )

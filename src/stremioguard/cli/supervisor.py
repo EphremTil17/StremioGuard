@@ -228,6 +228,19 @@ def _python() -> str:
     return sys.executable
 
 
+# Security hardening that works in a user manager and was proven against what
+# these units run (Docker over the rootless socket, writes in the checkout,
+# outbound HTTPS). Sandboxing that needs a mount namespace (PrivateTmp,
+# ProtectSystem) cut the Docker CLI off from the rootless socket, and a syscall
+# filter that ever missed would crash the watchdog, so neither is used.
+UNIT_HARDENING = """NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+"""
+
+
 def render_watchdog_unit() -> str:
     return (
         _MANAGED_HEADER
@@ -254,7 +267,8 @@ RestartMaxDelaySec={RESTART_MAX_DELAY_SEC}
 RestartPreventExitStatus=78
 TimeoutStartSec=120
 WatchdogSec={WATCHDOG_SEC}
-"""
+UMask=0077
+{UNIT_HARDENING}"""
     )
 
 
@@ -275,7 +289,8 @@ ExecStart={_exec_arg(_python())} -m stremioguard.orchestrator failsafe
 TimeoutStartSec={FAILSAFE_TIMEOUT_START_SEC}
 Restart=on-failure
 RestartSec=30
-"""
+UMask=0077
+{UNIT_HARDENING}"""
     )
 
 
@@ -302,7 +317,7 @@ TimeoutStartSec=1800
 Restart=on-failure
 RestartSec=60
 RestartPreventExitStatus=78
-
+{UNIT_HARDENING}
 [Install]
 WantedBy=default.target
 """

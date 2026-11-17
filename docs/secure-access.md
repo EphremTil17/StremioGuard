@@ -46,6 +46,13 @@ Trust boundary: every device on the LAN can hit `:11470`. A compromised IoT
 device on the same `192.168.x.0/24` reaches Stremio. That's what binding on
 the LAN NIC means; if you don't accept it, Tier 1 isn't for you.
 
+Every tier requires `STREMIO_USERNAME` and a `STREMIO_PASSWORD` of at least
+12 characters in `.env`: the host port maps to the image's nginx (container
+port 8080), which then asks for them on every server route except raw stream
+URLs. Give Stremio the server URL with them, as
+`http://USER:PASSWORD@<host-LAN-IP>:11470`. `STREMIO_ALLOW_NO_AUTH=1` accepts
+an open server instead, with a warning on every start.
+
 ## Tier 2 — Tier 1 + reverse-proxied domain (tailnet-only)
 
 Tier 1 plus a friendly hostname. The domain resolves publicly but routes only
@@ -130,9 +137,10 @@ STREMIO_BIND_ADDRS=<host-LAN-IP>
 EXTERNAL_BASE_URL=https://<your-domain>
 ```
 
-Stremio's streaming server has no built-in auth. Whatever your proxy applies
-(Authentik / Authelia via OIDC, basic auth, mTLS, IP allowlist, WAF rules) is
-the only gate on the public side. Note: OIDC and CORS do not work for native
+Stremio's streaming server has no built-in auth; StremioGuard requires the
+image's basic auth (`STREMIO_USERNAME` / `STREMIO_PASSWORD`) on every server
+route except raw stream URLs. Whatever your proxy adds (Authentik / Authelia
+via OIDC, mTLS, IP allowlist, WAF rules) is a further gate on the public side. Note: OIDC and CORS do not work for native
 mobile Stremio — they assume a browser. Design accordingly.
 
 ## Switching tiers
@@ -156,9 +164,9 @@ After bringing the stack up (`./stremio restart`):
 
 2. **LAN-direct reachability** (any tier):
    ```bash
-   curl -v http://<host-LAN-IP>:11470/stats.json
+   curl -v -u USER:PASSWORD http://<host-LAN-IP>:11470/stats.json
    ```
-   200 with a JSON body. Run from a LAN device, not from this host's
+   200 with a JSON body (401 without the credentials). Run from a LAN device, not from this host's
    loopback.
 
 3. **Tier 2 / 3 — domain reachability**:

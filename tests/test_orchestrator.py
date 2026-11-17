@@ -1876,14 +1876,39 @@ def test_restart_moves_the_auth_scan_cursor_past_the_restart(tmp_path: Path) -> 
     # and its restart must not be read by the next check and counted as a
     # second, post-restart sighting.
     guard, orch = _leak_orchestrator(tmp_path)
-    orch.last_auth_check_wall = 1000.0
+    orch.last_auth_check_mono = 1000.0
     with (
         mock.patch.object(guard, "restart_gluetun", return_value=True),
-        mock.patch.object(orchestrator_mod.time, "time", return_value=1042.0),
+        mock.patch.object(orchestrator_mod.time, "monotonic", return_value=1042.0),
     ):
         orch._restart_gluetun(relaxed=False)
     assert orch.restart_generation == 1
-    assert orch.last_auth_check_wall == 1042.0
+    assert orch.last_auth_check_mono == 1042.0
+
+
+def test_auth_scan_survives_a_backward_clock_step(tmp_path: Path) -> None:
+    """The scan's `--since` follows elapsed time, not the wall clock at the last scan."""
+    guard, orch = _leak_orchestrator(tmp_path)
+    orch.outage_started_at = 500.0
+    orch.last_watch_tick_at = 590.0
+    orch.last_auth_check_mono = 590.0  # last scan: 10 s of monotonic time ago
+    seen: list[float | None] = []
+
+    def evidence(*, lines: int, since_epoch: float | None) -> None:
+        seen.append(since_epoch)
+
+    # Wall clock stepped back an hour since that scan; monotonic moved 10 s.
+    with (
+        mock.patch.object(guard, "gluetun_healthy", return_value=False),
+        mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
+        mock.patch.object(guard, "gluetun_auth_evidence", side_effect=evidence),
+        mock.patch.object(orchestrator_mod.time, "monotonic", return_value=600.0),
+        mock.patch.object(orchestrator_mod.time, "time", return_value=1_700_000_000.0),
+        mock.patch.object(orch, "_restart_gluetun", return_value=False),
+        mock.patch.object(orch, "_maybe_log_summary"),
+    ):
+        orch.watch_once()
+    assert seen == [1_700_000_000.0 - 10.0]
 
 
 def test_failed_restart_does_not_increment_generation_or_trip_false_auth_lockout(

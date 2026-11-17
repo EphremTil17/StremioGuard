@@ -16,6 +16,7 @@ from stremioguard.overrides.formatter import render_formatter_override
 from stremioguard.overrides.logger import render_logger_override
 from stremioguard.overrides.media_search import render_media_search_override
 from stremioguard.overrides.orchestration import render_orchestration_override
+from stremioguard.overrides.playback import render_playback_override
 from stremioguard.overrides.stream import render_stream_override
 from stremioguard.overrides.template import render_configure_template_override
 from stremioguard.overrides.torrentio import render_torrentio_override
@@ -69,6 +70,24 @@ SPECS = [
         render=lambda repo_dir, ctx: (
             Path(__file__).with_name("response_guard.py").read_text(encoding="utf-8")
         ),
+    ),
+    OverrideSpec(
+        name="stream_guard",
+        feature="stream proxy hardening: request-only headers, public upstreams, quiet errors",
+        container_path="/app/comet/stremioguard_stream_guard.py",
+        output_name="stremioguard_stream_guard.py",
+        requirement=Requirement.REQUIRED,
+        render=lambda repo_dir, ctx: (
+            Path(__file__).with_name("stream_guard.py").read_text(encoding="utf-8")
+        ),
+    ),
+    OverrideSpec(
+        name="playback",
+        feature="stream proxy hardening at the playback endpoint",
+        container_path="/app/comet/api/endpoints/playback.py",
+        output_name="playback.py",
+        requirement=Requirement.REQUIRED,
+        render=lambda repo_dir, ctx: render_playback_override(repo_dir),
     ),
     OverrideSpec(
         name="logger",

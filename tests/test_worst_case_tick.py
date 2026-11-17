@@ -402,21 +402,21 @@ def _run_tick_case(
         orch.outage_start_wall = clock.time() - 150.0
         orch.unhealthy_elapsed_seconds = 140.0
         orch.last_watch_tick_at = clock.monotonic() - 10.0
-        orch.last_auth_check_wall = clock.time() - 10.0
+        orch.last_auth_check_mono = clock.monotonic() - 10.0
         orch.last_restart_at = clock.monotonic() - 100.0
     elif path_name == "recovery_tick":
         orch.outage_started_at = clock.monotonic() - 100.0
         orch.outage_start_wall = clock.time() - 100.0
         orch.unhealthy_elapsed_seconds = 90.0
         orch.last_watch_tick_at = clock.monotonic() - 10.0
-        orch.last_auth_check_wall = clock.time() - 10.0
+        orch.last_auth_check_mono = clock.monotonic() - 10.0
         orch.last_restart_at = clock.monotonic() - 45.0
     elif path_name == "trip_tick":
         orch.outage_started_at = clock.monotonic() - 310.0
         orch.outage_start_wall = clock.time() - 310.0
         orch.unhealthy_elapsed_seconds = 290.0
         orch.last_watch_tick_at = clock.monotonic() - 10.0
-        orch.last_auth_check_wall = clock.time() - 10.0
+        orch.last_auth_check_mono = clock.monotonic() - 10.0
         orch.last_restart_at = clock.monotonic() - 20.0
     elif path_name == "second_leak_verdict":
         orch.leak_verdict_times.append(clock.monotonic() - 60.0)
