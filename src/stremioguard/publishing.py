@@ -19,9 +19,11 @@ from stremioguard.config import (
     GLUETUN_ENV_FILE,
     PUBLISHED_COMPOSE_FILE,
     PUBLISHED_ENV_FILE,
+    PUBLISHED_GENERATION_FILE,
     TUNABLE_KEYS,
     CometConfig,
     parse_bind_addresses,
+    render_generation_manifest,
 )
 from stremioguard.env import (
     DEFAULT_STREMIO_CONTAINER_PORT,
@@ -391,6 +393,14 @@ class StackPublisher:
                     mode=0o600,
                 )
         atomic_write_text(self.compose_override_file, content, mode=0o600)
+        # Last: the hashes of the generation just written. Until this lands, a
+        # publish cut short leaves files that do not match the previous
+        # manifest, and the watchdog refuses to start containers from them.
+        atomic_write_text(
+            self.root_dir / PUBLISHED_GENERATION_FILE,
+            render_generation_manifest(self.root_dir),
+            mode=0o600,
+        )
 
     def _require_valid_manifest(
         self, bundle_dir: Path, *, active_digest: str, gateway_enabled: bool

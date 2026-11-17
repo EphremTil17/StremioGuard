@@ -833,3 +833,29 @@ class Ac10PatchHelpersTests(unittest.TestCase):
                     gateway_enabled=False,
                 )
             self.assertFalse(manifest_path.exists())
+
+
+class CredentialFreeCorsTests(unittest.TestCase):
+    """Comet must never let a cross-site page read a response with the owner's cookies."""
+
+    def test_render_switches_credentials_off_and_keeps_every_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_required_comet_sources(root)
+            rendered = render_api_app_override(root)
+            write_comet_api_app(root, rendered)
+            self.assertEqual(render_api_app_override(root), rendered)
+        self.assertIn("    allow_credentials=False,\n", rendered)
+        self.assertNotIn("allow_credentials=True", rendered)
+        self.assertIn('    allow_origins=["*"],\n', rendered)
+
+    def test_changed_cors_setup_fails_loudly(self) -> None:
+        for changed in (
+            COMET_API_APP_SOURCE.replace('allow_origins=["*"]', "allow_origins=ORIGINS"),
+            COMET_API_APP_SOURCE.replace("    allow_credentials=True,\n", ""),
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_comet_api_app(root, changed)
+                with self.assertRaisesRegex(RuntimeError, "credentialed CORS"):
+                    render_api_app_override(root)

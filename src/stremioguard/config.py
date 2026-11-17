@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import os
 import re
 import subprocess
@@ -19,6 +21,7 @@ from stremioguard.env import (
     env_file_value,
     env_flag_enabled,
     env_int_value,
+    read_regular_file,
 )
 
 # Marks compose invocations as coming from this CLI. The `use-stremio-start-
@@ -35,6 +38,18 @@ GLUETUN_ENV_FILE = ".stremio/gluetun.env"
 # the next deliberate start (see publishing.StackPublisher).
 PUBLISHED_COMPOSE_FILE = ".stremio/compose.base.yml"
 PUBLISHED_ENV_FILE = ".stremio/env.snapshot"
+# Written last by every publish: the hash of each generation file, so a
+# publish cut short (a crash, a full disk) is detected instead of starting
+# containers from a mix of two generations.
+PUBLISHED_GENERATION_FILE = ".stremio/published-generation.json"
+GENERATION_FILES = (
+    GLUETUN_ENV_FILE,
+    PUBLISHED_ENV_FILE,
+    PUBLISHED_COMPOSE_FILE,
+    GENERATED_COMPOSE_FILE,
+)
+GENERATION_MANIFEST_VERSION = 1
+_GENERATION_READ_LIMIT = 4 * 1024 * 1024
 # Bound on a Docker query (ps, inspect, exec). A wedged daemon must surface as
 # a failed check, not as a watchdog that blocks until systemd kills it.
 DOCKER_QUERY_TIMEOUT_SECONDS = 30
@@ -140,6 +155,60 @@ def parse_public_ip(text: str) -> str | None:
     if isinstance(ip, ipaddress.IPv6Address) and ip.is_site_local:
         return None
     return str(ip)
+
+
+def render_generation_manifest(root_dir: Path) -> str:
+    """The manifest for the generation files as they are now on disk."""
+    files: dict[str, str] = {}
+    for name in GENERATION_FILES:
+        data = read_regular_file(root_dir / name, max_bytes=_GENERATION_READ_LIMIT)
+        if data is not None:
+            files[name] = hashlib.sha256(data).hexdigest()
+    payload = {"version": GENERATION_MANIFEST_VERSION, "files": files}
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def generation_problem(root_dir: Path) -> str | None:
+    """Why the published files are not one complete generation, or None.
+
+    Every generation file on disk must be listed in the manifest with its
+    current hash, and every listed file must exist. A missing, unreadable or
+    malformed manifest is a problem too: nothing proves the files belong
+    together. Generations published before the manifest existed fail here
+    until the next `./stremio start` publishes one.
+    """
+    manifest = root_dir / PUBLISHED_GENERATION_FILE
+    raw = read_regular_file(manifest, max_bytes=_GENERATION_READ_LIMIT)
+    if raw is None:
+        if not manifest.exists() and not manifest.is_symlink():
+            return f"{PUBLISHED_GENERATION_FILE} is missing"
+        return f"{PUBLISHED_GENERATION_FILE} is not a readable regular file"
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return f"{PUBLISHED_GENERATION_FILE} is malformed"
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != GENERATION_MANIFEST_VERSION
+        or not isinstance(files, dict)
+        or not set(files) <= set(GENERATION_FILES)
+        or not all(isinstance(value, str) for value in files.values())
+    ):
+        return f"{PUBLISHED_GENERATION_FILE} is malformed"
+    for name in GENERATION_FILES:
+        path = root_dir / name
+        listed = files.get(name)
+        data = read_regular_file(path, max_bytes=_GENERATION_READ_LIMIT)
+        if data is None:
+            if listed is not None or path.exists() or path.is_symlink():
+                return f"{name} is missing or unreadable"
+            continue
+        if listed is None:
+            return f"{name} is not part of the published generation"
+        if hashlib.sha256(data).hexdigest() != listed:
+            return f"{name} does not match the published generation"
+    return None
 
 
 def missing_published_files(root_dir: Path) -> list[Path]:

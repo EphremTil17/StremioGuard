@@ -6,6 +6,14 @@ from pathlib import Path
 
 from stremioguard.overrides._patching import replace_first_matching
 
+_UPSTREAM_CORS = '    CORSMiddleware,\n    allow_origins=["*"],\n    allow_credentials=True,\n'
+_PATCHED_CORS = (
+    "    CORSMiddleware,\n"
+    '    allow_origins=["*"],\n'
+    "    # StremioGuard: no credentialed cross-site reads; addon clients send none.\n"
+    "    allow_credentials=False,\n"
+)
+
 _GUARD_INSTALL_SNIPPET = (
     "# StremioGuard: enforce P2P stripping and torznab blocking at the response boundary.\n"
     "from comet.stremioguard_response_guard import (\n"
@@ -22,6 +30,13 @@ def render_api_app_override(repo_dir: Path) -> str:
     reduces a request to its route template with token parameters abstracted,
     preserving endpoint observability while hardening API key management. Also
     installs `StremioGuardResponseGuard` as the outermost user middleware.
+
+    Upstream's CORS middleware allows every origin *with* credentials, so any
+    page the browser counts as same-site (another subdomain of the same
+    domain, another port on the same loopback host) could read the
+    configure page or the admin API with the owner's session cookie. Addon
+    clients never send credentials, so credentials are switched off and every
+    origin keeps uncredentialed access.
     """
     source_file = repo_dir / "comet" / "api" / "app.py"
     if not source_file.exists():
@@ -51,6 +66,11 @@ def render_api_app_override(repo_dir: Path) -> str:
             "Unable to apply API route template override for API key management hardening; "
             "Comet's request log line has changed."
         ),
+    )
+    patched = replace_first_matching(
+        patched,
+        ((_UPSTREAM_CORS, _PATCHED_CORS),),
+        error=("Unable to switch off credentialed CORS; Comet's CORSMiddleware setup has changed."),
     )
     if _GUARD_INSTALL_SNIPPET not in patched:
         if patched and not patched.endswith("\n"):

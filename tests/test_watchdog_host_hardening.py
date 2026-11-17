@@ -37,6 +37,7 @@ from stremioguard.guard import PROBE_REQUEST_HEADERS, GluetunGuard, PublicIPAsse
 from stremioguard.orchestrator import Orchestrator
 from stremioguard.stacklock import stack_lock
 from tests.conftest import (
+    ACTIVE_STATUS_ARGS,
     PUBLIC_IPV4_ALT,
     PUBLIC_IPV4_EGRESS,
     PUBLIC_IPV4_HOST,
@@ -1542,7 +1543,7 @@ def test_ac13_teardown_tolerates_logging_and_lock_failures_while_start_refuses_e
                     ("docker", "ps", "--format", "{{.ID}}"): completed([]),
                     ("docker", "info", "--format", "{{.ID}}"): completed([], "daemon-a\n"),
                     (*p, "config", "--services"): completed([], "stremio\n"),
-                    (*p, "ps", "--status", "running", "--services", "stremio"): [
+                    (*p, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"): [
                         completed([], "stremio\n"),
                         completed([], ""),
                     ],
@@ -1594,7 +1595,7 @@ def test_ac13_teardown_tolerates_logging_and_lock_failures_while_start_refuses_e
             ("docker", "ps", "--format", "{{.ID}}"): completed([]),
             ("docker", "info", "--format", "{{.ID}}"): completed([], "daemon-a\n"),
             (*prefix_f, "config", "--services"): completed([], "stremio\n"),
-            (*prefix_f, "ps", "--status", "running", "--services", "stremio"): completed(
+            (*prefix_f, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"): completed(
                 [], "stremio\n"
             ),
             tuple(stop_f): completed(stop_f, returncode=1),
@@ -1800,7 +1801,7 @@ def test_ac20_stop_always_attempts_stop_even_when_require_commands_fails(
             ("docker", "ps", "--format", "{{.ID}}"): completed([]),
             ("docker", "info", "--format", "{{.ID}}"): completed([], "daemon-a\n"),
             (*prefix_a, "config", "--services"): completed([], "stremio\n"),
-            (*prefix_a, "ps", "--status", "running", "--services", "stremio"): [
+            (*prefix_a, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"): [
                 completed([], "stremio\n"),
                 completed([], ""),
             ],
@@ -1841,7 +1842,7 @@ def test_ac20_stop_always_attempts_stop_even_when_require_commands_fails(
             ("docker", "ps", "--format", "{{.ID}}"): completed([]),
             ("docker", "info", "--format", "{{.ID}}"): completed([], "daemon-new\n"),
             (*prefix_b, "config", "--services"): completed([], "stremio\n"),
-            (*prefix_b, "ps", "--status", "running", "--services", "stremio"): [
+            (*prefix_b, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"): [
                 completed([], "stremio\n"),
                 completed([], ""),
             ],
@@ -1869,7 +1870,7 @@ def test_ac20_stop_always_attempts_stop_even_when_require_commands_fails(
             ("docker", "ps", "--format", "{{.ID}}"): completed([]),
             ("docker", "info", "--format", "{{.ID}}"): completed([], "daemon-new\n"),
             (*prefix_b, "config", "--services"): completed([], "stremio\n"),
-            (*prefix_b, "ps", "--status", "running", "--services", "stremio"): [
+            (*prefix_b, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"): [
                 completed([], "stremio\n"),
                 completed([], ""),
             ],

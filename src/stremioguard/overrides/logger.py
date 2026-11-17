@@ -1,4 +1,4 @@
-"""Stop Comet's startup log from printing half of every secret."""
+"""Keep every configured secret out of Comet's logs."""
 
 from __future__ import annotations
 
@@ -54,14 +54,56 @@ def censor_url(url: str):
 """
 
 
+_IMPORT_ANCHOR = "from comet.utils.parsing import associate_urls_credentials\n"
+
+_SINK_EDITS = (
+    (
+        '                "sink": sys.stderr,\n',
+        '                "sink": _sg_scrubbed_sink(sys.stderr),\n',
+    ),
+    (
+        "logger.add(\n    loguru_handler.write,\n",
+        "logger.add(\n    _sg_scrubbed_sink(loguru_handler.write),\n",
+    ),
+)
+
+_SCRAPER_EDITS = (
+    (
+        'with {scraper_name} ({censor_url(scraper_url)})"',
+        'with {scraper_name}{_sg_scraper_origin(scraper_url)}"',
+    ),
+    (
+        "with {scraper_name} ({censor_url(scraper_url)}), you are most likely being "
+        'ratelimited{api_password_missing}: {error}"',
+        "with {scraper_name}{_sg_scraper_origin(scraper_url)}, you are most likely being "
+        'ratelimited{api_password_missing}: {_sg_describe_error(error)}"',
+    ),
+)
+
+
+def scrubber_source() -> str:
+    """The scrubber's code, as inserted into Comet's logger (docstring dropped)."""
+    text = (Path(__file__).parent / "comet_log_scrubber.py").read_text(encoding="utf-8")
+    body = text.split('"""', 2)[2].lstrip("\n")
+    return f"\n# StremioGuard: secret scrubbing for every log sink.\n{body}\n"
+
+
 def render_logger_override(repo_dir: Path) -> str:
-    """Make `censor`, `censor_url` and the API-token preview reveal nothing.
+    """Keep every configured secret out of Comet's log output.
 
     Upstream's `censor` keeps the first half of its input, so the startup log
     carried half of the debrid API key (TorBox scraper), the admin and
     configure-page passwords and database credentials; the protected API
     prefix showed ten characters of the public API token; and `censor_url`
-    only masked URLs carrying a `://` scheme.
+    only masked URLs carrying a `://` scheme. Its scraper error line also
+    passes TorBox's bare API key (and Debridio's provider key) as the "URL",
+    and prints the raw exception, whose URL can embed a whole config.
+
+    So besides those masks, every loguru sink Comet configures (the stderr
+    handler behind `docker logs`, and the capture behind `/admin/api/logs`)
+    writes through a scrubber that masks the value of every credential
+    setting wherever it appears, and scraper errors show only the scraper's
+    scheme and host, and the exception with every URL cut to scheme and host.
     """
     source_file = repo_dir / "comet" / "core" / "logger.py"
     if not source_file.exists():
@@ -83,7 +125,7 @@ def render_logger_override(repo_dir: Path) -> str:
         ((_UPSTREAM_CENSOR_URL, _PATCHED_CENSOR_URL),),
         error=error,
     )
-    return replace_first_matching(
+    content = replace_first_matching(
         content,
         (
             (
@@ -93,3 +135,11 @@ def render_logger_override(repo_dir: Path) -> str:
         ),
         error=error,
     )
+    content = replace_first_matching(
+        content,
+        ((_IMPORT_ANCHOR, _IMPORT_ANCHOR + scrubber_source()),),
+        error=error,
+    )
+    for edit in (*_SINK_EDITS, *_SCRAPER_EDITS):
+        content = replace_first_matching(content, (edit,), error=error)
+    return content

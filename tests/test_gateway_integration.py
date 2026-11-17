@@ -967,3 +967,48 @@ def test_ac9_nginx_logs_never_leak_tokens_api_token_or_config_blob(
 
     # Error log (`crit`) must have no request lines (no `request: "` entries).
     assert 'request: "' not in stderr
+
+
+def test_ac11_every_response_hides_the_version_and_carries_security_headers(
+    gateway_harness: GatewayHarness,
+) -> None:
+    """Every class of response: no nginx version anywhere, one copy of each header."""
+    api = TEST_API_TOKEN
+    cases = [
+        ("proxied addon route", f"/comet/{TOKEN_A}/s/{api}/manifest.json", "127.0.0.1:8090", 8090),
+        ("public page", "/configure", "127.0.0.1:8090", 8090),
+        ("token redirect", f"/comet/{TOKEN_A}/", "127.0.0.1:8090", 8090),
+        ("invalid token", "/comet/NotAT0ken/s/x/manifest.json", "127.0.0.1:8090", 8090),
+        ("forbidden route", f"/comet/{TOKEN_A}/admin", "127.0.0.1:8090", 8090),
+        ("unknown path", "/admin", "127.0.0.1:8090", 8090),
+        ("invalid host", "/configure", "bad host!", 8090),
+        ("liveness", "/__sg_alive", "127.0.0.1:8099", 8099),
+        ("liveness 404", "/nope", "127.0.0.1:8099", 8099),
+    ]
+    time.sleep(1.0)
+    seen: dict[str, int] = {}
+    for name, target, host, port in cases:
+        res = gateway_harness.exec_nginx(
+            f"curl -sS -i --path-as-is -H {_sh_quote('Host: ' + host)} "
+            f"http://127.0.0.1:{port}{target}"
+        )
+        assert res.returncode == 0, (name, res.stderr)
+        head, _, body = res.stdout.replace("\r\n", "\n").partition("\n\n")
+        status = int(head.split()[1])
+        seen[name] = status
+        headers = [line.split(":", 1) for line in head.splitlines()[1:] if ":" in line]
+        values: dict[str, list[str]] = {}
+        for key, value in headers:
+            values.setdefault(key.strip().lower(), []).append(value.strip())
+        assert values.get("server") == ["nginx"], (name, values.get("server"))
+        assert "nginx/" not in body, name
+        assert values.get("x-content-type-options") == ["nosniff"], name
+        assert values.get("x-frame-options") == ["DENY"], name
+        assert values.get("referrer-policy") == ["same-origin"], name
+        time.sleep(0.4)
+    # The cases really did cover every response class.
+    assert seen["proxied addon route"] == 200
+    assert seen["token redirect"] == 302
+    assert {seen["invalid token"], seen["forbidden route"], seen["unknown path"]} == {403}
+    assert seen["invalid host"] == 400
+    assert seen["liveness"] == 204 and seen["liveness 404"] == 404

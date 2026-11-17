@@ -25,6 +25,7 @@ from .conftest import (
     make_comet_config,
     make_comet_gateway_config,
     make_config,
+    seal_generation,
     write_minimal_bundle_manifest,
 )
 
@@ -1467,6 +1468,7 @@ def test_gluetun_identity_change_restarts_a_stale_service(tmp_path: Path) -> Non
     config = make_config(tmp_path)
     (tmp_path / PUBLISHED_COMPOSE_FILE).touch()
     (tmp_path / PUBLISHED_ENV_FILE).touch()
+    seal_generation(tmp_path)
     runner = FakeRunner(
         {
             **compose_stack_responses(

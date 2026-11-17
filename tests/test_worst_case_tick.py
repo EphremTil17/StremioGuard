@@ -32,7 +32,13 @@ from stremioguard.orchestrator import (
     Orchestrator,
 )
 from stremioguard.stacklock import stack_lock_path
-from tests.conftest import PUBLIC_IPV4_EGRESS, PUBLIC_IPV4_HOST, PUBLIC_IPV4_STATION, completed
+from tests.conftest import (
+    PUBLIC_IPV4_EGRESS,
+    PUBLIC_IPV4_HOST,
+    PUBLIC_IPV4_STATION,
+    completed,
+    seal_generation,
+)
 
 ALL_PATHS = (
     "steady_state_all_ip_stalling",
@@ -104,6 +110,7 @@ def _make_prod_like_config(root: Path, *, public_ip_timeout_seconds: int = 5) ->
     (state_dir / "docker-compose.bindings.yml").touch()
     (state_dir / "compose.base.yml").write_text("services:\n  gluetun: {}\n", encoding="utf-8")
     (state_dir / "env.snapshot").touch()
+    seal_generation(state_dir.parent)
     (root / "docker-compose.yml").write_text("services:\n  gluetun: {}\n", encoding="utf-8")
     (root / ".env").write_text(
         "VPN_SERVICE_PROVIDER=nordvpn\n"

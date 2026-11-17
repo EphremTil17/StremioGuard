@@ -31,6 +31,7 @@ from stremioguard.config import (
 from stremioguard.guard import GluetunGuard, LockoutActiveError, PublicIPAssessment
 from stremioguard.orchestrator import Orchestrator
 from tests.conftest import (
+    ACTIVE_STATUS_ARGS,
     PUBLIC_IPV4_EGRESS,
     PUBLIC_IPV4_HOST,
     PUBLIC_IPV6_EGRESS,
@@ -235,7 +236,7 @@ def test_ac4_hour_long_probe_timeout_outage_does_not_lock_out_and_recovers(
     prefix = compose_args_prefix(tmp_path)
     ps_gluetun = (*prefix, "ps", "-q", "gluetun")
     ps_stremio = (*prefix, "ps", "-q", "stremio")
-    status_stremio = (*prefix, "ps", "--status", "running", "--services", "stremio")
+    status_stremio = (*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio")
     stop_stremio = (*prefix, "stop", "stremio")
     up_stremio = (*prefix, "up", "-d", "--no-deps", "--build", "stremio")
     exec_probe = [
@@ -616,7 +617,7 @@ def test_ac8_unknown_running_state_stops_all_and_never_auto_starts(tmp_path: Pat
     """AC-8 (INV-6): compose ps timeout/error stops all on stop, never starts on watch."""
     cfg = make_config(tmp_path, max_auto_starts_per_hour=3)
     prefix = compose_args_prefix(tmp_path)
-    status_cmd = [*prefix, "ps", "--status", "running", "--services", "stremio"]
+    status_cmd = [*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"]
     stop_cmd = [*prefix, "stop", "stremio"]
     ps_q_cmd = [*prefix, "ps", "-q", "stremio"]
     docker_stop_cmd = ["docker", "stop", "-t", "5", "stremio-cid"]
@@ -678,6 +679,7 @@ def test_ac8_unknown_running_state_stops_all_and_never_auto_starts(tmp_path: Pat
     # (b) Watchdog in steady state, SAFE, compose ps timing out then non-zero for 20 ticks
     ps_mode = {"mode": "timeout"}  # "timeout" | "fail" | "empty"
     up_cmd = [*prefix, "up", "-d", "--no-deps", "--build", "stremio"]
+    running_cmd = [*prefix, "ps", "--status", "running", "--services", "stremio"]
 
     class _WatchRunner(FakeRunner):
         def run(
@@ -694,7 +696,8 @@ def test_ac8_unknown_running_state_stops_all_and_never_auto_starts(tmp_path: Pat
             self.envs.append(env)
             self.timeouts.append(timeout)
             self.inputs.append(input)
-            if args == status_cmd:
+            # Health checks ask for running containers, stop paths for any active one.
+            if args in (status_cmd, running_cmd):
                 if ps_mode["mode"] == "timeout":
                     raise subprocess.TimeoutExpired(args, timeout or 30)
                 if ps_mode["mode"] == "fail":
@@ -912,7 +915,7 @@ def test_ac10_bounded_teardown_and_failsafe_unit_timeout(
             ("docker", "ps", "--format", "{{.ID}}"): completed([]),
             ("docker", "info", "--format", "{{.ID}}"): completed([], "daemon-a\n"),
             (*prefix, "config", "--services"): completed([], "stremio\n"),
-            (*prefix, "ps", "--status", "running", "--services", "stremio"): [
+            (*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"): [
                 completed([], "stremio\n"),
                 completed([], ""),
             ],
@@ -949,7 +952,7 @@ def test_ac11_unwritable_state_dir_and_cli_failsafe_gating(
             ("docker", "ps", "--format", "{{.ID}}"): completed([]),
             ("docker", "info", "--format", "{{.ID}}"): completed([], "daemon-a\n"),
             (*prefix, "config", "--services"): completed([], "stremio\n"),
-            (*prefix, "ps", "--status", "running", "--services", "stremio"): [
+            (*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"): [
                 completed([], "stremio\n"),
                 completed([], ""),
             ],
@@ -1136,7 +1139,7 @@ def test_ac13_start_and_restart_without_safe_stops_services_and_confirms(tmp_pat
     prefix = compose_args_prefix(tmp_path)
     ps_stremio_all = (*prefix, "ps", "-a", "-q", "stremio")
     cfg_services = (*prefix, "config", "--services")
-    ps_running = (*prefix, "ps", "--status", "running", "--services", "stremio")
+    ps_running = (*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio")
     stop_stremio = (*prefix, "stop", "stremio")
     down_cmd = (*prefix, "down", "--remove-orphans", "--timeout", "10")
 
@@ -1398,7 +1401,7 @@ def test_ac16_failsafe_still_attempts_stop_when_daemon_check_fails(tmp_path: Pat
     (tmp_path / ".env").write_text("STREMIO_ENABLED=1\n", encoding="utf-8")
     prefix = compose_args_prefix(tmp_path)
     cfg_cmd = (*prefix, "config", "--services")
-    ps_running = (*prefix, "ps", "--status", "running", "--services", "stremio")
+    ps_running = (*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio")
     stop_cmd = (*prefix, "stop", "stremio")
     daemon_record = tmp_path / ".stremio" / "daemon-id"
     daemon_record.parent.mkdir(parents=True, exist_ok=True)

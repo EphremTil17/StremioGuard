@@ -32,6 +32,7 @@ from stremioguard.config import (
 )
 from stremioguard.publishing import StackPublisher
 from tests.conftest import (
+    ACTIVE_STATUS_ARGS,
     PUBLIC_IPV4_STATION,
     FakeRunner,
     completed,
@@ -403,8 +404,8 @@ def test_ac8_teardown_and_failsafe_stop_services_despite_refused_dotenv(
             tuple([*prefix, "config", "--services"]): completed(
                 [*prefix, "config", "--services"], "gluetun\nstremio\n"
             ),
-            tuple([*prefix, "ps", "--status", "running", "--services", "stremio"]): completed(
-                [*prefix, "ps", "--status", "running", "--services", "stremio"],
+            tuple([*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"]): completed(
+                [*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"],
                 "stremio\n",
             ),
             tuple([*prefix, "ps", "-q", "gluetun"]): completed(
@@ -413,7 +414,7 @@ def test_ac8_teardown_and_failsafe_stop_services_despite_refused_dotenv(
             tuple([*prefix, "stop", "stremio"]): completed([*prefix, "stop", "stremio"]),
         }
         # Second status query after stop reports services stopped.
-        status_key = tuple([*prefix, "ps", "--status", "running", "--services", "stremio"])
+        status_key = tuple([*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"])
         runner = FakeRunner(
             {
                 **responses,

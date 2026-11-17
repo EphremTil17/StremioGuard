@@ -35,6 +35,7 @@ from stremioguard.config import (
     Runner,
     SubprocessRunner,
     compose_command,
+    generation_problem,
     missing_published_files,
     parse_bind_addresses,
     parse_public_ip,
@@ -91,6 +92,13 @@ AUTH_REJECTION_MARKERS = (
 )
 EVIDENCE_LINE_LIMIT = 300
 DNS_BLOCK_RULE = "-A OUTPUT -d 127.0.0.11/32 -j REJECT --reject-with icmp-port-unreachable"
+
+
+# `docker compose ps --status` values. Start and health checks want running
+# containers; stop paths must also stop, or wait out, any container that
+# still holds a process or will come back: paused, restarting, removing.
+RUNNING_STATES = ("running",)
+ACTIVE_STATES = ("running", "restarting", "paused", "removing")
 
 
 @dataclass(frozen=True)
@@ -240,6 +248,8 @@ class GluetunGuard:
         # every non-SAFE tick re-probes.
         self._verified_egress_ip: str | None = None
         self._verified_control_ip: str | None = None
+        # The gluetun container (ID, start time) the last SAFE probe ran in.
+        self._verified_egress_identity: tuple[str, str] | None = None
         self._last_egress_probe_time = 0.0
         self._warned_snapshot_pair: tuple[str, str] | None = None
         self._egress_warned_at: float | None = None
@@ -446,6 +456,16 @@ class GluetunGuard:
                 )
         else:
             self.write_compose_override()
+        # Stop paths never come here (they use `compose`), so a broken
+        # generation can block a start but never the fail-safe.
+        if not missing_published_files(self.config.root_dir):
+            problem = generation_problem(self.config.root_dir)
+            if problem:
+                raise RuntimeError(
+                    f"The published stack configuration is not one complete generation "
+                    f"({problem}); refusing to start services from it. "
+                    "Run `./stremio start` to publish it again."
+                )
         return self.compose(*args, check=check, capture=capture, env=env)
 
     def _compose_command(self, *args: str) -> list[str]:
@@ -815,18 +835,22 @@ class GluetunGuard:
         gluetun start and goes stale after an in-tunnel reconnect, so it is
         only a cheap change trigger and a diagnostic, never proof of anything.
 
-        A SAFE verification is trusted for `egress_probe_interval_seconds`;
-        egress verification latency is therefore bounded by that interval.
+        A SAFE verification is trusted for `egress_probe_interval_seconds`, and
+        only for the gluetun container it was probed in: a gluetun that was
+        restarted or recreated since (even with the same control-server IP) is
+        a new tunnel and is probed again before anything trusts it.
         """
         control_ip = self.public_ip_via_control_server()
         now = time.monotonic()
+        identity = self.last_gluetun_state.identity if self.last_gluetun_state is not None else None
         due = (
             force_probe
             or self._verified_egress_ip is None
+            or identity is None
+            or identity != self._verified_egress_identity
             or control_ip != self._verified_control_ip
             or now - self._last_egress_probe_time >= self.config.egress_probe_interval_seconds
         )
-        identity = self.last_gluetun_state.identity if self.last_gluetun_state is not None else None
         if due or identity is None or identity != self._verified_dns_block_identity:
             block_active = self.namespace_dns_block_active()
             if block_active is not True:
@@ -944,6 +968,7 @@ class GluetunGuard:
 
         self._verified_egress_ip = egress_ip
         self._verified_control_ip = control_ip
+        self._verified_egress_identity = identity
         self._last_egress_probe_time = now
         return PublicIPAssessment.SAFE
 
@@ -1136,15 +1161,23 @@ class GluetunGuard:
                 return True
         return False
 
-    def running_services(self, services: list[str]) -> set[str] | None:
-        """Which of ``services`` Docker reports running, in one query.
+    def running_services(
+        self, services: list[str], *, states: tuple[str, ...] = RUNNING_STATES
+    ) -> set[str] | None:
+        """Which of ``services`` Docker reports in one of ``states``, in one query.
 
-        None when Docker cannot answer: callers decide whether that counts
-        as running (stop paths) or not (start paths).
+        None when Docker cannot answer, or answers with anything other than
+        the requested service names, one per line (a warning on stdout, a
+        changed output format): an answer this parser did not fully
+        understand is never "none of them". Callers decide whether None
+        counts as running (stop paths) or not (start paths).
         """
+        if not services:
+            return set()
+        status_args = [arg for state in states for arg in ("--status", state)]
         try:
             result = self.runner.run(
-                self._compose_command("ps", "--status", "running", "--services", *services),
+                self._compose_command("ps", *status_args, "--services", *services),
                 check=False,
                 timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
             )
@@ -1152,7 +1185,15 @@ class GluetunGuard:
             return None
         if result.returncode != 0:
             return None
-        return set((result.stdout or "").split()) & set(services)
+        reported: set[str] = set()
+        for raw_line in (result.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line not in services:
+                return None
+            reported.add(line)
+        return reported
 
     def container_running(self, services: list[str] | None = None) -> bool | None:
         """Whether all ``services`` are running, or ``None`` if Docker did not answer."""
@@ -1192,11 +1233,13 @@ class GluetunGuard:
         return True
 
     def services_confirmed_stopped(self, services: list[str]) -> bool:
-        """Whether Docker positively reports none of ``services`` running.
+        """Whether Docker positively reports none of ``services`` active.
 
-        A failed query is not proof of a stopped container.
+        Active is running, restarting, paused or removing: a paused container
+        still holds its process and a restarting one comes back. A failed or
+        unreadable query is not proof of a stopped container.
         """
-        return self.running_services(services) == set()
+        return self.running_services(services, states=ACTIVE_STATES) == set()
 
     def protected_services(self) -> list[str]:
         """Every service in the Compose project except gluetun and the gate.
@@ -1252,7 +1295,7 @@ class GluetunGuard:
                         "stremthru",
                         "comet-postgres",
                     ]
-        running = self.running_services(services)
+        running = self.running_services(services, states=ACTIVE_STATES)
         if running == set():
             return True
         # Unknown state: stop everything named rather than guess.
@@ -1267,7 +1310,7 @@ class GluetunGuard:
         if compose_ok and self.services_confirmed_stopped(running_services):
             self.success("Active services are stopped.")
             return True
-        still_running = self.running_services(running_services)
+        still_running = self.running_services(running_services, states=ACTIVE_STATES)
         fallback_targets = (
             running_services
             if still_running is None

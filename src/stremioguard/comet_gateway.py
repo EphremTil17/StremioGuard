@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import urllib.parse
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -59,6 +60,14 @@ _COMET_IP_PROXY_HEADERS = (
     "CF-Pseudo-IPv4",
     "X-AIOStreams-User-IP",
 )
+
+
+# Token-lock depth per lock file, per thread (see `_token_lock`).
+_HELD_TOKEN_LOCKS = threading.local()
+
+
+def _copy_tokens(tokens: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+    return {token_id: dict(entry) for token_id, entry in tokens.items()}
 
 
 @dataclass(frozen=True)
@@ -178,8 +187,24 @@ class CometGatewayManager:
 
     @contextmanager
     def _token_lock(self) -> Iterator[None]:
+        """Serialize every read-modify-write of the token files.
+
+        Reentrant within a thread: a token command that holds the lock calls
+        `write_nginx_configs()`, which takes it too, and a second `flock` on a
+        new open file description would wait on itself forever. Other threads
+        and processes wait for the holder.
+        """
         ensure_directory(self.config.state_dir)
         lock_path = self.config.tokens_file.with_suffix(".lock")
+        key = str(lock_path.resolve())
+        held: dict[str, int] = _HELD_TOKEN_LOCKS.__dict__.setdefault("depth", {})
+        if held.get(key, 0):
+            held[key] += 1
+            try:
+                yield
+            finally:
+                held[key] -= 1
+            return
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         try:
             lock_file = os.fdopen(fd, "a+", encoding="utf-8")
@@ -188,10 +213,38 @@ class CometGatewayManager:
             raise
         with lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            held[key] = 1
             try:
                 yield
             finally:
+                held.pop(key, None)
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _commit_tokens(
+        self, before: dict[str, dict[str, object]], state: dict[str, object]
+    ) -> None:
+        """Save a token change so that no failure can leave an unlisted token admitted.
+
+        First the map admits only tokens present before *and* after the
+        change, so a revocation takes effect before tokens.json changes; then
+        tokens.json is saved; then the map admits the new state, so an added
+        token works only once it is listed. A failure at any step leaves every
+        token admitted-and-listed, denied-and-listed or gone, and a failed
+        revoke can simply be run again. Callers hold the token lock.
+        """
+        after = state["tokens"]
+        assert isinstance(after, dict)
+        kept = {
+            token_id: entry
+            for token_id, entry in after.items()
+            if isinstance(entry, dict)
+            and token_id in before
+            and before[token_id].get("token") == entry.get("token")
+        }
+        ensure_directory(self.config.state_dir)
+        atomic_write_text(self.config.tokens_map_file, self.render_tokens_map(kept), mode=0o600)
+        self.save_state(state)
+        self.write_nginx_configs()
 
     def _create_token_in_state(
         self,
@@ -241,11 +294,11 @@ class CometGatewayManager:
             tokens = state["tokens"]  # type: ignore[assignment]
             assert isinstance(tokens, dict)
             self._validated_tokens(tokens)  # type: ignore[arg-type]
+            before = _copy_tokens(tokens)
             token_id, token_value = self._create_token_in_state(
                 state, label, make_default=make_default
             )
-            self.save_state(state)
-            self.write_nginx_configs()
+            self._commit_tokens(before, state)
             return token_id, token_value
 
     def revoke_token(self, token_id: str) -> str:
@@ -259,11 +312,11 @@ class CometGatewayManager:
             entry = tokens[token_id]
             assert isinstance(entry, dict)
             label = str(entry.get("label", ""))
+            before = _copy_tokens(tokens)
             del tokens[token_id]
             if state.get("default") == token_id:
                 state["default"] = self._oldest_token_id(tokens)  # type: ignore[arg-type]
-            self.save_state(state)
-            self.write_nginx_configs()
+            self._commit_tokens(before, state)
             return label
 
     def rotate_token(self, token_id: str) -> tuple[str, str]:
@@ -278,13 +331,13 @@ class CometGatewayManager:
             assert isinstance(entry, dict)
             label = str(entry.get("label", ""))
             was_default = state.get("default") == token_id
+            before = _copy_tokens(tokens)
             del tokens[token_id]
             state["default"] = (
                 self._oldest_token_id(tokens) if was_default else state.get("default")
             )
             new_id, new_value = self._create_token_in_state(state, label, make_default=was_default)
-            self.save_state(state)
-            self.write_nginx_configs()
+            self._commit_tokens(before, state)
             return new_id, new_value
 
     def use_token(self, token_id: str) -> str:
@@ -295,9 +348,9 @@ class CometGatewayManager:
             self._validated_tokens(tokens)  # type: ignore[arg-type]
             if token_id not in tokens:
                 raise KeyError(f"Token ID {token_id!r} not found")
+            before = _copy_tokens(tokens)
             state["default"] = token_id
-            self.save_state(state)
-            self.write_nginx_configs()
+            self._commit_tokens(before, state)
             entry = tokens[token_id]
             assert isinstance(entry, dict)
             return str(entry.get("label", ""))
@@ -356,8 +409,8 @@ class CometGatewayManager:
 
     # ── Nginx config generation ────────────────────────────────────
 
-    def render_tokens_map(self) -> str:
-        validated = self._validated_tokens(self.load_tokens())
+    def render_tokens_map(self, tokens: dict[str, dict[str, object]] | None = None) -> str:
+        validated = self._validated_tokens(self.load_tokens() if tokens is None else tokens)
         lines = [
             "# Generated by ./stremio; do not edit by hand.",
             "map $gateway_token $token_valid {",
@@ -471,6 +524,19 @@ http {{
                     'tid=$gateway_token_id '
                     'upstream=$upstream_status urt=$upstream_response_time rt=$request_time';
     access_log /var/log/nginx/access.log main;
+
+    # No nginx version in the Server header or in error pages. On every
+    # response, error pages included (`always`), and replacing any copy from
+    # Comet: no MIME sniffing, no framing of the configure page, and no
+    # Referer to other sites (addon and configure URLs carry the token).
+    # No location sets its own add_header, so all of them inherit these.
+    server_tokens off;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header Referrer-Policy;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "same-origin" always;
 
     map $http_x_forwarded_proto $pass_x_forwarded_proto {{
         ~*^\\s*https(?:[\\s,]|$) https;
@@ -591,13 +657,17 @@ http {{
 """
 
     def write_nginx_configs(self) -> None:
-        nginx_conf = self.render_nginx_conf()
-        tokens_map = self.render_tokens_map()
-        ensure_directory(self.config.state_dir)
-        # These files carry live gateway tokens; write them atomically at 0600
-        # (the nginx container runs as root and can still read the bind mounts).
-        atomic_write_text(self.config.nginx_conf_file, nginx_conf, mode=0o600)
-        atomic_write_text(self.config.tokens_map_file, tokens_map, mode=0o600)
+        # Under the token lock, so tokens.map always renders the tokens.json
+        # that is current when it is written: a reload or start that read the
+        # tokens before a revoke can no longer write the revoked token back.
+        with self._token_lock():
+            nginx_conf = self.render_nginx_conf()
+            tokens_map = self.render_tokens_map()
+            ensure_directory(self.config.state_dir)
+            # These files carry live gateway tokens; write them atomically at 0600
+            # (the nginx container runs as root and can still read the bind mounts).
+            atomic_write_text(self.config.nginx_conf_file, nginx_conf, mode=0o600)
+            atomic_write_text(self.config.tokens_map_file, tokens_map, mode=0o600)
 
     # ── Compose lifecycle ──────────────────────────────────────────
 
@@ -629,8 +699,14 @@ http {{
 
         A reload only helps if nginx reads the new files; the state directory is
         mounted (not single files, which keep the inode they started with), and
-        the in-container hashes are compared before claiming success.
+        the in-container hashes are compared before claiming success. The token
+        lock is held throughout, so no token change lands between the write,
+        the check and the reload.
         """
+        with self._token_lock():
+            self._reload_nginx_locked()
+
+    def _reload_nginx_locked(self) -> None:
         self.write_nginx_configs()
         container_id = self.service_container_id()
         if not container_id:

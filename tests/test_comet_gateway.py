@@ -1474,3 +1474,20 @@ class TestTokenCrudPreMutationValidation:
                 assert manager.config.tokens_map_file.read_bytes() == sentinel_map
         finally:
             loguru_logger.remove(sink_id)
+
+
+def test_rendered_gateway_hides_its_version_and_sets_security_headers(tmp_path: Path) -> None:
+    """Default-suite check of what the real-nginx test proves per response."""
+    conf = CometGatewayManager(make_comet_gateway_config(tmp_path)).render_nginx_conf()
+    http_block = conf.split("http {", 1)[1].split("    server {", 1)[0]
+    assert "    server_tokens off;\n" in http_block
+    for header, value in (
+        ("X-Content-Type-Options", '"nosniff"'),
+        ("X-Frame-Options", '"DENY"'),
+        ("Referrer-Policy", '"same-origin"'),
+    ):
+        assert f"    proxy_hide_header {header};\n" in http_block
+        assert f"    add_header {header} {value} always;\n" in http_block
+    # A location with its own add_header would silently drop the inherited ones.
+    servers = conf.split("    server {", 1)[1]
+    assert "add_header" not in servers

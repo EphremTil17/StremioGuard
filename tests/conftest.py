@@ -164,6 +164,28 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
     return Config(**values)  # type: ignore[arg-type]
 
 
+# `ps --status` flags of the stop paths (see guard.ACTIVE_STATES).
+ACTIVE_STATUS_ARGS = (
+    "--status",
+    "running",
+    "--status",
+    "restarting",
+    "--status",
+    "paused",
+    "--status",
+    "removing",
+)
+
+
+def seal_generation(root: Path) -> None:
+    """Write the generation manifest for files a test created by hand (what publish does last)."""
+    from stremioguard.config import PUBLISHED_GENERATION_FILE, render_generation_manifest
+
+    (root / PUBLISHED_GENERATION_FILE).write_text(
+        render_generation_manifest(root), encoding="utf-8"
+    )
+
+
 def compose_args_prefix(tmp_path: Path) -> list[str]:
     return [
         "docker",
@@ -206,10 +228,11 @@ def compose_stack_responses(
             responses[tuple(cfg_cmd)] = completed(cfg_cmd, "\n".join(compose_services) + "\n")
         query_targets = running_query_services if running_query_services is not None else running
         if query_targets:
-            status_cmd = [*prefix, "ps", "--status", "running", "--services", *query_targets]
-            responses[tuple(status_cmd)] = completed(
-                status_cmd, "\n".join(s for s in query_targets if s in running) + "\n"
-            )
+            for status_args in (("--status", "running"), ACTIVE_STATUS_ARGS):
+                status_cmd = [*prefix, "ps", *status_args, "--services", *query_targets]
+                responses[tuple(status_cmd)] = completed(
+                    status_cmd, "\n".join(s for s in query_targets if s in running) + "\n"
+                )
     for service in containers:
         if service in running:
             responses[("docker", "inspect", "-f", "{{.State.Running}}", service)] = completed(
@@ -351,6 +374,9 @@ Request = object  # upstream: from fastapi import Request
 STREMIO_API_PREFIX = "/s/secret-token"
 
 
+CORSMiddleware = object  # upstream: from fastapi.middleware.cors import CORSMiddleware
+
+
 class FastAPI:
     def __init__(self, *args, **kwargs):
         self.user_middleware = []
@@ -374,11 +400,55 @@ async def dispatch(request, method, status_code, process_time):
 
 
 app = FastAPI(title="Comet")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 """
+
+
+# Upstream's two scraper log lines, built in pieces (each is one long line upstream).
+_TIMEOUT_LINE = (
+    'f"Timeout while getting torrents for {media_id} with {scraper_name} '
+    '({censor_url(scraper_url)})"'
+)
+_EXCEPTION_LINE = (
+    'f"Exception while getting torrents for {media_id} with {scraper_name} '
+    "({censor_url(scraper_url)}), you are most likely being "
+    'ratelimited{api_password_missing}: {error}"'
+)
 
 
 # The upstream shape of the masking sites the logger override patches.
 COMET_LOGGER_SOURCE = """\
+import sys
+
+from comet.utils.parsing import associate_urls_credentials
+
+
+def handlers():
+    return [
+            {
+                "sink": sys.stderr,
+            }
+    ]
+
+
+def add_capture(logger, loguru_handler):
+    logger.add(
+    loguru_handler.write,
+    )
+
+
+def log_scraper_error(scraper_name, scraper_url, media_id, error):
+    if "timeout" in str(error):
+        return @@TIMEOUT_LINE@@
+    return @@EXCEPTION_LINE@@
+
+
 def censor(text: str):
     if not text:
         return ""
@@ -404,7 +474,7 @@ def censor_url(url: str):
 
 def preview(token_value):
     return f"{token_value[:6]}...{token_value[-4:]}"
-"""
+""".replace("@@TIMEOUT_LINE@@", _TIMEOUT_LINE).replace("@@EXCEPTION_LINE@@", _EXCEPTION_LINE)
 
 # Manifest outputs every bundle must carry, whatever the deployment shape.
 REQUIRED_PATCH_OUTPUTS = {

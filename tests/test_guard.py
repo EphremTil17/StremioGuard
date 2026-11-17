@@ -11,12 +11,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from stremioguard import config as config_mod
 from stremioguard import guard as guard_mod
 from stremioguard import preflight as preflight_mod
 from stremioguard.guard import GluetunGuard, PublicIPAssessment
 
 from .conftest import (
+    ACTIVE_STATUS_ARGS,
     PUBLIC_IPV4_ALT,
     PUBLIC_IPV4_EGRESS,
     PUBLIC_IPV4_HOST,
@@ -28,6 +31,7 @@ from .conftest import (
     compose_args_prefix,
     compose_stack_responses,
     make_config,
+    seal_generation,
 )
 
 GLUETUN_HEALTH_INSPECT = (
@@ -1244,7 +1248,49 @@ class EgressAssessmentTests(unittest.TestCase):
     SNAPSHOT = PUBLIC_IPV4_SNAPSHOT
 
     def _guard(self, tmp_path: Path, **overrides: object) -> GluetunGuard:
-        return GluetunGuard(make_config(tmp_path, **overrides), FakeRunner({}))
+        guard = GluetunGuard(make_config(tmp_path, **overrides), FakeRunner({}))
+        # The tick reads gluetun's state before assessing; a SAFE verdict is
+        # cached only for the gluetun instance it was probed in.
+        guard.last_gluetun_state = guard_mod.GluetunState("gluetun", "healthy", GLUETUN_STARTED_AT)
+        return guard
+
+    def test_a_restarted_gluetun_is_probed_before_a_cached_verdict_is_reused(self) -> None:
+        """Same control-server IP, inside the interval, but a new container: probe again."""
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory), egress_probe_interval_seconds=300)
+            patches, _ = self._probes(guard)
+            with patches[0], patches[1] as egress_probe, patches[2], patches[3], patches[4]:
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.SAFE)
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.SAFE)
+                self.assertEqual(egress_probe.call_count, 1)  # cached within the interval
+                # gluetun restarted between ticks (same ID, new start time) ...
+                guard.last_gluetun_state = guard_mod.GluetunState(
+                    "gluetun", "healthy", "2026-11-17T09:00:00.000000000Z"
+                )
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.SAFE)
+                self.assertEqual(egress_probe.call_count, 2)
+                # ... or was recreated (new ID).
+                guard.last_gluetun_state = guard_mod.GluetunState(
+                    "gluetun-new", "healthy", "2026-11-17T09:00:00.000000000Z"
+                )
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.SAFE)
+                self.assertEqual(egress_probe.call_count, 3)
+                # Unknown identity is never trusted from the cache either.
+                guard.last_gluetun_state = guard_mod.GluetunState("gluetun", None, None)
+                guard.public_ip_assessment()
+                self.assertEqual(egress_probe.call_count, 4)
+
+    def test_a_new_gluetun_that_cannot_be_verified_is_not_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            guard = self._guard(Path(directory), egress_probe_interval_seconds=300)
+            patches, _ = self._probes(guard)
+            with patches[0], patches[1] as egress_probe, patches[2], patches[3], patches[4]:
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.SAFE)
+                guard.last_gluetun_state = guard_mod.GluetunState(
+                    "gluetun-new", "healthy", "2026-11-17T09:00:00.000000000Z"
+                )
+                egress_probe.return_value = None  # the new tunnel's probe fails
+                self.assertEqual(guard.public_ip_assessment(), PublicIPAssessment.UNKNOWN)
 
     def _probes(
         self,
@@ -1711,6 +1757,7 @@ def test_frozen_guard_never_rebuilds_from_the_working_tree(tmp_path: Path) -> No
         cfg = make_config(tmp_path)
         (tmp_path / PUBLISHED_COMPOSE_FILE).touch()
         (tmp_path / PUBLISHED_ENV_FILE).touch()
+        seal_generation(tmp_path)
         cmd = [*compose_command(tmp_path), *expected]
         runner = FakeRunner({tuple(cmd): completed(cmd)})
         guard = GluetunGuard(cfg, runner, frozen=frozen)
@@ -1733,7 +1780,7 @@ def test_stop_active_services_falls_back_to_docker_stop_when_compose_fails(tmp_p
     cfg_cmd = compose_command(tmp_path, "config", "--services")
     stop_cmd = compose_command(tmp_path, "stop", "stremio")
     ps_stremio = compose_command(tmp_path, "ps", "-q", "stremio")
-    status_cmd = compose_command(tmp_path, "ps", "--status", "running", "--services", "stremio")
+    status_cmd = compose_command(tmp_path, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio")
 
     docker_stopped = False
 
@@ -1774,3 +1821,78 @@ def test_stop_active_services_falls_back_to_docker_stop_when_compose_fails(tmp_p
     guard = GluetunGuard(cfg, runner)
     assert guard.stop_active_services() is True
     assert ["docker", "stop", "-t", "5", "stremio-cid"] in calls
+
+
+# F-6: a stop path must never read "nothing running" from output it did not
+# understand, nor miss a paused or restarting container.
+
+
+def _cmd(tmp_path: Path, *args: str) -> list[str]:
+    return [*compose_args_prefix(tmp_path), *args]
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "WARN[0000] some compose warning on stdout\n",
+        "stremio\nunexpected-service\n",
+        "strem\n",
+        '[{"Service": "stremio", "State": "running"}]\n',
+        "stremio extra\n",
+    ],
+)
+def test_unrecognised_ps_output_is_unknown_not_empty(tmp_path: Path, stdout: str) -> None:
+    query = _cmd(tmp_path, "ps", "--status", "running", "--services", "stremio")
+    runner = FakeRunner({tuple(query): completed(query, stdout)})
+    guard = GluetunGuard(make_config(tmp_path), runner)
+    assert guard.running_services(["stremio"]) is None
+    assert guard.container_running(["stremio"]) is None
+    assert runner.calls == [query, query], "the stubbed query was not the one sent"
+    # The same answer, understood, is not None (the stub really is reached).
+    runner.responses[tuple(query)] = completed(query, "stremio\n")
+    assert guard.running_services(["stremio"]) == {"stremio"}
+
+
+def test_recognised_ps_output_tolerates_crlf_and_blank_lines(tmp_path: Path) -> None:
+    query = _cmd(tmp_path, "ps", "--status", "running", "--services", "stremio", "comet")
+    guard = GluetunGuard(
+        make_config(tmp_path), FakeRunner({tuple(query): completed(query, "\r\nstremio\r\n\n")})
+    )
+    assert guard.running_services(["stremio", "comet"]) == {"stremio"}
+
+
+def test_stop_paths_count_paused_restarting_and_removing_containers(tmp_path: Path) -> None:
+    # Real `docker compose ps --status ... --services` output for a project
+    # with one running and one paused service (Compose v5.6.1).
+    active = _cmd(tmp_path, "ps", *ACTIVE_STATUS_ARGS, "--services", "alpha", "beta")
+    running = _cmd(tmp_path, "ps", "--status", "running", "--services", "alpha", "beta")
+    stop = _cmd(tmp_path, "stop", "alpha", "beta")
+    runner = FakeRunner(
+        {
+            tuple(running): completed(running, "alpha\n"),
+            tuple(active): [completed(active, "alpha\nbeta\n"), completed(active, "")],
+            tuple(stop): completed(stop),
+        }
+    )
+    guard = GluetunGuard(make_config(tmp_path), runner)
+    assert guard.stop_active_services(["alpha", "beta"]) is True
+    assert stop in runner.calls, "the paused service was not stopped"
+
+
+def test_stop_with_persistently_unreadable_state_is_not_reported_as_done(tmp_path: Path) -> None:
+    active = _cmd(tmp_path, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio")
+    stop = _cmd(tmp_path, "stop", "stremio")
+    ps_q = _cmd(tmp_path, "ps", "-q", "stremio")
+    runner = FakeRunner(
+        {
+            tuple(active): completed(active, "WARN something unexpected\n"),
+            tuple(stop): completed(stop),
+            tuple(ps_q): completed(ps_q, "stremio-cid\n"),
+            ("docker", "stop", "-t", "5", "stremio-cid"): completed([]),
+        }
+    )
+    guard = GluetunGuard(make_config(tmp_path), runner)
+    with mock.patch.object(guard, "warn"):
+        assert guard.stop_active_services(["stremio"]) is False
+    assert stop in runner.calls
+    assert guard.services_confirmed_stopped(["stremio"]) is False

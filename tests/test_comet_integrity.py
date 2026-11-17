@@ -45,6 +45,7 @@ from .conftest import (
     make_comet_config,
     make_comet_gateway_config,
     make_config,
+    seal_generation,
     write_bundle,
 )
 from .test_comet import _write_lock, _write_upstream_patch_sources
@@ -1427,8 +1428,14 @@ def test_ac14_incomplete_generation_refused_by_frozen_guard_and_tick(tmp_path: P
         assert orch._tick() is False
     assert not any("up" in call for call in tick_runner.calls)
 
-    # All three present -> frozen guard runs
+    # All three present but never sealed by a publish -> still refused
     (tmp_path / PUBLISHED_ENV_FILE).write_text("STREMIO_BIND_ADDRS='127.0.0.1'\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="published-generation\\.json is missing"):
+        frozen_guard.compose_fresh("up", "-d", "--no-deps", "stremio")
+    assert runner.calls == []
+
+    # Sealed as one generation -> frozen guard runs
+    seal_generation(tmp_path)
     frozen_guard.compose_fresh("up", "-d", "--no-deps", "stremio", check=False)
     assert len(runner.calls) == 1
 
