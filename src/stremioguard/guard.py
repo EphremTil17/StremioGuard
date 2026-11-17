@@ -1038,7 +1038,7 @@ class GluetunGuard:
             raise RuntimeError(
                 "The Stremio server needs credentials: set STREMIO_USERNAME and a "
                 f"STREMIO_PASSWORD of at least {STREMIO_MIN_PASSWORD_LENGTH} characters in .env "
-                "(every server route except raw stream URLs then requires them), set "
+                "(every server route then requires them), set "
                 "STREMIO_ENABLED=0, or set STREMIO_ALLOW_NO_AUTH=1 to accept an open server."
             )
 

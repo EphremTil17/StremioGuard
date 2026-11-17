@@ -8,9 +8,12 @@ Security hardening for edge cases:
   non-empty `sources` list (trackers): P2P fields are stripped, and an entry
   with no HTTP URL left is dropped. Top-level `sources` lists (another addon
   format) are filtered the same way as `streams`.
-- Password attempts on `/configure/login` and `/admin/login` share one
-  in-process budget (6 a minute, 5 at once; excess gets 429), so guessing is
-  paced on every path to Comet, the host's own loopback port included.
+- Password attempts are paced per login page: `/configure/login` and
+  `/admin/login` each have an in-process budget (6 a minute, 5 at once;
+  excess gets 429), so guessing is paced on every path to Comet, the host's
+  own loopback port included. They are separate because every client
+  reaches Comet from the same address: guesses at the public configure page
+  must not lock the owner out of the admin dashboard.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ _TOO_MANY_LOGINS_BODY = b'{"detail":"Too many login attempts; wait a minute and 
 
 
 class _LoginBudget:
-    """A token bucket shared by every login attempt in this process."""
+    """A token bucket shared by every attempt at one login page in this process."""
 
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
@@ -52,7 +55,7 @@ class _LoginBudget:
         return False
 
 
-_LOGIN_BUDGET = _LoginBudget()
+_LOGIN_BUDGETS = {path: _LoginBudget() for path in _LOGIN_PATHS}
 
 
 def _is_torznab_path(path: str) -> bool:
@@ -214,10 +217,11 @@ class StremioGuardResponseGuard:
             await _send_json_response(send, 404, _NOT_FOUND_BODY)
             return
 
+        login_budget = _LOGIN_BUDGETS.get(str(scope.get("path") or "").rstrip("/"))
         if (
-            str(scope.get("method") or "").upper() == "POST"
-            and str(scope.get("path") or "").rstrip("/") in _LOGIN_PATHS
-            and not _LOGIN_BUDGET.allow()
+            login_budget is not None
+            and str(scope.get("method") or "").upper() == "POST"
+            and not login_budget.allow()
         ):
             await _send_json_response(send, 429, _TOO_MANY_LOGINS_BODY)
             return

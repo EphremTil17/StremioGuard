@@ -153,11 +153,13 @@ services:
       - FFMPEG_BIN=/usr/bin/ffmpeg
       - FFPROBE_BIN=/usr/bin/ffprobe
       - STREMIO_SKIP_HW_PROBE=${STREMIO_SKIP_HW_PROBE:-1}
-      # Basic auth in the image's nginx on every server route except raw stream
-      # URLs; `./stremio start` refuses Stremio without them (STREMIO_ALLOW_NO_AUTH=1
-      # opts out).
+      # Basic auth in the image's nginx on every server route; a raw stream URL
+      # also plays without it for a torrent a signed-in client already started
+      # (docker/stremio/gate-raw-streams.js). `./stremio start` refuses Stremio
+      # without them (STREMIO_ALLOW_NO_AUTH=1 opts out).
       - USERNAME=${STREMIO_USERNAME:-}
       - PASSWORD=${STREMIO_PASSWORD:-}
+      - STREMIO_OPEN_RAW_STREAMS=${STREMIO_OPEN_RAW_STREAMS:-}
       - EXTERNAL_BASE_URL=${EXTERNAL_BASE_URL:-}
       - INTERNAL_MEDIA_BASE_URL=${INTERNAL_MEDIA_BASE_URL:-http://127.0.0.1:11470}
     volumes:

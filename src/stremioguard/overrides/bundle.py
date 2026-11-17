@@ -11,6 +11,7 @@ from loguru import logger
 from stremioguard.env import atomic_write_text
 from stremioguard.overrides.api_app import render_api_app_override
 from stremioguard.overrides.config import render_config_override
+from stremioguard.overrides.config_limits import render_config_limits_override
 from stremioguard.overrides.filtering import render_filtering_override
 from stremioguard.overrides.formatter import render_formatter_override
 from stremioguard.overrides.logger import render_logger_override
@@ -88,6 +89,14 @@ SPECS = [
         output_name="playback.py",
         requirement=Requirement.REQUIRED,
         render=lambda repo_dir, ctx: render_playback_override(repo_dir),
+    ),
+    OverrideSpec(
+        name="config_limits",
+        feature="bounded addon config parsing: length, debrid services, cache size",
+        container_path="/app/comet/core/config_validation.py",
+        output_name="config_validation.py",
+        requirement=Requirement.REQUIRED,
+        render=lambda repo_dir, ctx: render_config_limits_override(repo_dir),
     ),
     OverrideSpec(
         name="logger",

@@ -147,6 +147,7 @@ class TestOverridesBundle(unittest.TestCase):
                     "media_search.py": "/app/comet/services/media_search.py",
                     "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
                     "playback.py": "/app/comet/api/endpoints/playback.py",
+                    "config_validation.py": "/app/comet/core/config_validation.py",
                 },
                 extra={
                     "image_digest": "sha256:123",

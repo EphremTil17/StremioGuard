@@ -321,6 +321,7 @@ MINIMAL_BUNDLE_OUTPUTS = {
     "index.html": "/app/comet/templates/index.html",
     "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
     "playback.py": "/app/comet/api/endpoints/playback.py",
+    "config_validation.py": "/app/comet/core/config_validation.py",
 }
 
 
@@ -486,6 +487,7 @@ REQUIRED_PATCH_OUTPUTS = {
     "stream.py": "/app/comet/api/endpoints/stream.py",
     "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
     "playback.py": "/app/comet/api/endpoints/playback.py",
+    "config_validation.py": "/app/comet/core/config_validation.py",
 }
 
 
@@ -507,11 +509,13 @@ import mediaflow_proxy.utils.http_utils
 from fastapi import Request
 
 
-async def playback(request: Request, download_url: str):
+async def playback(request: Request, download_url: str, torrent_name: str, ip: str):
     return await custom_handle_stream_request(
             request.method,
             download_url,
             mediaflow_proxy.utils.http_utils.get_proxy_headers(request),
+            media_id=torrent_name,
+            ip=ip,
     )
 """
 
@@ -522,8 +526,47 @@ def write_comet_playback(repo_root: Path, source: str = COMET_PLAYBACK_SOURCE) -
     target.write_text(source, encoding="utf-8")
 
 
+# The upstream shape of comet/core/config_validation.py where the config limits patch.
+COMET_CONFIG_VALIDATION_SOURCE = """\
+import base64
+from functools import lru_cache
+
+import orjson
+
+from comet.core.models import ConfigModel
+
+
+@lru_cache(maxsize=4096)
+def _parse_and_validate_config(b64config: str):
+    try:
+        config = orjson.loads(base64.b64decode(b64config).decode())
+
+        validated_config = ConfigModel(**config)
+        return validated_config.model_dump()
+    except Exception:
+        return None
+
+
+def config_check(b64config: str | None, strict_b64config: bool = False):
+    if not b64config:
+        return None
+
+    validated_config = _parse_and_validate_config(b64config)
+    return validated_config
+"""
+
+
+def write_comet_config_validation(
+    repo_root: Path, source: str = COMET_CONFIG_VALIDATION_SOURCE
+) -> None:
+    target = repo_root / "comet" / "core" / "config_validation.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+
+
 def write_required_comet_sources(repo_root: Path) -> None:
     """Upstream files every required override patches."""
     write_comet_api_app(repo_root)
     write_comet_logger(repo_root)
     write_comet_playback(repo_root)
+    write_comet_config_validation(repo_root)

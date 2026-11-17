@@ -746,11 +746,16 @@ def _login_scope(path: str, method: str = "POST") -> dict[str, Any]:
     return scope
 
 
-def test_login_attempts_share_a_paced_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+def _paced_login_guard(
+    monkeypatch: pytest.MonkeyPatch, now: list[float]
+) -> tuple[StremioGuardResponseGuard, list[str]]:
     import stremioguard.overrides.response_guard as guard_mod
 
-    now = [1000.0]
-    monkeypatch.setattr(guard_mod, "_LOGIN_BUDGET", guard_mod._LoginBudget(clock=lambda: now[0]))
+    monkeypatch.setattr(
+        guard_mod,
+        "_LOGIN_BUDGETS",
+        {path: guard_mod._LoginBudget(clock=lambda: now[0]) for path in guard_mod._LOGIN_PATHS},
+    )
     reached: list[str] = []
 
     async def app(scope: Any, receive: Any, send: Any) -> None:
@@ -758,13 +763,18 @@ def test_login_attempts_share_a_paced_budget(monkeypatch: pytest.MonkeyPatch) ->
         await send({"type": "http.response.start", "status": 303, "headers": []})
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
-    guard = StremioGuardResponseGuard(app)
+    return StremioGuardResponseGuard(app), reached
+
+
+def test_login_attempts_are_paced_per_login_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [1000.0]
+    guard, reached = _paced_login_guard(monkeypatch, now)
 
     def status_of(path: str, method: str = "POST") -> int:
         return asyncio.run(_run_asgi(guard, _login_scope(path, method)))[0]
 
     statuses = [status_of("/configure/login") for _ in range(4)]
-    statuses += [status_of("/admin/login/"), status_of("/admin/login")]
+    statuses += [status_of("/configure/login/"), status_of("/configure/login")]
     assert statuses == [303] * 5 + [429]
     # Reading the pages, and every other route, is never paced.
     assert status_of("/configure/login", "GET") == 303
@@ -775,3 +785,22 @@ def test_login_attempts_share_a_paced_budget(monkeypatch: pytest.MonkeyPatch) ->
     assert status_of("/configure/login") == 429
     # Four POSTs, the GET, and the one after the refill: never a refused attempt.
     assert reached.count("/configure/login") == 6
+
+
+def test_configure_login_flood_does_not_lock_out_admin_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every client reaches Comet from one address: the pages need their own budgets."""
+    now = [1000.0]
+    guard, reached = _paced_login_guard(monkeypatch, now)
+
+    def status_of(path: str) -> int:
+        return asyncio.run(_run_asgi(guard, _login_scope(path)))[0]
+
+    flood = [status_of("/configure/login") for _ in range(20)]
+    assert flood.count(429) == 15
+    # The admin dashboard's own budget is untouched by the flood...
+    assert [status_of("/admin/login") for _ in range(5)] == [303] * 5
+    # ...and is itself paced.
+    assert status_of("/admin/login/") == 429
+    assert reached.count("/admin/login") == 5

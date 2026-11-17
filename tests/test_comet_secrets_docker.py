@@ -115,7 +115,14 @@ def sources(
     patched = root / "patched" / "comet"
     shutil.copytree(upstream, patched)
     for spec in SPECS:
-        if spec.name in {"logger", "api_app", "response_guard", "stream_guard", "playback"}:
+        if spec.name in {
+            "logger",
+            "api_app",
+            "response_guard",
+            "stream_guard",
+            "playback",
+            "config_limits",
+        }:
             target = patched / spec.container_path.removeprefix("/app/comet/")
             rendered = spec.render(upstream.parent, CONTEXT)
             assert rendered is not None
@@ -295,9 +302,26 @@ if patched:
     print("PUBLIC", json.dumps({a: guard.is_public_address(a) for a in [
         "8.8.8.8", "127.0.0.1", "10.1.2.3", "172.18.0.2", "192.168.1.5", "169.254.169.254",
         "100.64.0.1", "0.0.0.0", "::1", "fe80::1", "fd00::1", "::ffff:127.0.0.1",
-        "2002:7f00:1::", "224.0.0.1", "2606:4700:4700::1111", "not-an-ip"]}))
+        "2002:7f00:1::", "224.0.0.1", "2606:4700:4700::1111", "not-an-ip",
+        "::127.0.0.1", "::10.0.0.1", "64:ff9b::127.0.0.1", "64:ff9b::10.0.0.1",
+        "64:ff9b:1::1", "::ffff:0:7f00:1", "2001::1", "64:ff9b::808:808"]}))
+
+    def _request(peer, client_id=None):
+        headers = [] if client_id is None else [(b"x-stremioguard-client", client_id.encode())]
+        return Request({"type": "http", "method": "GET", "path": "/", "query_string": b"",
+                        "headers": headers, "client": (peer, 40000)})
+
+    print("ADMISSION", json.dumps([
+        guard.admission_key(_request("127.0.0.1", "toka01"), ""),
+        guard.admission_key(_request("::1", "toka01"), ""),
+        guard.admission_key(_request("172.18.0.1", "toka01"), ""),
+        guard.admission_key(_request("127.0.0.1", "bad id!"), ""),
+        guard.admission_key(_request("127.0.0.1", "x" * 65), ""),
+        guard.admission_key(_request("127.0.0.1"), ""),
+    ]))
 else:
     print("PUBLIC {}")
+    print("ADMISSION []")
 
 async def fetch(url):
     response = await handlers.handle_stream_request("GET", url, playback_headers)
@@ -321,6 +345,9 @@ print("REDIRECT", json.dumps(asyncio.run(fetch("http://127.0.0.2:%d/hop" % hop.s
 """
 
 
+_STREAM_TAGS = {"HEADERS", "PUBLIC", "ADMISSION", "DIRECT", "NAMED", "REDIRECT"}
+
+
 def _stream_results(image: str, comet_dir: Path) -> dict[str, Any]:
     import json
 
@@ -328,9 +355,9 @@ def _stream_results(image: str, comet_dir: Path) -> dict[str, Any]:
     rows = {}
     for line in out.splitlines():
         tag, _, payload = line.partition(" ")
-        if tag in {"HEADERS", "PUBLIC", "DIRECT", "NAMED", "REDIRECT"}:
+        if tag in _STREAM_TAGS:
             rows[tag] = json.loads(payload)
-    assert set(rows) == {"HEADERS", "PUBLIC", "DIRECT", "NAMED", "REDIRECT"}, out[-3000:]
+    assert set(rows) == _STREAM_TAGS, out[-3000:]
     return rows
 
 
@@ -354,9 +381,67 @@ def test_stream_proxy_hardening(sources: tuple[str, Path, Path]) -> None:
     assert headers["response"] == {} and headers["remove"] == [] and headers["propagate"] == {}
     public = after["PUBLIC"]
     assert public.pop("8.8.8.8") is True and public.pop("2606:4700:4700::1111") is True
+    # NAT64 is judged by its embedded IPv4 address: here 8.8.8.8.
+    assert public.pop("64:ff9b::808:808") is True
     assert not any(public.values()), public
+    # Stream slots are counted per gateway token, and only for the gateway's
+    # own loopback connections: the host's published port arrives from the
+    # bridge address, and a malformed ID falls back to upstream's key.
+    assert after["ADMISSION"] == ["token:toka01", "token:toka01", "", "", "", ""]
+    playback_source = (patched / "api" / "endpoints" / "playback.py").read_text(encoding="utf-8")
+    assert "ip=_sg_admission_key(request, ip)," in playback_source
     for tag in ("DIRECT", "NAMED", "REDIRECT"):
         status, body = after[tag]
         assert status >= 400, (tag, status, body)
         assert "namespace-only data" not in body, tag
         assert "127.0.0.1" not in body and "localhost" not in body, (tag, body)
+
+
+CONFIG_PROBE = """
+import base64, json
+from comet.core.config_validation import config_check, _parse_and_validate_config
+
+def encoded(services):
+    entries = [{"service": "realdebrid", "apiKey": "k%d" % i} for i in range(services)]
+    return base64.b64encode(json.dumps({"debridServices": entries}).encode()).decode()
+
+padded = base64.b64encode(json.dumps({"debridStreamProxyPassword": "p" * 9000}).encode()).decode()
+print("CONFIG", json.dumps({
+    "one": config_check(encoded(1), strict_b64config=True) is not None,
+    "ten": config_check(encoded(10), strict_b64config=True) is not None,
+    "eleven": config_check(encoded(11), strict_b64config=True) is not None,
+    "five_hundred": config_check(encoded(500), strict_b64config=True) is not None,
+    "oversized": config_check(padded, strict_b64config=True) is not None,
+    "oversized_lenient_is_default": config_check(padded) is config_check(None),
+    "cache_size": _parse_and_validate_config.cache_info().maxsize,
+}))
+"""
+
+
+def _config_results(image: str, comet_dir: Path) -> dict[str, Any]:
+    import json
+
+    out = _run(image, comet_dir, CONFIG_PROBE)
+    for line in out.splitlines():
+        tag, _, payload = line.partition(" ")
+        if tag == "CONFIG":
+            return json.loads(payload)
+    raise AssertionError(out[-3000:])
+
+
+def test_config_parsing_is_bounded(sources: tuple[str, Path, Path]) -> None:
+    image, upstream, patched = sources
+    before = _config_results(image, upstream)
+    assert before["five_hundred"] is True and before["oversized"] is True, "positive control"
+    assert before["cache_size"] == 4096, "positive control"
+
+    after = _config_results(image, patched)
+    assert after == {
+        "one": True,
+        "ten": True,
+        "eleven": False,
+        "five_hundred": False,
+        "oversized": False,
+        "oversized_lenient_is_default": True,
+        "cache_size": 256,
+    }

@@ -8,6 +8,7 @@ import time; Comet and Starlette modules are imported dynamically at runtime.
 from __future__ import annotations
 
 import asyncio
+import base64
 import builtins
 import dis
 import importlib
@@ -250,8 +251,32 @@ def verify_stream_guard() -> list[str]:
     guard = importlib.import_module("comet.stremioguard_stream_guard")
     if getattr(playback, "_sg_safe_proxy_headers", None) is not guard.safe_proxy_headers:
         findings.append("playback does not build proxy headers through the stream guard")
+    if getattr(playback, "_sg_admission_key", None) is not guard.admission_key:
+        findings.append("playback does not count stream slots through the stream guard")
     if not guard.installed():
         findings.append("stream guard is not installed in the proxy library")
+    return findings
+
+
+def verify_config_limits() -> list[str]:
+    """Oversized configs and configs with too many debrid services are refused."""
+    findings: list[str] = []
+    validation = importlib.import_module("comet.core.config_validation")
+    limit = getattr(validation, "_SG_MAX_B64CONFIG_LENGTH", None)
+    max_services = getattr(validation, "_SG_MAX_DEBRID_SERVICES", None)
+    if not isinstance(limit, int) or not isinstance(max_services, int):
+        return ["config validation carries no StremioGuard limits"]
+
+    def encoded(services: int) -> str:
+        entries = [{"service": "realdebrid", "apiKey": "probe"}] * services
+        return base64.b64encode(json.dumps({"debridServices": entries}).encode()).decode()
+
+    if validation.config_check(encoded(1), strict_b64config=True) is None:
+        findings.append("config limits refused a config with one debrid service")
+    if validation.config_check(encoded(max_services + 1), strict_b64config=True) is not None:
+        findings.append("config limits accepted more debrid services than the cap")
+    if validation.config_check("A" * (limit + 4), strict_b64config=True) is not None:
+        findings.append("config limits accepted a config over the length cap")
     return findings
 
 
@@ -285,6 +310,11 @@ def run_probe(module_names: list[str]) -> dict[str, Any]:
             findings.extend(verify_stream_guard())
         except Exception as error:
             findings.append(f"stream guard probe failed: {type(error).__name__}: {error}")
+    if not findings:
+        try:
+            findings.extend(verify_config_limits())
+        except Exception as error:
+            findings.append(f"config limits probe failed: {type(error).__name__}: {error}")
 
     return {"ok": not findings, "findings": findings}
 

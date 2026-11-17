@@ -48,10 +48,18 @@ the LAN NIC means; if you don't accept it, Tier 1 isn't for you.
 
 Every tier requires `STREMIO_USERNAME` and a `STREMIO_PASSWORD` of at least
 12 characters in `.env`: the host port maps to the image's nginx (container
-port 8080), which then asks for them on every server route except raw stream
-URLs. Give Stremio the server URL with them, as
-`http://USER:PASSWORD@<host-LAN-IP>:11470`. `STREMIO_ALLOW_NO_AUTH=1` accepts
-an open server instead, with a warning on every start.
+port 8080), which then asks for them on every server route. Give Stremio the
+server URL with them, as `http://USER:PASSWORD@<host-LAN-IP>:11470`.
+`STREMIO_ALLOW_NO_AUTH=1` accepts an open server instead, with a warning on
+every start.
+
+Players cannot send credentials, so a raw stream URL (`/<infohash>/<file>`)
+also plays without them, but only for a torrent that already exists on the
+server. Torrents start only through authenticated routes, so nobody without
+the password can make the server download one. If a player ever fails to
+start a torrent stream (one that skips the authenticated start), set
+`STREMIO_OPEN_RAW_STREAMS=1` for upstream's behaviour: raw stream URLs for any
+torrent, without credentials.
 
 ## Tier 2 — Tier 1 + reverse-proxied domain (tailnet-only)
 
@@ -139,7 +147,7 @@ EXTERNAL_BASE_URL=https://<your-domain>
 
 Stremio's streaming server has no built-in auth; StremioGuard requires the
 image's basic auth (`STREMIO_USERNAME` / `STREMIO_PASSWORD`) on every server
-route except raw stream URLs. Whatever your proxy adds (Authentik / Authelia
+route (raw stream URLs: see Tier 1). Whatever your proxy adds (Authentik / Authelia
 via OIDC, mTLS, IP allowlist, WAF rules) is a further gate on the public side. Note: OIDC and CORS do not work for native
 mobile Stremio — they assume a browser. Design accordingly.
 

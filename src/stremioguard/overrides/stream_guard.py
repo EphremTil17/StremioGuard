@@ -17,6 +17,10 @@ the patched `comet/api/endpoints/playback.py`. It hardens the
 - **Upstream errors are not echoed to the client.** The client gets the
   status and a fixed message; the details go to the log, which masks secrets
   and cuts URLs to scheme and host.
+- **Each gateway token gets its own stream slots.** Behind the gateway every
+  client reaches Comet from the same address, so Comet's per-IP limit on
+  concurrent proxied streams was one pool for every user. `admission_key`
+  counts a request from the gateway under the token it came with.
 
 This file is source for Comet and runs in Comet's own Python; StremioGuard
 reads it, never imports it.
@@ -24,6 +28,7 @@ reads it, never imports it.
 
 import errno
 import ipaddress
+import re
 
 import aiohttp
 import mediaflow_proxy.handlers as _handlers
@@ -45,16 +50,44 @@ def safe_proxy_headers(request) -> ProxyRequestHeaders:
     return ProxyRequestHeaders(request_headers, {}, [], {})
 
 
+# The well-known NAT64 prefix (RFC 6052) is globally routable, but the IPv4
+# address in its last 32 bits is where a translator would actually connect.
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip in _NAT64_WELL_KNOWN:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
 def is_public_address(address: str) -> bool:
+    """Whether an address is plainly public: globally routable and nothing else.
+
+    IPv6 forms that carry an IPv4 address (mapped, 6to4, NAT64) are judged by
+    that IPv4 address. Reserved ranges (the deprecated IPv4-compatible `::/96`
+    among them) are refused even where Python counts them as global.
+    """
     try:
         ip = ipaddress.ip_address(str(address).split("%", 1)[0])
     except ValueError:
         return False
     if isinstance(ip, ipaddress.IPv6Address):
-        mapped = ip.ipv4_mapped or ip.sixtofour
-        if mapped is not None:
-            ip = mapped
-    return bool(ip.is_global) and not ip.is_multicast
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None:
+            ip = embedded
+    return bool(ip.is_global) and not (
+        ip.is_multicast
+        or ip.is_reserved
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_unspecified
+    )
 
 
 class PublicOnlyConnector(aiohttp.TCPConnector):
@@ -66,6 +99,26 @@ class PublicOnlyConnector(aiohttp.TCPConnector):
         if not public:
             raise OSError(errno.EACCES, f"Refusing to connect to a non-public address for {host}")
         return public
+
+
+# Set by the gateway (and cleared on every other route) to the ID of the
+# token a request came with; the ID is not a credential.
+_CLIENT_HEADER = "x-stremioguard-client"
+_CLIENT_ID = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+# The gateway shares Comet's network namespace and connects over loopback; a
+# connection to the host's published port arrives from the bridge address,
+# so a direct client cannot pick its own key by sending the header.
+_GATEWAY_PEERS = frozenset({"127.0.0.1", "::1"})
+
+
+def admission_key(request, ip: str) -> str:
+    """The key Comet counts a client's concurrent proxied streams under."""
+    client = getattr(request, "client", None)
+    peer = str(getattr(client, "host", "") or "")
+    token_id = request.headers.get(_CLIENT_HEADER, "")
+    if peer in _GATEWAY_PEERS and _CLIENT_ID.match(token_id):
+        return f"token:{token_id}"
+    return ip
 
 
 _original_handle_exceptions = _handlers.handle_exceptions

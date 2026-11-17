@@ -62,6 +62,12 @@ _COMET_IP_PROXY_HEADERS = (
 )
 
 
+# Carries the ID of a request's gateway token to Comet's stream guard, which
+# counts concurrent proxied streams per token (see overrides/stream_guard.py).
+# Set on token routes, cleared on every other route.
+_CLIENT_ID_HEADER = "X-StremioGuard-Client"
+
+
 # Token-lock depth per lock file, per thread (see `_token_lock`).
 _HELD_TOKEN_LOCKS = threading.local()
 
@@ -509,9 +515,11 @@ http {{
     # (6 a minute, 5 in a burst). Every other request has an empty key, which
     # limit_req never counts. Behind the port forwarder all clients share the
     # bucket, so a guesser also slows the owner's own login; that is the
-    # intended trade.
-    map "$request_method $request_uri" $login_limit_key {{
-        "~^POST /(?:comet/{token_re}/)?configure/login(?:\\?.*)?$" $binary_remote_addr;
+    # intended trade. Matched on the decoded, normalized $uri (the path Comet
+    # routes on), so a percent-encoded or doubled-slash spelling of the login
+    # path draws from the same bucket.
+    map "$request_method $uri" $login_limit_key {{
+        "~^POST /(?:comet/{token_re}/)?configure/login/?$" $binary_remote_addr;
         default "";
     }}
     limit_req_zone $login_limit_key zone=gateway_login:1m rate=6r/m;
@@ -596,6 +604,9 @@ http {{
             proxy_set_header X-Forwarded-Proto $pass_x_forwarded_proto;
             proxy_set_header X-Forwarded-Host $http_host;
             proxy_set_header X-Forwarded-Prefix /comet/$gateway_token;
+            # The token's ID (not a credential): Comet counts concurrent
+            # proxied streams per token instead of in one pool for everyone.
+            proxy_set_header {_CLIENT_ID_HEADER} $gateway_token_id;
             # Clear all 14 headers from Comet's comet/utils/network.py (IP_PROXY_HEADERS)
             # at sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea.
 {clear_ip_headers}
@@ -628,6 +639,7 @@ http {{
             proxy_set_header X-Forwarded-Proto $pass_x_forwarded_proto;
             proxy_set_header X-Forwarded-Host $http_host;
             proxy_set_header X-Forwarded-Prefix "";
+            proxy_set_header {_CLIENT_ID_HEADER} "";
 {clear_ip_headers}
             proxy_buffering off;
             proxy_read_timeout 3600s;
@@ -645,6 +657,7 @@ http {{
             proxy_set_header X-Forwarded-Proto $pass_x_forwarded_proto;
             proxy_set_header X-Forwarded-Host $http_host;
             proxy_set_header X-Forwarded-Prefix "";
+            proxy_set_header {_CLIENT_ID_HEADER} "";
 {clear_ip_headers}
             proxy_buffering off;
             proxy_read_timeout 3600s;

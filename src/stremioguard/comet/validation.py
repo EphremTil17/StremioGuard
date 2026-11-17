@@ -29,6 +29,7 @@ _REQUIRED_GUARD_CONTAINER_PATHS = (
     "/app/comet/stremioguard_response_guard.py",
     "/app/comet/api/endpoints/playback.py",
     "/app/comet/stremioguard_stream_guard.py",
+    "/app/comet/core/config_validation.py",
 )
 # Comet's single gunicorn worker runs its anime-mapping refresh synchronously
 # at startup and won't answer ANY request, including /health, until it's

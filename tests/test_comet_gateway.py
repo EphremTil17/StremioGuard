@@ -176,10 +176,13 @@ class TestCometGatewayManager:
         limiters = [line.strip() for line in token_location.splitlines() if "limit_req" in line]
         assert limiters == ["limit_req zone=gateway_login burst=5 nodelay;"]
         assert "limit_req_zone $login_limit_key zone=gateway_login:1m rate=6r/m;" in rendered
-        login_map = rendered.split('map "$request_method $request_uri" $login_limit_key {')[1]
-        login_map = login_map.split("}", 1)[0]
+        # Keyed on the decoded, normalized $uri (what Comet routes on), so a
+        # percent-encoded spelling of the login path is limited too.
+        login_map = rendered.split('map "$request_method $uri" $login_limit_key {')[1]
+        login_map = login_map.split("\n    }", 1)[0]
         assert '        default "";' in login_map
         assert login_map.count("$binary_remote_addr") == 1
+        assert "configure/login/?$" in login_map
         # No rewrite-phase return 403 remains in the token locations.
         assert "if ($token_valid = 0) {\n                return 403;" not in rendered
         # Configure/admin and root proxy get the human-paced admin limiter.

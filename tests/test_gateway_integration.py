@@ -799,6 +799,7 @@ def test_ac7_clears_ip_proxy_headers_and_client_forwarded_headers(
         [
             "X-Forwarded-Prefix: //evil.example",
             "X-Forwarded-Host: evil.example",
+            "X-StremioGuard-Client: spoofed-client",
         ]
     )
     specs = [
@@ -824,8 +825,11 @@ def test_ac7_clears_ip_proxy_headers_and_client_forwarded_headers(
         assert _header_values(rec, "x-forwarded-host") == ["127.0.0.1:8090"]
         if idx == 0:
             assert _header_values(rec, "x-forwarded-prefix") == [f"/comet/{TOKEN_A}"]
+            # Comet counts stream slots under the token's ID, never a client's value.
+            assert _header_values(rec, "x-stremioguard-client") == [TOKEN_A_ID]
         else:
             assert _header_values(rec, "x-forwarded-prefix") == []
+            assert _header_values(rec, "x-stremioguard-client") == []
 
 
 def test_ac8_rate_limit_storms_throttle_denials_never_valid_playback(
@@ -1027,9 +1031,15 @@ def test_ac12_login_attempts_share_a_strict_bucket_that_nothing_else_draws_from(
         "body": "password=wrong",
     }
     token_login = {**login, "target": f"/comet/{TOKEN_A}/configure/login"}
-    statuses = [r["status"] for r in gateway_harness.curl_batch([login] * 6 + [token_login] * 3)]
+    # Other spellings of the same path, which Comet routes to the same login.
+    respelled = [
+        {**login, "target": "/configure/%6cogin"},
+        {**login, "target": "//configure//login"},
+    ]
+    batch = [login] * 6 + respelled + [token_login] * 2
+    statuses = [r["status"] for r in gateway_harness.curl_batch(batch)]
     assert all(status != 503 for status in statuses[:5]), statuses
-    assert statuses.count(503) >= 3, statuses
+    assert statuses[6:8] == [503, 503], f"a respelled login path shares the bucket: {statuses}"
     assert statuses[-1] == 503, "the token-route login shares the same bucket"
     login_records = gateway_harness.fetch_records()
     assert len(login_records) <= 6, "throttled attempts must never reach Comet"

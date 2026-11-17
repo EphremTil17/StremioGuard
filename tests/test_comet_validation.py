@@ -62,6 +62,7 @@ _GUARD_OUTPUTS = {
     "stremioguard_response_guard.py": "/app/comet/stremioguard_response_guard.py",
     "playback.py": "/app/comet/api/endpoints/playback.py",
     "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
+    "config_validation.py": "/app/comet/core/config_validation.py",
 }
 
 
@@ -126,6 +127,7 @@ class ImportSmokeTestTests(unittest.TestCase):
                 "comet.api.app",
                 "comet.api.endpoints.playback",
                 "comet.api.endpoints.stream",
+                "comet.core.config_validation",
                 "comet.stremioguard_response_guard",
                 "comet.stremioguard_stream_guard",
             ],
