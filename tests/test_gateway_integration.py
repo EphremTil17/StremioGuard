@@ -1012,3 +1012,31 @@ def test_ac11_every_response_hides_the_version_and_carries_security_headers(
     assert {seen["invalid token"], seen["forbidden route"], seen["unknown path"]} == {403}
     assert seen["invalid host"] == 400
     assert seen["liveness"] == 204 and seen["liveness 404"] == 404
+
+
+def test_ac12_login_attempts_share_a_strict_bucket_that_nothing_else_draws_from(
+    gateway_harness: GatewayHarness,
+) -> None:
+    """POSTs to configure/login (public or under a token) are capped; nothing else is."""
+    time.sleep(12.0)  # let earlier tests' login POST drain from the 6-a-minute bucket
+    gateway_harness.clear_records()
+    login = {
+        "method": "POST",
+        "target": "/configure/login",
+        "headers": ["Content-Type: application/x-www-form-urlencoded"],
+        "body": "password=wrong",
+    }
+    token_login = {**login, "target": f"/comet/{TOKEN_A}/configure/login"}
+    statuses = [r["status"] for r in gateway_harness.curl_batch([login] * 6 + [token_login] * 3)]
+    assert all(status != 503 for status in statuses[:5]), statuses
+    assert statuses.count(503) >= 3, statuses
+    assert statuses[-1] == 503, "the token-route login shares the same bucket"
+    login_records = gateway_harness.fetch_records()
+    assert len(login_records) <= 6, "throttled attempts must never reach Comet"
+
+    # GETs and addon traffic draw nothing from the login bucket, even right now.
+    others = gateway_harness.curl_batch(
+        [{"target": "/configure"}]
+        + [{"target": f"/comet/{TOKEN_A}/s/{TEST_API_TOKEN}/manifest.json"}] * 15
+    )
+    assert [r["status"] for r in others] == [200] * 16, others

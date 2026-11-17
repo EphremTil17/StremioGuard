@@ -257,6 +257,47 @@ def _mkdir_parents_private(directory: Path) -> None:
                     raise
 
 
+def tighten_private_files(directory: Path) -> list[str]:
+    """Remove group and other access from the regular files directly in ``directory``.
+
+    Files created before StremioGuard made its files owner-only from creation
+    (wave 3) kept 0644 or 0664. Only regular files owned by this user change,
+    through an ``O_NOFOLLOW`` descriptor, so a symlink is never followed;
+    subdirectories (Comet's data and bundles keep the modes their containers
+    need) are left alone. Returns the names of the files it tightened.
+    """
+    tightened: list[str] = []
+    try:
+        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+    except (FileNotFoundError, NotADirectoryError):
+        return tightened
+    uid = os.getuid()
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY
+    for entry in entries:
+        try:
+            before = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != uid:
+            continue
+        if not before.st_mode & 0o077:
+            continue
+        try:
+            fd = os.open(entry.path, flags)
+        except OSError:
+            continue
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and st.st_ino == before.st_ino and st.st_uid == uid:
+                os.fchmod(fd, stat.S_IMODE(st.st_mode) & 0o700)
+                tightened.append(entry.name)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+    return tightened
+
+
 def ensure_directory(path: Path, *, mode: int = 0o700) -> None:
     """Create ``path`` (and missing parents at 0700) without following any symlink.
 

@@ -16,12 +16,14 @@ its fingerprint is.
 
 from __future__ import annotations
 
+import errno
 import glob
 import gzip
 import hashlib
 import os
 import re
 import secrets
+import stat
 import string
 import time
 import urllib.error
@@ -116,41 +118,98 @@ def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
 
 
+# A sink file is read from its end: the canary was written seconds ago, so the
+# tail of a large log is where it can be. A compressed file is read whole or
+# not at all.
+FILE_READ_LIMIT_BYTES = 32 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class FileGlobSink:
     """Plain or gzip-rotated log files matching a glob.
 
     `modified_since` skips files untouched since the probe window opened, so a
-    large archive of old run logs is not rescanned on every start.
+    large archive of old run logs is not rescanned on every start. A match
+    that is a symlink or not a regular file is never followed or opened for
+    reading: it makes the sink UNVERIFIED, since an unread sink is not a clean
+    one. Reads are bounded by `max_bytes` (see FILE_READ_LIMIT_BYTES).
     """
 
     name: str
     pattern: str
     modified_since: float | None = None
+    max_bytes: int = FILE_READ_LIMIT_BYTES
 
     def count(self, needle: str) -> SinkResult:
         paths = sorted(glob.glob(self.pattern))
         if self.modified_since is not None:
-            paths = [p for p in paths if os.path.getmtime(p) >= self.modified_since]
+            recent = []
+            for path in paths:
+                try:
+                    if os.lstat(path).st_mtime >= self.modified_since:
+                        recent.append(path)
+                except OSError:
+                    recent.append(path)  # reported as unreadable below
+            paths = recent
             if not paths:
                 return SinkResult(self.name, SinkStatus.PASS, detail="no file written")
         if not paths:
             return SinkResult(self.name, SinkStatus.UNVERIFIED, detail="no files match")
         hits = 0
+        partial = 0
         for path in paths:
-            opener = gzip.open if path.endswith(".gz") else open
             try:
-                with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
-                    hits += sum(1 for line in handle if needle in line)
-            except OSError as error:
+                text, complete = _read_log_file(path, self.max_bytes)
+            except _UnreadableSinkFile as error:
                 return SinkResult(
-                    self.name,
-                    SinkStatus.UNVERIFIED,
-                    hits,
-                    f"unreadable {Path(path).name}: {error.strerror or type(error).__name__}",
+                    self.name, SinkStatus.UNVERIFIED, hits, f"{Path(path).name}: {error}"
                 )
+            if not complete:
+                partial += 1
+            hits += sum(1 for line in text.splitlines() if needle in line)
         status = SinkStatus.FAIL if hits else SinkStatus.PASS
-        return SinkResult(self.name, status, hits, f"{len(paths)} file(s)")
+        detail = f"{len(paths)} file(s)"
+        if partial:
+            detail += f", last {self.max_bytes // (1024 * 1024)} MiB of {partial}"
+        return SinkResult(self.name, status, hits, detail)
+
+
+class _UnreadableSinkFile(Exception):
+    pass
+
+
+def _read_log_file(path: str, max_bytes: int) -> tuple[str, bool]:
+    """Text of a log file (or its last ``max_bytes``), and whether it was read whole."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise _UnreadableSinkFile("a symlink, not followed") from None
+        reason = error.strerror or type(error).__name__
+        raise _UnreadableSinkFile(f"unreadable ({reason})") from None
+    with os.fdopen(fd, "rb") as handle:
+        st = os.fstat(handle.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise _UnreadableSinkFile("not a regular file")
+        try:
+            if path.endswith(".gz"):
+                with gzip.GzipFile(fileobj=handle) as unzipped:
+                    data = unzipped.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise _UnreadableSinkFile(f"larger than {max_bytes} bytes uncompressed")
+                return data.decode("utf-8", errors="replace"), True
+            if st.st_size > max_bytes:
+                handle.seek(st.st_size - max_bytes)
+                data = handle.read(max_bytes)
+                # Drop the first, probably partial, line.
+                data = data.split(b"\n", 1)[1] if b"\n" in data else b""
+                return data.decode("utf-8", errors="replace"), False
+            return handle.read(max_bytes).decode("utf-8", errors="replace"), True
+        except (OSError, EOFError, gzip.BadGzipFile) as error:
+            raise _UnreadableSinkFile(
+                f"unreadable ({getattr(error, 'strerror', None) or type(error).__name__})"
+            ) from None
 
 
 @dataclass(frozen=True)

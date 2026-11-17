@@ -242,8 +242,14 @@ authenticated playback:
   to an internal access-phase location (`deny all`, `403`) rate-limited by
   `gateway_fail` at 5 r/s (burst 3; excess returns `503`).
 - Human-paced public pages (`/configure`, `/static/`, `/health`, and the root
-  page) share `gateway_admin` at 10 r/s (burst 20), which throttles
-  configure-password brute force.
+  page) share `gateway_admin` at 10 r/s (burst 20).
+- Configure-password guessing has its own, much stricter bucket:
+  every `POST` to `/configure/login` or `/comet/<token>/configure/login` draws
+  from `gateway_login`, 6 a minute (burst 5; excess returns `503` and never
+  reaches Comet). Every other request has an empty key in that zone and is
+  never counted, so playback and page loads are unaffected. The bucket is
+  shared by every client, so a guesser also slows your own login; a strong
+  password matters more than the limit.
 - Everything else falls through to `location /` (`deny all`, `403`) limited by
   `gateway_fail` at 5 r/s (burst 3; excess returns `503`).
 
@@ -301,8 +307,13 @@ container logs, this run's StremioGuard logs, and every file matched by
 proxy's logs). It prints only the canary's fingerprint and a PASS / FAIL /
 UNVERIFIED line per sink, and exits 1 unless the public HTTPS probe reached
 the gateway and every sink passed. A sink it cannot read, or a glob that
-matches nothing, is UNVERIFIED rather than PASS. The same check runs as an
-advisory warning after `./stremio start` and `./stremio restart`.
+matches nothing, is UNVERIFIED rather than PASS. A matched path that is a
+symlink or not a regular file (a FIFO, a device) is never followed or read
+and makes its sink UNVERIFIED. Plain log files are read from their end, at
+most the last 32 MiB (the canary was just written there); a compressed
+rotated log larger than 32 MiB uncompressed makes its sink UNVERIFIED. The
+same check runs as an advisory warning after `./stremio start` and
+`./stremio restart`.
 
 Logs owned by root-only runtimes (for example a rootful Docker daemon's
 `json-file` logs) are outside the automated check; scan them once with root.

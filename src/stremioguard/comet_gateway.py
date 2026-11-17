@@ -504,6 +504,18 @@ http {{
     limit_req_zone $binary_remote_addr zone=gateway_admin:1m rate=10r/s;
     limit_req_zone $binary_remote_addr zone=gateway_fail:1m rate=5r/s;
 
+    # Password guessing on the configure-page login: every POST to
+    # /configure/login, public or under a token, draws from one strict bucket
+    # (6 a minute, 5 in a burst). Every other request has an empty key, which
+    # limit_req never counts. Behind the port forwarder all clients share the
+    # bucket, so a guesser also slows the owner's own login; that is the
+    # intended trade.
+    map "$request_method $request_uri" $login_limit_key {{
+        "~^POST /(?:comet/{token_re}/)?configure/login(?:\\?.*)?$" $binary_remote_addr;
+        default "";
+    }}
+    limit_req_zone $login_limit_key zone=gateway_login:1m rate=6r/m;
+
     # Mask request paths before they reach the access log. After /comet/ the
     # line carries the gateway token AND the base64 Comet config blob, which
     # can embed debrid API keys, so everything up to the protocol field is
@@ -560,6 +572,7 @@ http {{
         }}
 
         location ^~ /comet/ {{
+            limit_req zone=gateway_login burst=5 nodelay;
             if ($token_valid = 0) {{
                 rewrite ^ /__sg_invalid_token last;
             }}
@@ -602,6 +615,7 @@ http {{
         }}
 
         location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$))" {{
+            limit_req zone=gateway_login burst=5 nodelay;
             limit_req zone=gateway_admin burst=20 nodelay;
             proxy_pass $comet_upstream$request_uri;
             proxy_http_version 1.1;

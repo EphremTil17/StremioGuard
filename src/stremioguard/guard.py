@@ -41,7 +41,12 @@ from stremioguard.config import (
     parse_public_ip,
     service_container_id,
 )
-from stremioguard.env import atomic_write_text, env_file_value, read_regular_file
+from stremioguard.env import (
+    atomic_write_text,
+    env_file_value,
+    read_regular_file,
+    tighten_private_files,
+)
 from stremioguard.httpdeadline import (
     ConnectionTracker,
     DeadlineHTTPHandler,
@@ -1101,6 +1106,16 @@ class GluetunGuard:
             )
         self.check_vpn_lockout(allow_recovery=allow_recovery)
         self.check_bind_addresses()
+        private_dirs = [self.config.vpn_lockout_file.parent]
+        if self.config.log_file is not None:
+            private_dirs.append(self.config.log_file.parent)
+        for directory in private_dirs:
+            tightened = tighten_private_files(directory)
+            if tightened:
+                self.log(
+                    f"Made {len(tightened)} older file(s) in {directory.name}/ owner-only: "
+                    f"{', '.join(tightened)}."
+                )
 
         comet_config = CometConfig.from_env(self.config.root_dir, env_file=self._env_path)
         if comet_config.enabled:

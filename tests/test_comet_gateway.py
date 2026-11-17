@@ -169,9 +169,17 @@ class TestCometGatewayManager:
         assert "location = /__sg_forbidden {" in rendered
         assert "limit_req zone=gateway_fail burst=3 nodelay;" in rendered
         assert "deny all;" in rendered
-        # Valid-token proxying must carry no limiter — playback seeking is bursty.
+        # Valid-token proxying carries no limiter that counts playback (seeking is
+        # bursty): only the login limiter, whose key is empty for everything but
+        # POSTs to configure/login.
         token_location = rendered.split("location ^~ /comet/ {")[1].split("\n        }", 1)[0]
-        assert "limit_req" not in token_location
+        limiters = [line.strip() for line in token_location.splitlines() if "limit_req" in line]
+        assert limiters == ["limit_req zone=gateway_login burst=5 nodelay;"]
+        assert "limit_req_zone $login_limit_key zone=gateway_login:1m rate=6r/m;" in rendered
+        login_map = rendered.split('map "$request_method $request_uri" $login_limit_key {')[1]
+        login_map = login_map.split("}", 1)[0]
+        assert '        default "";' in login_map
+        assert login_map.count("$binary_remote_addr") == 1
         # No rewrite-phase return 403 remains in the token locations.
         assert "if ($token_valid = 0) {\n                return 403;" not in rendered
         # Configure/admin and root proxy get the human-paced admin limiter.

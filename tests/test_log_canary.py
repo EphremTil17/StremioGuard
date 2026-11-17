@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import os
 import subprocess
 import tempfile
 import time
@@ -59,10 +60,55 @@ class FileGlobSinkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "root-only.log"
             path.write_text("x\n")
-            with mock.patch("builtins.open", side_effect=PermissionError(13, "Permission denied")):
+            path.chmod(0)
+            try:
                 result = FileGlobSink("npm", str(path)).count("CANARY")
+            finally:
+                path.chmod(0o600)
         self.assertEqual(result.status, SinkStatus.UNVERIFIED)
         self.assertIn("Permission denied", result.detail)
+
+    def test_symlinks_and_fifos_are_never_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = root / "secret.txt"
+            secret.write_text("CANARY\n")
+            (root / "link.log").symlink_to(secret)
+            linked = FileGlobSink("npm", str(root / "link.log")).count("CANARY")
+            os.mkfifo(root / "pipe.log")
+            started = time.monotonic()
+            piped = FileGlobSink("npm", str(root / "pipe.log")).count("CANARY")
+            elapsed = time.monotonic() - started
+        self.assertEqual((linked.status, linked.hits), (SinkStatus.UNVERIFIED, 0))
+        self.assertIn("symlink", linked.detail)
+        self.assertEqual(piped.status, SinkStatus.UNVERIFIED)
+        self.assertIn("not a regular file", piped.detail)
+        self.assertLess(elapsed, 2.0)
+
+    def test_large_plain_file_is_read_from_its_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "big.log"
+            with path.open("w") as handle:
+                handle.write("CANARY in the old head\n")
+                handle.write("x" * 2000 + "\n")
+                handle.write("recent CANARY line\n")
+            result = FileGlobSink("npm", str(path), max_bytes=1000).count("CANARY")
+        self.assertEqual((result.status, result.hits), (SinkStatus.FAIL, 1))
+        self.assertIn("last", result.detail)
+
+    def test_compressed_file_over_the_limit_is_unverified(self) -> None:
+        import gzip
+
+        with tempfile.TemporaryDirectory() as directory:
+            small = Path(directory) / "small.log.gz"
+            small.write_bytes(gzip.compress(b"CANARY\n"))
+            big = Path(directory) / "big.log.gz"
+            big.write_bytes(gzip.compress(b"y" * 5000 + b"\nCANARY\n"))
+            small_result = FileGlobSink("npm", str(small), max_bytes=1000).count("CANARY")
+            big_result = FileGlobSink("npm", str(big), max_bytes=1000).count("CANARY")
+        self.assertEqual((small_result.status, small_result.hits), (SinkStatus.FAIL, 1))
+        self.assertEqual(big_result.status, SinkStatus.UNVERIFIED)
+        self.assertIn("larger than", big_result.detail)
 
     def test_modified_since_skips_stale_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
