@@ -2,13 +2,18 @@ name: Comet Canary
 
 # Daily upstream-drift canary (plan Phase 7.2): resolve the remote digest of
 # <image>:latest, validate it against the patch generator when it differs
-# from the lock's tested_digest, then either open a bump PR or file a drift
-# issue. Scheduled runs fire on the repository's DEFAULT branch only.
+# from the lock's tested_digest, then either bump, test and merge it, or file
+# a drift issue. Scheduled runs fire on the repository's DEFAULT branch only.
 #
-# Note: PRs created with the built-in GITHUB_TOKEN do not trigger other
-# workflows (including ci.yml). The bump PR is validated by this run itself;
-# to also get a CI run on the PR, replace `token` below with a PAT or a
-# GitHub App token.
+# A passing bump merges on its own: the patches validated against the new
+# image, and the full test suite passed with the bumped lock. Merging deploys
+# nothing; `./stremio comet update` promotes a digest on the host, and uses
+# tested_digest as its fallback when a newer candidate fails validation.
+#
+# PRs created with the built-in GITHUB_TOKEN do not trigger other workflows
+# (including ci.yml), which is why this run tests the bump itself. If `main`
+# ever requires status checks, the merge below will be refused; then use a
+# PAT or GitHub App token for `token`, so ci.yml runs on the PR.
 
 on:
   schedule:
@@ -101,7 +106,12 @@ jobs:
             echo "</details>"
           } > "$RUNNER_TEMP/pr_body.md"
 
+      - name: Run the test suite against the bumped lock
+        if: steps.digests.outputs.remote_digest != steps.digests.outputs.tested_digest && steps.run_validation.outputs.failed == '0'
+        run: uv run pytest -q
+
       - name: Create pull request
+        id: cpr
         if: steps.digests.outputs.remote_digest != steps.digests.outputs.tested_digest && steps.run_validation.outputs.failed == '0'
         uses: peter-evans/create-pull-request@v8
         with:
@@ -112,6 +122,15 @@ jobs:
           body-path: ${{ runner.temp }}/pr_body.md
           branch: "canary/comet-${{ steps.success.outputs.short_digest }}"
           delete-branch: true
+
+      # Merges exactly the commit this run validated and tested.
+      - name: Merge the validated bump
+        if: steps.cpr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.cpr.outputs.pull-request-number }}
+          HEAD_SHA: ${{ steps.cpr.outputs.pull-request-head-sha }}
+        run: gh pr merge "$PR" --squash --delete-branch --match-head-commit "$HEAD_SHA"
 
       - name: File drift issue
         if: steps.digests.outputs.remote_digest != steps.digests.outputs.tested_digest && steps.run_validation.outputs.failed == '1'

@@ -1,24 +1,15 @@
 version: 2
 
-updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "08:45"
-      timezone: "America/Los_Angeles"
-    labels:
-      - "dependencies"
-      - "github-actions"
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "build"
-    groups:
-      actions-dependencies:
-        patterns:
-          - "*"
+# Dependabot watches only the images the stack runs. Python packages and GitHub Actions are
+# development tooling and are updated by hand. Comet is not here: the Comet Canary workflow
+# validates the patches against each new Comet release and bumps vendor/comet.lock.json.
+#
+# Merging never deploys: the live host runs whatever was last pulled and started.
 
+updates:
+  # The optional Stremio server. Its patches are applied at build time and fail the build when
+  # an essential anchor is gone, so CI's image build is a real check: these PRs merge on their
+  # own once CI passes (see the automerge job in .github/workflows/ci.yml).
   - package-ecosystem: "docker"
     directory: "/docker/stremio"
     schedule:
@@ -37,9 +28,10 @@ updates:
         patterns:
           - "*"
 
-  # Digest-pinned compose images, gluetun included: the watchdog depends on
-  # details of that image, so its releases are reviewed like the others.
-  # Comet's digest is promoted by `./stremio comet update`.
+  # Digest-pinned compose images, gluetun included: the watchdog depends on details of that
+  # image, and nginx fronts the public gateway. CI does not run these images yet, so a passing
+  # check proves nothing about them: these PRs wait for review, and the opt-in Docker suites
+  # (tests/*_docker.py, STREMIOGUARD_DOCKER_TESTS=1) are the way to test one.
   - package-ecosystem: "docker-compose"
     directory: "/"
     schedule:
@@ -66,23 +58,3 @@ updates:
       # A Postgres major needs pg_upgrade on the data directory, not a new image.
       - dependency-name: "postgres"
         update-types: ["version-update:semver-major"]
-
-  # uv, not pip: the pip ecosystem bumps pyproject.toml but leaves uv.lock
-  # stale, so every merged update needed a manual relock.
-  - package-ecosystem: "uv"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:15"
-      timezone: "America/Los_Angeles"
-    labels:
-      - "dependencies"
-      - "python"
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "build"
-    groups:
-      python-dependencies:
-        patterns:
-          - "*"

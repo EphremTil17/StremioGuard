@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ gluetun, main ]
 
+# Read-only unless a job asks for more; only the automerge job does.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Lint, Type Check, Test & Validate
@@ -43,3 +47,76 @@ jobs:
           TESTED_DIGEST=$(jq -r '.tested_digest' vendor/comet.lock.json)
           docker pull "$IMAGE@$TESTED_DIGEST"
           uv run python -m stremioguard.comet.validate --image "$IMAGE@$TESTED_DIGEST"
+
+  # The Stremio server's patches are applied while the image builds, and an essential patch whose
+  # anchor is gone fails the build (docker/stremio/patch-server.js). Building is therefore the
+  # check that a new Stremio base image still takes the patches.
+  stremio-image:
+    name: Build the Stremio image with its patches
+    runs-on: ubuntu-latest
+    outputs:
+      built: ${{ steps.build.outcome }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check whether this change touches the Stremio image
+        id: changed
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then base=$PR_BASE; head=$PR_HEAD; else base=$PUSH_BEFORE; head=$PUSH_AFTER; fi
+          # An unknown base (a new branch, a force push) builds rather than guesses.
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$base" "$head" -- docker/stremio | grep -q .; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build docker/stremio with its patches
+        id: build
+        if: steps.changed.outputs.touched == 'true'
+        run: docker build --pull -f docker/stremio/Dockerfile -t stremioguard-stremio:ci .
+
+  # Merges a Dependabot update of the Stremio base image once both jobs above have passed. It
+  # runs after them (`needs`), so it does not depend on branch protection settings, and it
+  # merges only the exact commit that was tested. Anything else Dependabot opens, such as the
+  # compose images that CI does not run, waits for review.
+  automerge:
+    name: Merge a passing Dependabot Stremio update
+    needs: [check, stremio-image]
+    if: >-
+      github.event_name == 'pull_request'
+      && github.actor == 'dependabot[bot]'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && needs.stremio-image.outputs.built == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Merge if the update changes only the Stremio Dockerfile
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          files=$(gh pr view "$PR" --repo "$REPO" --json files --jq '.files[].path')
+          printf 'Changed files:\n%s\n' "$files"
+          # Exactly one file, the Stremio Dockerfile; anything else waits for review.
+          if [ "$files" != "docker/stremio/Dockerfile" ]; then
+            echo "Not a Stremio-only update; leaving it for review."
+            exit 0
+          fi
+          gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$HEAD_SHA"
