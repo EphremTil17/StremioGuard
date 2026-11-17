@@ -149,7 +149,7 @@ def _install_apt_packages(
 
 def _install_hint(missing: list[str]) -> str:
     if "docker" in missing:
-        return "Install Docker with Compose support inside WSL, then retry."
+        return "Install Docker and its Compose plugin, then retry."
     return "Install the missing command(s), then retry."
 
 

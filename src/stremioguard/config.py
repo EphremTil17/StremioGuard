@@ -253,9 +253,9 @@ def docker_permission_help(output: str) -> str | None:
     return (
         "Permission error: Docker is installed, but this user is not authorized to run it "
         "without sudo permissions.\n"
-        "Try `docker ps` to confirm, then add your user to the `docker` group or "
-        "enable Docker Desktop WSL integration for this distro. After changing group "
-        "membership, start a fresh shell or restart WSL and try again.\n"
+        "Try `docker ps` to confirm, then add your user to the `docker` group or use "
+        "rootless Docker (docs/rootless-docker.md). After changing group membership, log "
+        "out and back in, then try again.\n"
         "If you need a one-off bypass, run `sudo ./stremio`."
     )
 

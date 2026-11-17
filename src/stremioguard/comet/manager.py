@@ -1576,8 +1576,8 @@ class CometManager:
         if not self.host_healthcheck():
             self.warn(
                 "Host-side /health probe did not respond at "
-                f"{self.base_url_for_checks()}/health. This can happen on WSL or "
-                "multi-interface hosts even when container health is fine."
+                f"{self.base_url_for_checks()}/health. This can happen on multi-interface "
+                "hosts even when container health is fine."
             )
 
         gateway_config = self.gateway_config()

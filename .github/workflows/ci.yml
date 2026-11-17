@@ -89,7 +89,7 @@ jobs:
 
   # Merges a Dependabot update of the Stremio base image once both jobs above have passed. It
   # runs after them (`needs`), so it does not depend on branch protection settings, and it
-  # merges only the exact commit that was tested. Anything else Dependabot opens, such as the
+  # merges only the exact commit that was tested, then deletes Dependabot's branch. Anything else Dependabot opens, such as the
   # compose images that CI does not run, waits for review.
   automerge:
     name: Merge a passing Dependabot Stremio update
@@ -111,6 +111,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           files=$(gh pr view "$PR" --repo "$REPO" --json files --jq '.files[].path')
           printf 'Changed files:\n%s\n' "$files"
@@ -120,3 +121,9 @@ jobs:
             exit 0
           fi
           gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$HEAD_SHA"
+          # Delete the branch through the API: this job has no checkout for a local delete.
+          if gh api -X DELETE "repos/$REPO/git/refs/heads/$HEAD_REF" > /dev/null 2>&1; then
+            echo "Deleted branch $HEAD_REF."
+          else
+            echo "Branch $HEAD_REF was already gone, or could not be deleted."
+          fi

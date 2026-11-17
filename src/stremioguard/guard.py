@@ -1072,7 +1072,7 @@ class GluetunGuard:
             raise RuntimeError(
                 f".env not found at {self._env_path}. Run `./stremio init` for guided "
                 "first-time setup, or copy .env.example to .env and populate the "
-                "chosen VPN credentials manually (see README.md → First-time setup)."
+                "chosen VPN credentials manually (see docs/setup.md)."
             )
         self.check_vpn_lockout(allow_recovery=allow_recovery)
         self.check_bind_addresses()
