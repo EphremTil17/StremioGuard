@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 CONTAINER_PREFIX = os.environ.get("STREMIOGUARD_DOCKER_TEST_PREFIX", "sgfix11-")
-NGINX_IMAGE = "nginx@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11"
+NGINX_IMAGE = "nginx@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72"
 DEFAULT_COMET_IMAGE = (
     "g0ldyy/comet@sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea"
 )

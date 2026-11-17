@@ -27,7 +27,7 @@ from tests.conftest import make_comet_config
 
 PREFIX = os.environ.get("STREMIOGUARD_DOCKER_TEST_PREFIX", "sgfix8-")
 REPO_ROOT = Path(__file__).resolve().parent.parent
-POSTGRES_IMAGE = "postgres@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395"
+POSTGRES_IMAGE = "postgres@sha256:9ba53c7d41ea093baf5c1ba635ba5434c4f979880527d49bb7d9237d3193085b"
 COMET_IMAGE = "g0ldyy/comet@sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea"
 BUSYBOX_IMAGE = "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
 

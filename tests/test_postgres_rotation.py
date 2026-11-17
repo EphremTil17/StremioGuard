@@ -24,7 +24,7 @@ from stremioguard.stacklock import stack_lock
 from tests.conftest import FakeRunner, completed, make_comet_config
 
 PINNED_PG_IMAGE = (
-    "postgres:18.6-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395"
+    "postgres:18.6-alpine@sha256:9ba53c7d41ea093baf5c1ba635ba5434c4f979880527d49bb7d9237d3193085b"
 )
 
 
