@@ -154,15 +154,30 @@ def test_error_text_keeps_no_url_path_query_or_userinfo(scrubber: types.ModuleTy
 
 
 def test_noted_config_keys_are_masked_in_every_form(scrubber: types.ModuleType) -> None:
-    key = "sg/caller+key=1&x"
-    scrubber._sg_note_secret_values([key, "short", None, 42])
-    line = (
-        f"raw {key} quoted {urllib.parse.quote(key, safe='')} "
-        f"plus {urllib.parse.quote_plus(key)} short\n"
-    )
+    key = "sg/caller+KEY=0001xyz"
+    scrubber._sg_note_secret_values([key, None, 42])
+    quoted = urllib.parse.quote(key, safe="")
+    mixed = quoted.replace("%2F", "%2f")
+    line = f"raw {key} quoted {quoted} plus {urllib.parse.quote_plus(key)} mixed {mixed}\n"
     out = _sink_output(scrubber, line)
-    assert "caller" not in out and "sg%2F" not in out
-    assert out == "raw ******** quoted ******** plus ******** short\n"
+    assert "caller" not in out
+    assert out == "raw ******** quoted ******** plus ******** mixed ********\n"
+
+
+def test_only_key_shaped_config_values_are_noted(scrubber: types.ModuleType) -> None:
+    """A config's author must not be able to blank out ordinary log text."""
+    scrubber._sg_note_secret_values(
+        [
+            "ConnectionError",  # a word under the minimum length
+            "rate limited by the upstream",  # spaces
+            "https://torrentio.strem.fun",  # a URL
+            "password&query=x1234567",  # characters no key uses
+            "x" * 300,  # longer than any key
+        ]
+    )
+    assert scrubber._sg_noted == {}
+    line = "rate limited by the upstream https://torrentio.strem.fun ConnectionError"
+    assert _sink_output(scrubber, line) == line
 
 
 def test_noted_keys_are_bounded_and_the_least_recently_seen_is_dropped(
@@ -170,10 +185,41 @@ def test_noted_keys_are_bounded_and_the_least_recently_seen_is_dropped(
 ) -> None:
     # Room for two keys (a plain key's quoted forms are the key itself).
     monkeypatch.setattr(scrubber, "_SG_MAX_NOTED_SECRETS", 2)
-    scrubber._sg_note_secret_values(["sgcallerKEY0001"])
-    scrubber._sg_note_secret_values(["sgcallerKEY0002"])
-    scrubber._sg_note_secret_values(["sgcallerKEY0001"])  # seen again: now the most recent
-    scrubber._sg_note_secret_values(["sgcallerKEY0003"])
+    scrubber._sg_note_secret_values(["sgcallerKEY000001"])
+    scrubber._sg_note_secret_values(["sgcallerKEY000002"])
+    scrubber._sg_note_secret_values(["sgcallerKEY000001"])  # seen again: now the most recent
+    scrubber._sg_note_secret_values(["sgcallerKEY000003"])
     assert len(scrubber._sg_noted) == 2
-    out = _sink_output(scrubber, "sgcallerKEY0001 sgcallerKEY0002 sgcallerKEY0003")
-    assert out == "******** sgcallerKEY0002 ********"
+    out = _sink_output(scrubber, "sgcallerKEY000001 sgcallerKEY000002 sgcallerKEY000003")
+    assert out == "******** sgcallerKEY000002 ********"
+
+
+def test_server_secrets_match_escapes_in_any_case(
+    scrubber: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TORBOX_API_KEY", "sg/canary+key=1")
+    out = _sink_output(
+        scrubber, "a sg%2Fcanary%2Bkey%3D1 b sg%2fcanary%2bkey%3d1 c sg%2Fcanary%2bkey%3D1"
+    )
+    assert out == "a ******** b ******** c ********"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        # A password holding a raw "/" ends the host part early: masked whole.
+        ("x https://user:pa/ss=word@example.com/dl/v.mkv y", "x https://******** y"),
+        # Punctuation in a password no longer ends the URL.
+        ("x https://user:pa(ss)'w@example.com/x y", "x https://example.com y"),
+        ("x https://user:pass@example.com:8443/x?k=v y", "x https://example.com:8443 y"),
+        # An "@" after the host: the authority is ambiguous, masked whole.
+        ("x https://host/a?email=me@example.org y", "x https://******** y"),
+        # Closing punctuation of the surrounding text is kept.
+        ("(https://torrentio.strem.fun/a/b?c=d)", "(https://torrentio.strem.fun)"),
+        ("url='https://cdn.example/dl/k/v.mkv?token=k',", "url='https://cdn.example',"),
+    ],
+)
+def test_urls_never_show_anything_from_before_an_at_sign(
+    scrubber: types.ModuleType, line: str, expected: str
+) -> None:
+    assert scrubber._SG_URL.sub(scrubber._sg_origin_only, line) == expected

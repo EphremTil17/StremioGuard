@@ -235,6 +235,11 @@ try:
     raise RuntimeError("failed for " + key)
 except RuntimeError:
     logging.getLogger("aiohttp.client").exception("library traceback")
+# A password holding a raw "/" or "(" must not end the URL before its "@".
+half = len(key) // 2
+logging.getLogger("aiohttp.client").error(
+    "connect https://user:%s/%s@cdn.example/x and https://user:%s(%s@cdn.example/y",
+    key[:half], key[half:], key[:half], key[half:])
 comet_logger.logger.complete()
 time.sleep(0.5)
 """
@@ -250,6 +255,11 @@ def test_library_logging_goes_through_the_scrubber(sources: tuple[str, Path, Pat
         patched_out
     )
     assert "aiohttp.client: library traceback" in patched_out
+    # Neither half of the key, which the whole-key mask cannot catch, is shown.
+    key = CANARIES["TORBOX_API_KEY"]
+    half = len(key) // 2
+    assert key[:half] not in patched_out and key[half:] not in patched_out
+    assert "connect https://******** and https://cdn.example" in patched_out
 
 
 STREAM_PROBE = r"""

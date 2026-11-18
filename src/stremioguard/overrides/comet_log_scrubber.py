@@ -36,13 +36,25 @@ _SG_SECRET_SUFFIXES = frozenset(
 # Shorter values are left alone: masking them would garble ordinary text.
 _SG_MIN_SECRET_LENGTH = 8
 _SG_WITHHELD = "[StremioGuard withheld a log line: secret scrubbing failed]\n"
-_SG_URL = _sg_re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^\s/?#'\"<>()\[\]]*)[^\s'\"<>()\[\]]*")
+# A URL runs to the next whitespace: a password may hold any other character
+# (`/`, `(`, quotes), so stopping earlier would print the rest of the URL as is.
+_SG_URL = _sg_re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://(\S*)")
+# Closing punctuation the surrounding text put after a URL, kept in the output.
+_SG_URL_TRAILERS = "'\")]>,;"
+# Percent-escapes in either case; a line's escapes are upper-cased before
+# matching, so `%2f`, `%2F` and any mix match the one quoted form kept.
+_SG_ESCAPE = _sg_re.compile(r"%[0-9A-Fa-f]{2}")
 _sg_secret_forms: tuple[str, ...] = ()
 _sg_secrets_final = False
 # Secrets from parsed addon configs, most recently seen last. Bounded so that
 # a stream of distinct configs cannot grow memory or the per-line scan; the
-# least recently seen is dropped first. A self-hosted instance sees a handful.
-_SG_MAX_NOTED_SECRETS = 512
+# least recently seen is dropped first. A self-hosted instance sees a handful,
+# and every request notes its own config's keys again before it logs anything.
+_SG_MAX_NOTED_SECRETS = 2048
+# Only key-shaped values from a config are masked: a config is written by its
+# user, who could otherwise blank out ordinary words or URLs in every log line.
+# Debrid API keys are long runs of letters, digits and a little punctuation.
+_SG_NOTED_SHAPE = _sg_re.compile(r"\A[A-Za-z0-9._~+/=-]{16,256}\Z")
 _sg_noted = {}
 _sg_noted_forms: tuple[str, ...] = ()
 _sg_noted_lock = _sg_threading.Lock()
@@ -70,6 +82,22 @@ def _sg_add_url_password(found, url):
         found.add(_sg_parse.unquote(password))
 
 
+def _sg_upper_escapes(text):
+    return _SG_ESCAPE.sub(lambda m: m.group(0).upper(), text) if "%" in text else text
+
+
+def _sg_forms(value):
+    """A secret as it may appear in a line: raw and percent-encoded.
+
+    Matched against a line whose escapes are upper-cased (`_sg_scrub`), so a
+    raw secret that itself holds an escape-like `%2f` is kept in that form too.
+    """
+    return {
+        _sg_upper_escapes(form)
+        for form in (value, _sg_parse.quote(value, safe=""), _sg_parse.quote_plus(value))
+    }
+
+
 def _sg_current_secrets():
     # Comet's settings module imports this one, so settings are read lazily,
     # and the set is final only once the API token has been resolved.
@@ -93,7 +121,7 @@ def _sg_current_secrets():
     forms = set()
     for value in found:
         if len(value) >= _SG_MIN_SECRET_LENGTH:
-            forms.update((value, _sg_parse.quote(value, safe=""), _sg_parse.quote_plus(value)))
+            forms.update(_sg_forms(value))
     _sg_secret_forms = tuple(sorted(forms, key=len, reverse=True))
     _sg_secrets_final = final
     return _sg_secret_forms
@@ -104,8 +132,8 @@ def _sg_note_secret_values(values):
     global _sg_noted_forms
     forms = []
     for value in values:
-        if isinstance(value, str) and len(value) >= _SG_MIN_SECRET_LENGTH:
-            forms.extend((value, _sg_parse.quote(value, safe=""), _sg_parse.quote_plus(value)))
+        if isinstance(value, str) and _SG_NOTED_SHAPE.match(value):
+            forms.extend(sorted(_sg_forms(value)))
     if not forms:
         return
     with _sg_noted_lock:
@@ -124,6 +152,7 @@ def _sg_note_secret_values(values):
 
 
 def _sg_scrub(text):
+    text = _sg_upper_escapes(text)
     for secret in _sg_current_secrets():
         if secret in text:
             text = text.replace(secret, _SG_MASK)
@@ -150,7 +179,18 @@ def _sg_scrubbed_sink(target):
 
 
 def _sg_origin_only(match):
-    return f"{match.group(1)}://{match.group(2).rsplit('@', 1)[-1]}"
+    """A URL cut to its scheme and host; never anything from before an `@`.
+
+    An `@` after the host part (in the path, or in a password holding a raw
+    `/`, `?` or `#`) makes the authority ambiguous, so the whole URL is masked.
+    """
+    token = match.group(2)
+    core = token.rstrip(_SG_URL_TRAILERS)
+    suffix = token[len(core) :]
+    authority = _sg_re.split(r"[/?#]", core, maxsplit=1)[0]
+    if "@" in core[len(authority) :]:
+        return f"{match.group(1)}://{_SG_MASK}{suffix}"
+    return f"{match.group(1)}://{authority.rsplit('@', 1)[-1]}{suffix}"
 
 
 def _sg_scraper_origin(value):
