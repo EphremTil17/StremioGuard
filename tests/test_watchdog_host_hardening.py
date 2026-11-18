@@ -247,6 +247,7 @@ def _create_localhost_cert(tmp_path: Path) -> tuple[Path, Path]:
         "ff0e::1",
         "2001:db8::1",
         "3fff::1",
+        "3fff:fff:ffff::1",
         "2002:102:304::1",
         "fec0::1",
         "::1.2.3.4",

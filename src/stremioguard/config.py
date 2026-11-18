@@ -132,11 +132,17 @@ CONFIG_ENV_KEYS = (
 )
 
 
+# RFC 9637's IPv6 documentation prefix. Python's ipaddress tables count it as
+# global before 3.13, so it is refused by name on whatever Python runs this.
+IPV6_DOCUMENTATION_3FFF = ipaddress.ip_network("3fff::/20")
+
+
 def parse_public_ip(text: str) -> str | None:
     """Parse ``text`` as a canonical global unicast IPv4 or IPv6 address.
 
     Unwraps ``::ffff:`` IPv4-mapped IPv6 addresses first, then rejects any
-    non-global, multicast, reserved, IPv6 site-local, or zone-suffixed address.
+    non-global, multicast, reserved, IPv6 site-local, documentation
+    (``3fff::/20`` included), or zone-suffixed address.
     """
     candidate = text.strip()
     if not candidate:
@@ -152,7 +158,9 @@ def parse_public_ip(text: str) -> str | None:
             ip = ip.ipv4_mapped
     if not ip.is_global or ip.is_multicast or ip.is_reserved:
         return None
-    if isinstance(ip, ipaddress.IPv6Address) and ip.is_site_local:
+    if isinstance(ip, ipaddress.IPv6Address) and (
+        ip.is_site_local or ip in IPV6_DOCUMENTATION_3FFF
+    ):
         return None
     return str(ip)
 
@@ -520,6 +528,38 @@ def _validate_public_url(value: str | None, *, key: str) -> None:
         raise RuntimeError(f"Invalid {key} value (missing host; expected an absolute HTTP(S) URL)")
 
 
+# An HTTPS origin with an optional plain path: rendered into the gateway's
+# nginx config as a redirect target, so nothing nginx would interpret.
+_PORTAL_URL = re.compile(r"\Ahttps://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~-]+)*/?\Z")
+
+
+def _validate_configure_url(
+    value: str | None, *, public_configure: bool, gateway_public_base_url: str | None
+) -> str | None:
+    """COMET_GATEWAY_CONFIGURE_URL, normalized without a trailing slash."""
+    if not value:
+        return None
+    key = "COMET_GATEWAY_CONFIGURE_URL"
+    if not _PORTAL_URL.match(value):
+        raise RuntimeError(
+            f"Invalid {key} value: expected an HTTPS URL with a plain path and no query, "
+            "such as https://comet-admin.example.com"
+        )
+    if public_configure:
+        raise RuntimeError(
+            f"{key} and COMET_GATEWAY_PUBLIC_CONFIGURE=1 exclude each other: the gateway "
+            "either serves the configure page or redirects to it"
+        )
+    portal_host = urllib.parse.urlsplit(value).netloc.lower()
+    gateway_host = urllib.parse.urlsplit(gateway_public_base_url or "").netloc.lower()
+    if gateway_host and portal_host == gateway_host:
+        raise RuntimeError(
+            f"{key} must be a different host from COMET_GATEWAY_PUBLIC_BASE_URL; "
+            "the gateway would redirect its configure page to itself"
+        )
+    return value.rstrip("/")
+
+
 def _validate_image_repository(value: str, *, key: str) -> str:
     # StremioGuard pins the Comet image by digest itself (`<repo>@<digest>`)
     # and resolves updates against `<repo>:latest`, so a tag or digest baked
@@ -622,6 +662,10 @@ class CometConfig:
     # its login, /static/) publicly. Off by default: the configure page is a
     # management surface, reachable through COMET_HOST_PORT on the host.
     gateway_public_configure: bool = False
+    # Where the owner opens the configure page instead (an HTTPS URL behind
+    # its own login, such as a Cloudflare Access application); the gateway's
+    # configure addresses redirect there. Only without the public configure page.
+    gateway_configure_url: str | None = None
     # Log files outside StremioGuard (e.g. a reverse proxy's) that the log
     # canary must also verify.
     log_canary_globs: tuple[str, ...] = ()
@@ -690,6 +734,11 @@ class CometConfig:
         )
         gateway_public_configure = env_flag_enabled(
             "COMET_GATEWAY_PUBLIC_CONFIGURE", False, env_path=env_file
+        )
+        gateway_configure_url = _validate_configure_url(
+            (env_file_value(env_file, "COMET_GATEWAY_CONFIGURE_URL") or "").strip() or None,
+            public_configure=gateway_public_configure,
+            gateway_public_base_url=env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL"),
         )
         log_canary_globs = tuple(
             item.strip()
@@ -800,6 +849,7 @@ class CometConfig:
             gateway_token_length=gateway_token_length,
             gateway_enabled=gateway_enabled,
             gateway_public_configure=gateway_public_configure,
+            gateway_configure_url=gateway_configure_url,
             log_canary_globs=log_canary_globs,
             scrape_torbox=scrape_torbox,
             torbox_api_key=torbox_api_key,

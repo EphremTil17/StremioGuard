@@ -314,7 +314,7 @@ if patched:
         "100.64.0.1", "0.0.0.0", "::1", "fe80::1", "fd00::1", "::ffff:127.0.0.1",
         "2002:7f00:1::", "224.0.0.1", "2606:4700:4700::1111", "not-an-ip",
         "::127.0.0.1", "::10.0.0.1", "64:ff9b::127.0.0.1", "64:ff9b::10.0.0.1",
-        "64:ff9b:1::1", "::ffff:0:7f00:1", "2001::1", "64:ff9b::808:808"]}))
+        "64:ff9b:1::1", "::ffff:0:7f00:1", "2001::1", "64:ff9b::808:808", "3fff::1"]}))
 
     def _request(peer, client_id=None, extra=()):
         headers = [] if client_id is None else [(b"x-stremioguard-client", client_id.encode())]

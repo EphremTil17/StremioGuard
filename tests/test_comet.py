@@ -1434,6 +1434,7 @@ class CometCliTests(unittest.TestCase):
                         "7",  # max connections
                         "18001",  # gateway port
                         "https://comet.example.com",  # gateway public base URL
+                        "",  # no configure page portal
                     ],
                 ),
                 mock.patch.object(
@@ -1515,6 +1516,7 @@ class CometCliTests(unittest.TestCase):
                         "-1",  # max connections
                         "18001",  # gateway port
                         "https://comet.example.com",  # gateway public base URL
+                        "",  # no configure page portal
                     ],
                 ),
                 mock.patch.object(

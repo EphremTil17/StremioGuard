@@ -111,6 +111,9 @@ class CometGatewayConfig:
     # Serve Comet's configure page (/, /configure, its login, /static/) and the
     # token configure routes. Off: the gateway serves addon routes and /health only.
     public_configure: bool = False
+    # Without the public configure page: where its addresses redirect instead
+    # (the owner's portal behind its own login), or None to refuse them (403).
+    configure_url: str | None = None
 
     @classmethod
     def from_env(
@@ -135,6 +138,7 @@ class CometGatewayConfig:
             token_length=comet.gateway_token_length,
             enabled=comet.gateway_enabled,
             public_configure=comet.gateway_public_configure,
+            configure_url=comet.gateway_configure_url,
         )
 
 
@@ -469,13 +473,42 @@ class CometGatewayManager:
             r'(?:\?\S*)?(?<mrt>\s+\S+)$ "${mrh}${mrt}";'
         )
         public_configure = self.config.public_configure
+        portal = None if public_configure else self.config.configure_url
+        portal_target = f"{portal}/configure" if portal else ""
         # /comet/<token> and /comet/<token>/ redirect to the token's configure
-        # page, which exists only when the configure page is public.
-        bare_token_action = "redirect" if public_configure else "deny"
+        # page when it is public, to the owner's portal when one is set, and
+        # are refused otherwise; the token configure routes likewise.
+        configure_action = "proxy" if public_configure else "portal" if portal else ""
+        bare_token_action = "redirect" if public_configure else "portal" if portal else "deny"
         configure_routes = (
-            f'        "~^(?:{api_prefix})?(?:/{seg})?/configure$" proxy;\n'
-            '        "~^/configure/login$" proxy;\n'
-            if public_configure
+            f'        "~^(?:{api_prefix})?(?:/{seg})?/configure$" {configure_action};\n'
+            f'        "~^/configure/login$" {configure_action};\n'
+            if configure_action
+            else ""
+        )
+        # A valid token's configure address goes to the portal; an invalid
+        # token is refused above, before this, exactly as on any other route.
+        token_portal_redirect = (
+            f"""            if ($comet_route_action = "portal") {{
+                return 302 "{portal_target}";
+            }}
+"""
+            if portal
+            else ""
+        )
+        # The public configure addresses send the owner to the portal; its
+        # login, not the gateway, decides who gets in. /static/ stays refused.
+        portal_locations = (
+            f"""
+        location ~ "^/configure(?:/|$)" {{
+            return 302 "{portal_target}";
+        }}
+
+        location = / {{
+            return 302 "{portal_target}";
+        }}
+"""
+            if portal
             else ""
         )
         public_pages = (
@@ -656,7 +689,7 @@ http {{
             if ($comet_route_action = "redirect") {{
                 return 302 /comet/$gateway_token/configure;
             }}
-            if ($comet_route_action != "proxy") {{
+{token_portal_redirect}            if ($comet_route_action != "proxy") {{
                 rewrite ^ /__sg_forbidden last;
             }}
             if ($raw_comet_path = "") {{
@@ -711,7 +744,7 @@ http {{
             proxy_send_timeout 3600s;
         }}
 
-{root_location}
+{root_location}{portal_locations}
         location / {{
             limit_req zone=gateway_fail burst=3 nodelay;
             deny all;

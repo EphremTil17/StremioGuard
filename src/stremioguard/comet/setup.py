@@ -162,6 +162,21 @@ def prompt_comet_setup(config: CometConfig, is_proxied: bool = False) -> None:
             "COMET_GATEWAY_PUBLIC_BASE_URL",
             gateway_public_base_url.rstrip("/"),
         )
+
+        typer.echo("")
+        typer.echo("Configure page portal:")
+        typer.echo(
+            "Comet's configure page is not served on the public address. If you open it\n"
+            "through a portal behind its own login (for example a Cloudflare Access\n"
+            "application such as https://comet-admin.example.com, see docs/comet-gateway.md),\n"
+            "enter its URL and /configure on the public address will send you there.\n"
+            "Leave blank to refuse it instead (open it through COMET_HOST_PORT on the host)."
+        )
+        configure_url = typer.prompt(
+            "Configure page portal URL (blank for none)",
+            default=gateway_config.configure_url or "",
+        ).strip()
+        write_env_setting(config.env_file, "COMET_GATEWAY_CONFIGURE_URL", configure_url.rstrip("/"))
         write_env_setting(
             config.env_file,
             "COMET_GATEWAY_TOKEN_LENGTH",

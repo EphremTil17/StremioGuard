@@ -18,7 +18,12 @@ ssh -L 18000:127.0.0.1:18000 <server>      # from another machine, then the same
 
 With `COMET_GATEWAY_PUBLIC_BASE_URL` set, the page's install and copy links
 still point at the public gateway URL with the default token.
-`COMET_GATEWAY_PUBLIC_CONFIGURE=1` also serves it publicly, as earlier
+To open it from anywhere, put it behind a portal with its own login (see
+[Owner portal](#owner-portal-cloudflare-access) below) and set
+`COMET_GATEWAY_CONFIGURE_URL`: `/configure`, `/` and the token configure
+addresses on the public address then redirect there, so typing
+`https://comet.example.com/configure` lands on the portal's login.
+`COMET_GATEWAY_PUBLIC_CONFIGURE=1` instead serves it publicly, as earlier
 releases did:
 
 ```text
@@ -234,6 +239,46 @@ Expected results:
 - `./stremio comet doctor` confirms Comet shares gluetun and egresses through
   the VPN
 - `./stremio comet log-canary` passes on every sink
+
+## Owner Portal (Cloudflare Access)
+
+The configure page and Comet's `/admin` dashboard can sit behind a Cloudflare
+Access login on a hostname of their own, while addon traffic and video keep
+going straight to your server. Access only protects traffic Cloudflare
+proxies, and proxying is per hostname: putting Access on a path of the addon
+hostname would send all of its video through Cloudflare. So the portal is a
+second hostname, and the gateway redirects the addon hostname's configure
+addresses to it.
+
+1. In Cloudflare Zero Trust, add a self-hosted application (Public DNS) for
+   `comet-admin.example.com` with a policy that allows only your email.
+2. Route that hostname through a Cloudflare Tunnel on this host to Comet's
+   loopback port, and have the tunnel check the Access token itself, so the
+   page stays closed if the application is ever removed. For a tunnel with a
+   local `config.yml`, above the final catch-all rule:
+
+   ```yaml
+   - hostname: comet-admin.example.com
+     service: http://localhost:18000          # COMET_HOST_PORT
+     originRequest:
+       access:
+         required: true
+         teamName: <your team>                # <team>.cloudflareaccess.com
+         audTag:
+           - <the application's AUD tag>
+   ```
+
+   and a proxied `CNAME` from `comet-admin` to `<tunnel-id>.cfargotunnel.com`.
+   The tunnel must run on the host itself (a rootless container cannot reach
+   the host's loopback).
+3. Set `COMET_GATEWAY_CONFIGURE_URL=https://comet-admin.example.com` and run
+   `./stremio restart`.
+
+The portal must be HTTPS, on a different host from the addon address, and
+cannot be combined with `COMET_GATEWAY_PUBLIC_CONFIGURE=1`. Any portal with
+its own login works the same way (an Authentik proxy, for example). Cloudflare
+terminates TLS for the portal hostname, so it sees what is typed on the
+configure page; the addon hostname stays DNS-only.
 
 ## Request Size and Browser Policies
 

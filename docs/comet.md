@@ -127,7 +127,9 @@ Users keep their own Stremio accounts, while Comet acts as the token-gated
 addon, stream-discovery, and playback relay.
 
 - The configure page is not served through the gateway by default: open it at
-  `http://127.0.0.1:18000/configure` on the host (an SSH tunnel from elsewhere).
+  `http://127.0.0.1:18000/configure` on the host (an SSH tunnel from elsewhere),
+  or behind a login portal that the public `/configure` redirects to
+  (`COMET_GATEWAY_CONFIGURE_URL`, see comet-gateway.md "Owner Portal").
   With `COMET_GATEWAY_PUBLIC_CONFIGURE=1` it stays at
   `https://comet.example.com/configure`, protected by Comet's configure
   password; opening `https://comet.example.com/comet/<token>/configure`

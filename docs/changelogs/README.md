@@ -5,6 +5,7 @@ up to v0.3.53, exist only as tags (`git tag -l 'v*'`).
 
 | Release | Date | About |
 | :-- | :-- | :-- |
+| [v0.4.1](v0.4.1.md) | 2026-11-17 | security release: edge-case hardening across logs, stream proxy, gateway and Stremio; configure page portal redirect |
 | [v0.4.0](v0.4.0.md) | 2026-11-16 | security release: audit fixes, hardened containers, supervised watchdog, automated Comet and Stremio updates |
 
 ## Cutting a release

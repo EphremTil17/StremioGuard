@@ -53,6 +53,8 @@ def safe_proxy_headers(request) -> ProxyRequestHeaders:
 # The well-known NAT64 prefix (RFC 6052) is globally routable, but the IPv4
 # address in its last 32 bits is where a translator would actually connect.
 _NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+# RFC 9637's documentation prefix, global to Python's tables before 3.13.
+_IPV6_DOCUMENTATION_3FFF = ipaddress.ip_network("3fff::/20")
 
 
 def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
@@ -87,6 +89,7 @@ def is_public_address(address: str) -> bool:
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_unspecified
+        or (isinstance(ip, ipaddress.IPv6Address) and ip in _IPV6_DOCUMENTATION_3FFF)
     )
 
 

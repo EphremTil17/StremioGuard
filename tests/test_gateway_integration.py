@@ -306,6 +306,16 @@ def default_gateway_harness(tmp_path_factory: pytest.TempPathFactory) -> Iterato
         yield harness
 
 
+@pytest.fixture(scope="module")
+def portal_gateway_harness(tmp_path_factory: pytest.TempPathFactory) -> Iterator[GatewayHarness]:
+    """The gateway sending its configure addresses to the owner's portal."""
+    with _running_harness(
+        tmp_path_factory.mktemp("sgfix11-portal"),
+        "COMET_GATEWAY_CONFIGURE_URL=https://admin.example.com\n",
+    ) as harness:
+        yield harness
+
+
 @contextmanager
 def _running_harness(tmp_root: Path, extra_env: str) -> Iterator[GatewayHarness]:
     (tmp_root / ".env").write_text(
@@ -1198,3 +1208,46 @@ def test_ac15_every_response_carries_one_content_and_permissions_policy(
             "camera=(), microphone=(), geolocation=(), payment=(), usb=(), browsing-topics=()"
         ], target
         time.sleep(0.4)
+
+
+def test_ac16_configure_addresses_redirect_to_the_owners_portal(
+    portal_gateway_harness: GatewayHarness,
+) -> None:
+    """With COMET_GATEWAY_CONFIGURE_URL, every configure address leads to the portal."""
+    harness = portal_gateway_harness
+    api = TEST_API_TOKEN
+    time.sleep(1.0)
+    harness.clear_records()
+    portal = "https://admin.example.com/configure"
+    login = {
+        "method": "POST",
+        "headers": ["Content-Type: application/x-www-form-urlencoded"],
+        "body": "password=test-password",
+    }
+    redirected = [
+        {"target": "/configure"},
+        {"target": "/configure/"},
+        {**login, "target": "/configure/login"},
+        {"target": "/"},
+        {"target": f"/comet/{TOKEN_A}/configure"},
+        {"target": f"/comet/{TOKEN_A}/s/{api}/{TEST_CONFIG_BLOB}/configure"},
+        {**login, "target": f"/comet/{TOKEN_A}/configure/login"},
+        {"target": f"/comet/{TOKEN_A}"},
+        {"target": f"/comet/{TOKEN_A}/"},
+    ]
+    results = harness.curl_batch(redirected)
+    assert [(r["status"], r["location"]) for r in results] == [(302, portal)] * len(redirected)
+
+    # An invalid token is refused, never redirected; /static/ stays refused.
+    time.sleep(1.0)
+    refused = harness.curl_batch(
+        [{"target": "/comet/NotAT0ken/configure"}, {"target": "/static/x.js"}]
+    )
+    assert [r["status"] for r in refused] == [403, 403], refused
+    assert harness.fetch_records() == [], "a configure request reached Comet"
+
+    # Addon routes and health are untouched.
+    allowed = harness.curl_batch(
+        [{"target": f"/comet/{TOKEN_A}/s/{api}/manifest.json"}, {"target": "/health"}]
+    )
+    assert [r["status"] for r in allowed] == [200, 200], allowed

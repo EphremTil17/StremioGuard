@@ -1590,3 +1590,78 @@ class TestConfigurePageAndEdgeLimits:
         # Inherited by every location: none sets its own add_header.
         server = rendered.split("server {", 1)[1]
         assert "add_header" not in server
+
+
+class TestConfigurePortal:
+    """COMET_GATEWAY_CONFIGURE_URL: the public configure addresses lead to the owner's portal."""
+
+    def _env(self, tmp_path: Path, extra: str) -> Path:
+        (tmp_path / ".env").write_text(
+            "COMET_ENABLED=1\nCOMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.com\n" + extra,
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_reads_and_normalizes_the_portal_url(self, tmp_path: Path) -> None:
+        root = self._env(tmp_path, "COMET_GATEWAY_CONFIGURE_URL=https://admin.example.com/\n")
+        assert CometGatewayConfig.from_env(root).configure_url == "https://admin.example.com"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://admin.example.com",  # the configure password must not cross plain HTTP
+            "https://admin.example.com/?next=1",
+            "https://admin.example.com/a b",
+            'https://admin.example.com/";return 200 "x',
+            "https://user:pw@admin.example.com",
+            "admin.example.com",
+        ],
+    )
+    def test_rejects_anything_but_a_plain_https_url(self, tmp_path: Path, value: str) -> None:
+        root = self._env(tmp_path, f"COMET_GATEWAY_CONFIGURE_URL={value}\n")
+        with pytest.raises(RuntimeError, match="COMET_GATEWAY_CONFIGURE_URL"):
+            CometGatewayConfig.from_env(root)
+
+    def test_rejects_a_portal_on_the_gateways_own_host(self, tmp_path: Path) -> None:
+        root = self._env(tmp_path, "COMET_GATEWAY_CONFIGURE_URL=https://comet.example.com/admin\n")
+        with pytest.raises(RuntimeError, match="different host"):
+            CometGatewayConfig.from_env(root)
+
+    def test_excludes_the_public_configure_page(self, tmp_path: Path) -> None:
+        root = self._env(
+            tmp_path,
+            "COMET_GATEWAY_PUBLIC_CONFIGURE=1\n"
+            "COMET_GATEWAY_CONFIGURE_URL=https://admin.example.com\n",
+        )
+        with pytest.raises(RuntimeError, match="exclude each other"):
+            CometGatewayConfig.from_env(root)
+
+    def test_renders_redirects_for_every_configure_address(self, tmp_path: Path) -> None:
+        manager = CometGatewayManager(
+            make_comet_gateway_config(
+                tmp_path, public_configure=False, configure_url="https://admin.example.com"
+            )
+        )
+        manager.add_token("Shared Addon")
+        rendered = manager.render_nginx_conf()
+        route_map = rendered.split("map $raw_comet_path $comet_route_action {", 1)[1]
+        route_map = route_map.split("\n    }", 1)[0]
+        assert '""  portal;' in route_map and '"/" portal;' in route_map
+        assert '/configure$" portal;' in route_map and '"~^/configure/login$" portal;' in route_map
+        assert "proxy;" in route_map  # addon routes still proxied
+        target = 'return 302 "https://admin.example.com/configure";'
+        assert rendered.count(target) == 3  # token routes, /configure..., and /
+        comet_location = rendered.split("location ^~ /comet/ {", 1)[1].split("\n        }", 1)[0]
+        # An invalid token is refused before any redirect is considered.
+        assert comet_location.index("$token_valid = 0") < comet_location.index('"portal"')
+        assert comet_location.index('"portal"') < comet_location.index('!= "proxy"')
+        assert 'location ~ "^/configure(?:/|$)" {' in rendered
+        assert "static/" not in rendered.split("server {", 1)[1].split("location = /__sg_alive")[0]
+
+    def test_public_configure_ignores_a_portal(self, tmp_path: Path) -> None:
+        manager = CometGatewayManager(
+            make_comet_gateway_config(
+                tmp_path, public_configure=True, configure_url="https://admin.example.com"
+            )
+        )
+        assert "admin.example.com" not in manager.render_nginx_conf()
