@@ -618,6 +618,10 @@ class CometConfig:
     gateway_public_base_url: str | None = None
     gateway_token_length: int = 8
     gateway_enabled: bool = False
+    # Whether the gateway also serves Comet's configure page (/, /configure,
+    # its login, /static/) publicly. Off by default: the configure page is a
+    # management surface, reachable through COMET_HOST_PORT on the host.
+    gateway_public_configure: bool = False
     # Log files outside StremioGuard (e.g. a reverse proxy's) that the log
     # canary must also verify.
     log_canary_globs: tuple[str, ...] = ()
@@ -683,6 +687,9 @@ class CometConfig:
         gateway_public_base_url = env_file_value(env_file, "COMET_GATEWAY_PUBLIC_BASE_URL") or None
         gateway_token_length = env_int_value(
             env_file, "COMET_GATEWAY_TOKEN_LENGTH", 8, minimum=8, maximum=32
+        )
+        gateway_public_configure = env_flag_enabled(
+            "COMET_GATEWAY_PUBLIC_CONFIGURE", False, env_path=env_file
         )
         log_canary_globs = tuple(
             item.strip()
@@ -792,6 +799,7 @@ class CometConfig:
             gateway_public_base_url=gateway_public_base_url,
             gateway_token_length=gateway_token_length,
             gateway_enabled=gateway_enabled,
+            gateway_public_configure=gateway_public_configure,
             log_canary_globs=log_canary_globs,
             scrape_torbox=scrape_torbox,
             torbox_api_key=torbox_api_key,

@@ -1111,7 +1111,8 @@ def test_ac11_apply_gateway_config_branches(tmp_path: Path) -> None:
 
     (tmp_path / ".env").write_text("COMET_ENABLED=1\nCOMET_GATEWAY_ENABLED=1\n", encoding="utf-8")
     cfg = make_comet_config(tmp_path, gateway_enabled=True)
-    gw_cfg = make_comet_gateway_config(tmp_path, enabled=True)
+    # As the .env above says: the configure page is not public by default.
+    gw_cfg = make_comet_gateway_config(tmp_path, enabled=True, public_configure=False)
 
     from stremioguard.comet_gateway import GATEWAY_CONFIG_DIR, CometGatewayManager
 

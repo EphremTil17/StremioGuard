@@ -28,6 +28,15 @@ class TestCometGatewayConfig:
         assert config.host_port == 18001
         assert config.bind_addresses == ("127.0.0.1",)
         assert config.token_length == 8
+        # The configure page is a management surface: not public unless asked.
+        assert config.public_configure is False
+
+    def test_public_configure_is_opt_in(self, tmp_path: Path) -> None:
+        for value, expected in (("1", True), ("yes", True), ("0", False), ("", False)):
+            (tmp_path / ".env").write_text(
+                f"COMET_ENABLED=1\nCOMET_GATEWAY_PUBLIC_CONFIGURE={value}\n", encoding="utf-8"
+            )
+            assert CometGatewayConfig.from_env(tmp_path).public_configure is expected, value
 
     def test_reads_env_values(self, tmp_path: Path) -> None:
         (tmp_path / ".env").write_text(
@@ -1502,3 +1511,82 @@ def test_rendered_gateway_hides_its_version_and_sets_security_headers(tmp_path: 
     # A location with its own add_header would silently drop the inherited ones.
     servers = conf.split("    server {", 1)[1]
     assert "add_header" not in servers
+
+
+class TestConfigurePageAndEdgeLimits:
+    """The configure page is opt-in; every mode limits bodies and sets browser policies."""
+
+    def _render(self, tmp_path: Path, *, public_configure: bool) -> str:
+        manager = CometGatewayManager(
+            make_comet_gateway_config(tmp_path, public_configure=public_configure)
+        )
+        manager.add_token("Shared Addon")
+        return manager.render_nginx_conf()
+
+    def test_default_serves_no_configure_page(self, tmp_path: Path) -> None:
+        rendered = self._render(tmp_path, public_configure=False)
+        route_map = rendered.split("map $raw_comet_path $comet_route_action {", 1)[1]
+        route_map = route_map.split("\n    }", 1)[0]
+        # No configure or login route under a token, and the bare token URL,
+        # which redirects to the token's configure page, is denied instead.
+        assert "configure" not in route_map
+        assert '""  deny;' in route_map and '"/" deny;' in route_map
+        assert "redirect" not in route_map
+        # The only public page is /health; no root page, no /configure, no /static/.
+        assert 'location ~ "^/(?:health(?:/|$))" {' in rendered
+        assert "location = / {" not in rendered
+        assert "static/" not in rendered.split("server {", 1)[1].split("location = /__sg_alive")[0]
+        assert "return 302" in rendered  # the template line stays, unreachable
+        # Addon routes are unchanged.
+        assert '/manifest\\.json$" proxy;' in route_map
+        assert "/playback/" in route_map
+
+    def test_public_configure_serves_the_page_and_its_token_routes(self, tmp_path: Path) -> None:
+        rendered = self._render(tmp_path, public_configure=True)
+        route_map = rendered.split("map $raw_comet_path $comet_route_action {", 1)[1]
+        route_map = route_map.split("\n    }", 1)[0]
+        assert '""  redirect;' in route_map
+        assert '/configure$" proxy;' in route_map
+        assert '"~^/configure/login$" proxy;' in route_map
+        assert 'location ~ "^/(?:configure(?:/|$)|static/|health(?:/|$))" {' in rendered
+        assert "location = / {" in rendered
+
+    @pytest.mark.parametrize("public_configure", [False, True])
+    def test_bodies_are_capped_once_for_every_location(
+        self, tmp_path: Path, public_configure: bool
+    ) -> None:
+        rendered = self._render(tmp_path, public_configure=public_configure)
+        assert re.findall(r"client_max_body_size \S+;", rendered) == [
+            f"client_max_body_size {gateway_mod.GATEWAY_MAX_BODY_SIZE};"
+        ]
+        # Set at http level, so no location can inherit nginx's default or 0.
+        http_block = rendered.split("http {", 1)[1]
+        assert http_block.index("client_max_body_size") < http_block.index("server {")
+
+    @pytest.mark.parametrize(
+        ("public_configure", "csp"),
+        [
+            (
+                False,
+                "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            ),
+            (
+                True,
+                "frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'",
+            ),
+        ],
+    )
+    def test_browser_policies_replace_any_from_comet(
+        self, tmp_path: Path, public_configure: bool, csp: str
+    ) -> None:
+        rendered = self._render(tmp_path, public_configure=public_configure)
+        assert f'add_header Content-Security-Policy "{csp}" always;' in rendered
+        assert (
+            'add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), '
+            'payment=(), usb=(), browsing-topics=()" always;'
+        ) in rendered
+        assert "proxy_hide_header Content-Security-Policy;" in rendered
+        assert "proxy_hide_header Permissions-Policy;" in rendered
+        # Inherited by every location: none sets its own add_header.
+        server = rendered.split("server {", 1)[1]
+        assert "add_header" not in server

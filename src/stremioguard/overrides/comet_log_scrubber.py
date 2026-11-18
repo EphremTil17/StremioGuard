@@ -9,6 +9,11 @@ scheme and host first, so no library output reaches stderr around the sinks.
 Scraper error lines use `_sg_scraper_origin` and `_sg_describe_error`, which
 never print a bare API key and cut every URL to its scheme and host.
 
+Besides the server's own secrets, the debrid keys of the addon configs Comet
+has recently parsed are masked too (`_sg_note_secret_values`, called by the
+config validation override): a user's config can carry a key the server does
+not know, and an error message can quote it.
+
 This file is source text for Comet, not a StremioGuard module: it must stay
 self-contained (standard library only, no `from __future__` import), and it
 is read, not imported, when the bundle is rendered.
@@ -18,6 +23,7 @@ import logging as _sg_logging
 import os as _sg_os
 import re as _sg_re
 import sys as _sg_sys
+import threading as _sg_threading
 import traceback as _sg_traceback
 import urllib.parse as _sg_parse
 
@@ -33,6 +39,13 @@ _SG_WITHHELD = "[StremioGuard withheld a log line: secret scrubbing failed]\n"
 _SG_URL = _sg_re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^\s/?#'\"<>()\[\]]*)[^\s'\"<>()\[\]]*")
 _sg_secret_forms: tuple[str, ...] = ()
 _sg_secrets_final = False
+# Secrets from parsed addon configs, most recently seen last. Bounded so that
+# a stream of distinct configs cannot grow memory or the per-line scan; the
+# least recently seen is dropped first. A self-hosted instance sees a handful.
+_SG_MAX_NOTED_SECRETS = 512
+_sg_noted = {}
+_sg_noted_forms: tuple[str, ...] = ()
+_sg_noted_lock = _sg_threading.Lock()
 
 
 def _sg_add_secret(found, name, value):
@@ -86,8 +99,35 @@ def _sg_current_secrets():
     return _sg_secret_forms
 
 
+def _sg_note_secret_values(values):
+    """Mask these values (a parsed config's own keys) in every later log line."""
+    global _sg_noted_forms
+    forms = []
+    for value in values:
+        if isinstance(value, str) and len(value) >= _SG_MIN_SECRET_LENGTH:
+            forms.extend((value, _sg_parse.quote(value, safe=""), _sg_parse.quote_plus(value)))
+    if not forms:
+        return
+    with _sg_noted_lock:
+        changed = False
+        for form in forms:
+            if form in _sg_noted:
+                _sg_noted[form] = _sg_noted.pop(form)  # now the most recent
+            else:
+                _sg_noted[form] = None
+                changed = True
+        while len(_sg_noted) > _SG_MAX_NOTED_SECRETS:
+            del _sg_noted[next(iter(_sg_noted))]
+            changed = True
+        if changed:
+            _sg_noted_forms = tuple(sorted(_sg_noted, key=len, reverse=True))
+
+
 def _sg_scrub(text):
     for secret in _sg_current_secrets():
+        if secret in text:
+            text = text.replace(secret, _SG_MASK)
+    for secret in _sg_noted_forms:
         if secret in text:
             text = text.replace(secret, _SG_MASK)
     return text

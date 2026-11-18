@@ -126,8 +126,11 @@ The recommended low-friction access model is to protect Comet, not Stremio.
 Users keep their own Stremio accounts, while Comet acts as the token-gated
 addon, stream-discovery, and playback relay.
 
-- Configure stays at `https://comet.example.com/configure` and is protected by
-  Comet's configure password; opening `https://comet.example.com/comet/<token>/configure`
+- The configure page is not served through the gateway by default: open it at
+  `http://127.0.0.1:18000/configure` on the host (an SSH tunnel from elsewhere).
+  With `COMET_GATEWAY_PUBLIC_CONFIGURE=1` it stays at
+  `https://comet.example.com/configure`, protected by Comet's configure
+  password; opening `https://comet.example.com/comet/<token>/configure`
   preserves that token in the generated install/copy links (since configure
   pages share one configure password and embed the default token, token
   separation applies to manifest-link recipients without that password).

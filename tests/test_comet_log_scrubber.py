@@ -151,3 +151,29 @@ def test_error_text_keeps_no_url_path_query_or_userinfo(scrubber: types.ModuleTy
         "Failure (HTTP 429): 429 for url='https://api.example' and URL('http://other.example')"
     )
     assert scrubber._sg_describe_error(ValueError()) == "ValueError"
+
+
+def test_noted_config_keys_are_masked_in_every_form(scrubber: types.ModuleType) -> None:
+    key = "sg/caller+key=1&x"
+    scrubber._sg_note_secret_values([key, "short", None, 42])
+    line = (
+        f"raw {key} quoted {urllib.parse.quote(key, safe='')} "
+        f"plus {urllib.parse.quote_plus(key)} short\n"
+    )
+    out = _sink_output(scrubber, line)
+    assert "caller" not in out and "sg%2F" not in out
+    assert out == "raw ******** quoted ******** plus ******** short\n"
+
+
+def test_noted_keys_are_bounded_and_the_least_recently_seen_is_dropped(
+    scrubber: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Room for two keys (a plain key's quoted forms are the key itself).
+    monkeypatch.setattr(scrubber, "_SG_MAX_NOTED_SECRETS", 2)
+    scrubber._sg_note_secret_values(["sgcallerKEY0001"])
+    scrubber._sg_note_secret_values(["sgcallerKEY0002"])
+    scrubber._sg_note_secret_values(["sgcallerKEY0001"])  # seen again: now the most recent
+    scrubber._sg_note_secret_values(["sgcallerKEY0003"])
+    assert len(scrubber._sg_noted) == 2
+    out = _sink_output(scrubber, "sgcallerKEY0001 sgcallerKEY0002 sgcallerKEY0003")
+    assert out == "******** sgcallerKEY0002 ********"

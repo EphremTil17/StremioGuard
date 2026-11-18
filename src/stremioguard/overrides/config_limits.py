@@ -1,4 +1,5 @@
-"""Bound the work and memory one addon config can cost Comet (security hardening)."""
+"""Bound the work and memory one addon config can cost Comet, and keep its keys
+out of Comet's logs (security hardening)."""
 
 from __future__ import annotations
 
@@ -25,6 +26,25 @@ _CACHE_PATCHED = (
     f"_SG_MAX_DEBRID_SERVICES = {MAX_DEBRID_SERVICES}\n"
     "\n"
     "\n"
+    "def _sg_note_config_secrets(validated_config):\n"
+    "    # A config's own debrid keys are masked in Comet's logs like the\n"
+    "    # server's (see the logger override); noted on every use, so the\n"
+    "    # configs in use stay the most recently seen.\n"
+    "    if not isinstance(validated_config, dict):\n"
+    "        return\n"
+    "    from comet.core.logger import _sg_note_secret_values\n"
+    "\n"
+    "    values = [\n"
+    '        validated_config.get("debridApiKey"),\n'
+    '        validated_config.get("debridStreamProxyPassword"),\n'
+    "    ]\n"
+    '    for key in ("debridServices", "_debridEntries"):\n'
+    "        for entry in validated_config.get(key) or ():\n"
+    "            if isinstance(entry, dict):\n"
+    '                values.append(entry.get("apiKey"))\n'
+    "    _sg_note_secret_values(values)\n"
+    "\n"
+    "\n"
     f"@lru_cache(maxsize={CONFIG_CACHE_SIZE})\n"
     "def _parse_and_validate_config(b64config: str):\n"
 )
@@ -41,6 +61,7 @@ _LENGTH_PATCHED = (
     "        if len(b64config) > _SG_MAX_B64CONFIG_LENGTH\n"
     "        else _parse_and_validate_config(b64config)\n"
     "    )\n"
+    "    _sg_note_config_secrets(validated_config)\n"
 )
 
 
@@ -51,6 +72,8 @@ def render_config_limits_override(repo_dir: Path) -> str:
     is invalid: a strict check refuses it and a lenient one falls back to the
     default config, exactly as upstream treats any other invalid config. The
     length check runs before the cache, so an oversized string is never kept.
+    Every valid config's debrid keys are handed to the log scrubber, which
+    masks them from then on.
     """
     source_file = repo_dir / "comet" / "core" / "config_validation.py"
     if not source_file.exists():

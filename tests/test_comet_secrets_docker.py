@@ -306,10 +306,33 @@ if patched:
         "::127.0.0.1", "::10.0.0.1", "64:ff9b::127.0.0.1", "64:ff9b::10.0.0.1",
         "64:ff9b:1::1", "::ffff:0:7f00:1", "2001::1", "64:ff9b::808:808"]}))
 
-    def _request(peer, client_id=None):
+    def _request(peer, client_id=None, extra=()):
         headers = [] if client_id is None else [(b"x-stremioguard-client", client_id.encode())]
         return Request({"type": "http", "method": "GET", "path": "/", "query_string": b"",
-                        "headers": headers, "client": (peer, 40000)})
+                        "headers": headers + list(extra), "client": (peer, 40000)})
+
+    # Comet's server trusts X-Forwarded-For from anyone: run a direct client's
+    # request through uvicorn's own middleware, as Comet's server does.
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    def _through_server(peer, extra):
+        seen = []
+
+        async def app(scope, receive, send):
+            seen.append(scope["client"][0])
+            seen.append(guard.admission_key(Request(scope), ""))
+
+        scope = {"type": "http", "method": "GET", "path": "/", "query_string": b"",
+                 "headers": [(b"x-stremioguard-client", b"spoof01"), *extra],
+                 "client": (peer, 40000)}
+        asyncio.run(ProxyHeadersMiddleware(app, trusted_hosts="*")(scope, None, None))
+        return seen
+
+    print("SPOOF", json.dumps([
+        _through_server("172.18.0.1", [(b"x-forwarded-for", b"127.0.0.1")]),
+        _through_server("172.18.0.1", [(b"x-forwarded-for", b"::1")]),
+        _through_server("127.0.0.1", []),
+    ]))
 
     print("ADMISSION", json.dumps([
         guard.admission_key(_request("127.0.0.1", "toka01"), ""),
@@ -318,10 +341,14 @@ if patched:
         guard.admission_key(_request("127.0.0.1", "bad id!"), ""),
         guard.admission_key(_request("127.0.0.1", "x" * 65), ""),
         guard.admission_key(_request("127.0.0.1"), ""),
+        *(guard.admission_key(_request("127.0.0.1", "toka01", [header]), "")
+          for header in [(b"x-forwarded-for", b"1.2.3.4"), (b"forwarded", b"for=1.2.3.4"),
+                         (b"x-real-ip", b"1.2.3.4")]),
     ]))
 else:
     print("PUBLIC {}")
     print("ADMISSION []")
+    print("SPOOF []")
 
 async def fetch(url):
     response = await handlers.handle_stream_request("GET", url, playback_headers)
@@ -345,7 +372,7 @@ print("REDIRECT", json.dumps(asyncio.run(fetch("http://127.0.0.2:%d/hop" % hop.s
 """
 
 
-_STREAM_TAGS = {"HEADERS", "PUBLIC", "ADMISSION", "DIRECT", "NAMED", "REDIRECT"}
+_STREAM_TAGS = {"HEADERS", "PUBLIC", "ADMISSION", "SPOOF", "DIRECT", "NAMED", "REDIRECT"}
 
 
 def _stream_results(image: str, comet_dir: Path) -> dict[str, Any]:
@@ -386,8 +413,16 @@ def test_stream_proxy_hardening(sources: tuple[str, Path, Path]) -> None:
     assert not any(public.values()), public
     # Stream slots are counted per gateway token, and only for the gateway's
     # own loopback connections: the host's published port arrives from the
-    # bridge address, and a malformed ID falls back to upstream's key.
-    assert after["ADMISSION"] == ["token:toka01", "token:toka01", "", "", "", ""]
+    # bridge address, and a malformed ID falls back to upstream's key. A
+    # request carrying a client-address header never came from the gateway.
+    assert after["ADMISSION"] == ["token:toka01", "token:toka01"] + [""] * 7
+    # The server rewrites a direct client's peer to the loopback address it
+    # claims (the mechanism is real), yet the claimed token key is refused.
+    assert after["SPOOF"] == [
+        ["127.0.0.1", ""],
+        ["::1", ""],
+        ["127.0.0.1", "token:spoof01"],
+    ]
     playback_source = (patched / "api" / "endpoints" / "playback.py").read_text(encoding="utf-8")
     assert "ip=_sg_admission_key(request, ip)," in playback_source
     for tag in ("DIRECT", "NAMED", "REDIRECT"):
@@ -445,3 +480,37 @@ def test_config_parsing_is_bounded(sources: tuple[str, Path, Path]) -> None:
         "oversized_lenient_is_default": True,
         "cache_size": 256,
     }
+
+
+_SERVICE_KEY = "sgCallerServiceKey0001"
+_LEGACY_KEY = "sgCallerLegacyKey0001"
+CONFIG_KEY_LOG_PROBE = """
+import base64, json, time
+import comet.core.logger as comet_logger
+from comet.core.config_validation import config_check
+
+def check(config):
+    blob = base64.b64encode(json.dumps(config).encode()).decode()
+    return config_check(blob, strict_b64config=True) is not None
+
+print("VALID", check({"debridServices": [{"service": "realdebrid", "apiKey": "SERVICE_KEY"}]}),
+      check({"debridService": "realdebrid", "debridApiKey": "LEGACY_KEY"}))
+try:
+    raise RuntimeError("HTTP 403: invalid key SERVICE_KEY / LEGACY_KEY")
+except RuntimeError:
+    comet_logger.logger.exception("scraper failed with SERVICE_KEY")
+comet_logger.logger.complete()
+time.sleep(0.5)
+""".replace("SERVICE_KEY", _SERVICE_KEY).replace("LEGACY_KEY", _LEGACY_KEY)
+
+
+def test_a_callers_config_keys_are_masked_in_logs(sources: tuple[str, Path, Path]) -> None:
+    """A user's config can carry a debrid key the server does not know."""
+    image, upstream, patched = sources
+    keys = (_SERVICE_KEY, _LEGACY_KEY)
+    upstream_out = _run(image, upstream, CONFIG_KEY_LOG_PROBE)
+    assert all(key in upstream_out for key in keys), "positive control: upstream must leak"
+    patched_out = _run(image, patched, CONFIG_KEY_LOG_PROBE)
+    assert "VALID True True" in patched_out
+    assert not [key for key in keys if key in patched_out], patched_out[-2000:]
+    assert "scraper failed with ********" in patched_out

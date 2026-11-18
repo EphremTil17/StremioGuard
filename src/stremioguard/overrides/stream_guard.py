@@ -106,16 +106,45 @@ class PublicOnlyConnector(aiohttp.TCPConnector):
 _CLIENT_HEADER = "x-stremioguard-client"
 _CLIENT_ID = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 # The gateway shares Comet's network namespace and connects over loopback; a
-# connection to the host's published port arrives from the bridge address,
-# so a direct client cannot pick its own key by sending the header.
+# connection to the host's published port arrives from the bridge address.
 _GATEWAY_PEERS = frozenset({"127.0.0.1", "::1"})
+# Comet's server trusts X-Forwarded-For from any peer and rewrites the peer
+# address from it before Comet runs, so a direct client could claim to be
+# loopback. The gateway clears every client-address header Comet reads
+# (comet/utils/network.py IP_PROXY_HEADERS), so a request carrying any of
+# them did not come from the gateway, whatever its peer address says.
+_FORWARDED_ADDRESS_HEADERS = (
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-real-ip",
+    "x-client-ip",
+    "do-connecting-ip",
+    "fastly-client-ip",
+    "x-cluster-client-ip",
+    "x-forwarded-for",
+    "x-forwarded",
+    "forwarded-for",
+    "forwarded",
+    "x-appengine-user-ip",
+    "cf-pseudo-ipv4",
+    "x-aiostreams-user-ip",
+)
 
 
 def admission_key(request, ip: str) -> str:
-    """The key Comet counts a client's concurrent proxied streams under."""
+    """The key Comet counts a client's concurrent proxied streams under.
+
+    A token's own key only for a request the gateway sent: from loopback and
+    with no client-address header (which the gateway never sends, and which
+    would have rewritten the peer address). Anything else counts under the
+    client address Comet resolved, as upstream does.
+    """
+    headers = request.headers
+    if any(name in headers for name in _FORWARDED_ADDRESS_HEADERS):
+        return ip
     client = getattr(request, "client", None)
     peer = str(getattr(client, "host", "") or "")
-    token_id = request.headers.get(_CLIENT_HEADER, "")
+    token_id = headers.get(_CLIENT_HEADER, "")
     if peer in _GATEWAY_PEERS and _CLIENT_ID.match(token_id):
         return f"token:{token_id}"
     return ip

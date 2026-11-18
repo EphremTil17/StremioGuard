@@ -259,7 +259,8 @@ def verify_stream_guard() -> list[str]:
 
 
 def verify_config_limits() -> list[str]:
-    """Oversized configs and configs with too many debrid services are refused."""
+    """Oversized configs and configs with too many debrid services are refused,
+    and a valid config's debrid keys are masked in Comet's logs."""
     findings: list[str] = []
     validation = importlib.import_module("comet.core.config_validation")
     limit = getattr(validation, "_SG_MAX_B64CONFIG_LENGTH", None)
@@ -277,6 +278,22 @@ def verify_config_limits() -> list[str]:
         findings.append("config limits accepted more debrid services than the cap")
     if validation.config_check("A" * (limit + 4), strict_b64config=True) is not None:
         findings.append("config limits accepted a config over the length cap")
+
+    # A config's own debrid keys, in either config shape, are masked in logs.
+    scrub = getattr(importlib.import_module("comet.core.logger"), "_sg_scrub", None)
+    if scrub is None:
+        return [*findings, "Comet's logger carries no StremioGuard scrubber"]
+    for shape, key in (("debridServices", "sgprobeServiceKey01"), ("legacy", "sgprobeLegacyKey01")):
+        config: dict[str, Any] = (
+            {"debridServices": [{"service": "realdebrid", "apiKey": key}]}
+            if shape == "debridServices"
+            else {"debridService": "realdebrid", "debridApiKey": key}
+        )
+        blob = base64.b64encode(json.dumps(config).encode()).decode()
+        if validation.config_check(blob, strict_b64config=True) is None:
+            findings.append(f"config limits refused a valid {shape} config")
+        elif key in scrub(f"HTTP 403: invalid key {key}"):
+            findings.append(f"a {shape} config's debrid key is not masked in Comet's logs")
     return findings
 
 

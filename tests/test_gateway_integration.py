@@ -16,6 +16,7 @@ import textwrap
 import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -291,11 +292,26 @@ def _sh_quote(value: str) -> str:
 
 @pytest.fixture(scope="module")
 def gateway_harness(tmp_path_factory: pytest.TempPathFactory) -> Iterator[GatewayHarness]:
-    tmp_root = tmp_path_factory.mktemp("sgfix11-int")
+    """The gateway with the configure page public (COMET_GATEWAY_PUBLIC_CONFIGURE=1)."""
+    with _running_harness(
+        tmp_path_factory.mktemp("sgfix11-int"), "COMET_GATEWAY_PUBLIC_CONFIGURE=1\n"
+    ) as harness:
+        yield harness
+
+
+@pytest.fixture(scope="module")
+def default_gateway_harness(tmp_path_factory: pytest.TempPathFactory) -> Iterator[GatewayHarness]:
+    """The gateway as installed by default: no configure page."""
+    with _running_harness(tmp_path_factory.mktemp("sgfix11-default"), "") as harness:
+        yield harness
+
+
+@contextmanager
+def _running_harness(tmp_root: Path, extra_env: str) -> Iterator[GatewayHarness]:
     (tmp_root / ".env").write_text(
         "COMET_ENABLED=1\n"
         "COMET_GATEWAY_ENABLED=1\n"
-        "COMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.com\n",
+        "COMET_GATEWAY_PUBLIC_BASE_URL=https://comet.example.com\n" + extra_env,
         encoding="utf-8",
     )
     config = CometGatewayConfig.from_env(tmp_root)
@@ -1050,3 +1066,135 @@ def test_ac12_login_attempts_share_a_strict_bucket_that_nothing_else_draws_from(
         + [{"target": f"/comet/{TOKEN_A}/s/{TEST_API_TOKEN}/manifest.json"}] * 15
     )
     assert [r["status"] for r in others] == [200] * 16, others
+
+
+def _headers_of(
+    harness: GatewayHarness, target: str, host: str = "127.0.0.1:8090"
+) -> tuple[int, dict[str, list[str]]]:
+    res = harness.exec_nginx(
+        f"curl -sS -i --path-as-is -H {_sh_quote('Host: ' + host)} http://127.0.0.1:8090{target}"
+    )
+    assert res.returncode == 0, res.stderr
+    head = res.stdout.replace("\r\n", "\n").partition("\n\n")[0]
+    values: dict[str, list[str]] = {}
+    for line in head.splitlines()[1:]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            values.setdefault(key.strip().lower(), []).append(value.strip())
+    return int(head.split()[1]), values
+
+
+def test_ac13_by_default_no_configure_page_but_addon_routes_and_health_work(
+    default_gateway_harness: GatewayHarness,
+) -> None:
+    """Without COMET_GATEWAY_PUBLIC_CONFIGURE the configure page never reaches Comet."""
+    harness = default_gateway_harness
+    api = TEST_API_TOKEN
+    time.sleep(1.0)
+    harness.clear_records()
+    login = {
+        "method": "POST",
+        "headers": ["Content-Type: application/x-www-form-urlencoded"],
+        "body": "password=test-password",
+    }
+    refused = [
+        {"target": "/configure"},
+        {"target": "/configure/"},
+        {**login, "target": "/configure/login"},
+        {"target": "/static/x.js"},
+        {"target": "/"},
+        {"target": f"/comet/{TOKEN_A}/configure"},
+        {"target": f"/comet/{TOKEN_A}/s/{api}/configure"},
+        {**login, "target": f"/comet/{TOKEN_A}/configure/login"},
+        {"target": f"/comet/{TOKEN_A}"},
+        {"target": f"/comet/{TOKEN_A}/"},
+    ]
+    statuses = []
+    for spec in refused:  # paced so the denial limiter answers 403, not 503
+        statuses.append(harness.curl_batch([spec])[0]["status"])
+        time.sleep(0.3)
+    assert statuses == [403] * len(refused), statuses
+    assert harness.fetch_records() == [], "a configure request reached Comet"
+
+    allowed = harness.curl_batch(
+        [
+            {"target": f"/comet/{TOKEN_A}/s/{api}/manifest.json"},
+            {"target": f"/comet/{TOKEN_A}/s/{api}/stream/movie/tt1.json"},
+            {"target": "/health"},
+        ]
+    )
+    assert [r["status"] for r in allowed] == [200, 200, 200], allowed
+    assert len(harness.fetch_records()) == 3
+
+
+@pytest.mark.parametrize("harness_name", ["default_gateway_harness", "gateway_harness"])
+def test_ac14_request_bodies_over_64k_are_refused_before_comet(
+    harness_name: str, request: pytest.FixtureRequest
+) -> None:
+    """Sized and chunked bodies, and a login form split into many fields."""
+    harness: GatewayHarness = request.getfixturevalue(harness_name)
+    manifest = f"/comet/{TOKEN_A}/s/{TEST_API_TOKEN}/manifest.json"
+    time.sleep(1.0)
+    harness.clear_records()
+    script = f"""
+set -u
+head -c 61440 /dev/zero | tr '\\0' a > /tmp/b60k
+head -c 71680 /dev/zero | tr '\\0' a > /tmp/b70k
+head -c 1048576 /dev/zero | tr '\\0' a > /tmp/b1m
+i=0; : > /tmp/fields; while [ $i -lt 200 ]; do
+  printf 'f%d=' $i >> /tmp/fields; head -c 1024 /dev/zero | tr '\\0' a >> /tmp/fields
+  printf '&' >> /tmp/fields; i=$((i+1)); done
+post() {{ curl -sS -o /dev/null -w '%{{http_code}}\\n' -H 'Host: 127.0.0.1:8090' "$@"; }}
+post --data-binary @/tmp/b60k http://127.0.0.1:8090{manifest}
+post --data-binary @/tmp/b70k http://127.0.0.1:8090{manifest}
+post -H 'Transfer-Encoding: chunked' --data-binary @/tmp/b1m http://127.0.0.1:8090{manifest}
+post -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @/tmp/fields \\
+  http://127.0.0.1:8090/configure/login
+post -H 'Content-Type: application/json' --data-binary @/tmp/b1m http://127.0.0.1:8090/
+rm -f /tmp/b60k /tmp/b70k /tmp/b1m /tmp/fields
+"""
+    res = harness.exec_nginx(script)
+    assert res.returncode == 0, res.stderr
+    statuses = [int(line) for line in res.stdout.split()]
+    # Under the cap passes through to Comet's routing (405: the manifest is
+    # GET-only); everything over it is 413 from the gateway.
+    assert statuses == [405, 413, 413, 413, 413], statuses
+    records = harness.fetch_records()
+    assert len(records) == 1, "only the body under the cap may reach Comet"
+
+
+@pytest.mark.parametrize(
+    ("harness_name", "csp"),
+    [
+        (
+            "default_gateway_harness",
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        ),
+        (
+            "gateway_harness",
+            "frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'",
+        ),
+    ],
+)
+def test_ac15_every_response_carries_one_content_and_permissions_policy(
+    harness_name: str, csp: str, request: pytest.FixtureRequest
+) -> None:
+    harness: GatewayHarness = request.getfixturevalue(harness_name)
+    targets = [
+        (f"/comet/{TOKEN_A}/s/{TEST_API_TOKEN}/manifest.json", "127.0.0.1:8090", 200),
+        ("/health", "127.0.0.1:8090", 200),
+        ("/comet/NotAT0ken/s/x/manifest.json", "127.0.0.1:8090", 403),
+        ("/admin", "127.0.0.1:8090", 403),
+        ("/health", "bad host!", 400),
+    ]
+    if harness_name == "gateway_harness":
+        targets.append(("/configure", "127.0.0.1:8090", 200))
+    time.sleep(1.0)
+    for target, host, expected in targets:
+        status, values = _headers_of(harness, target, host)
+        assert status == expected, (target, status)
+        assert values.get("content-security-policy") == [csp], (target, values)
+        assert values.get("permissions-policy") == [
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=(), browsing-topics=()"
+        ], target
+        time.sleep(0.4)

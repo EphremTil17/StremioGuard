@@ -7,13 +7,23 @@ gateway token.
 
 ## URL Model
 
-Management stays canonical and simple:
+The gateway serves addon routes and `/health`. Comet's configure page, a
+management page behind one shared password, is not served through it by
+default. Open it through Comet's own port on the host:
+
+```text
+http://127.0.0.1:18000/configure          # on the host (COMET_HOST_PORT)
+ssh -L 18000:127.0.0.1:18000 <server>      # from another machine, then the same URL
+```
+
+With `COMET_GATEWAY_PUBLIC_BASE_URL` set, the page's install and copy links
+still point at the public gateway URL with the default token.
+`COMET_GATEWAY_PUBLIC_CONFIGURE=1` also serves it publicly, as earlier
+releases did:
 
 ```text
 https://comet.example.com/configure
 ```
-
-That page is protected by Comet's configure password.
 
 Because StremioGuard requires `CONFIGURE_PAGE_PASSWORD`, Comet mounts all Stremio
 addon routes under `STREMIO_API_PREFIX=/s/<PUBLIC_API_TOKEN>`. Addon
@@ -44,8 +54,8 @@ case variants are denied):
 | `/s/<api>/manifest.json`, `/s/<api>/<config>/manifest.json` | Addon manifest |
 | `/s/<api>/stream/<seg>/<seg>.json`, `/s/<api>/<config>/stream/<seg>/<seg>.json` | Stream search |
 | `/s/<api>/<config>/playback/<seg>/<seg>/<seg>/<seg>/<seg>` (5 segments) | Stream playback |
-| `/configure`, `/<config>/configure`, `/s/<api>/configure`, `/s/<api>/<config>/configure` | Configure page |
-| `/configure/login` | Configure form login POST target |
+| `/configure`, `/<config>/configure`, `/s/<api>/configure`, `/s/<api>/<config>/configure` | Configure page (only with `COMET_GATEWAY_PUBLIC_CONFIGURE=1`) |
+| `/configure/login` | Configure form login POST target (only with `COMET_GATEWAY_PUBLIC_CONFIGURE=1`) |
 
 Everything else under `/comet/<token>/` (and at top level outside the public
 routes `/`, `/configure`, `/configure/...`, `/static/`, `/health`) is denied
@@ -225,6 +235,21 @@ Expected results:
   the VPN
 - `./stremio comet log-canary` passes on every sink
 
+## Request Size and Browser Policies
+
+Request bodies over 64 KB are refused with `413` before anything is buffered
+or passed to Comet, whether sized or chunked: every route is a GET apart from
+the configure login form. Every response carries a `Content-Security-Policy`
+and a `Permissions-Policy` (camera, microphone, location, payment, USB and
+topics off), replacing any Comet sends:
+
+- Without the configure page: `default-src 'none'; frame-ancestors 'none';
+  base-uri 'none'; form-action 'none'`. The gateway serves no page a browser
+  should run.
+- With `COMET_GATEWAY_PUBLIC_CONFIGURE=1`: `frame-ancestors 'none'; base-uri
+  'self'; object-src 'none'; form-action 'self'`. Comet's page runs inline
+  scripts and loads Shoelace from a CDN, so scripts are not restricted.
+
 ## Rate Limiting and Log Hygiene
 
 The generated nginx config rate-limits abuse paths without ever throttling
@@ -241,9 +266,11 @@ authenticated playback:
 - Valid-token requests to disallowed routes under `/comet/<token>/...` rewrite
   to an internal access-phase location (`deny all`, `403`) rate-limited by
   `gateway_fail` at 5 r/s (burst 3; excess returns `503`).
-- Human-paced public pages (`/configure`, `/static/`, `/health`, and the root
-  page) share `gateway_admin` at 10 r/s (burst 20).
-- Configure-password guessing has its own, much stricter bucket:
+- Human-paced public pages (`/health`, plus `/configure`, `/static/` and the
+  root page when the configure page is public) share `gateway_admin` at
+  10 r/s (burst 20).
+- With the configure page public, password guessing has its own, much
+  stricter bucket:
   every `POST` to `/configure/login` or `/comet/<token>/configure/login` draws
   from `gateway_login`, 6 a minute (burst 5; excess returns `503` and never
   reaches Comet). Every other request has an empty key in that zone and is
@@ -279,6 +306,9 @@ directives), keeping your existing `location /` settings:
 # request line through the server-level logs.
 access_log off;
 uninitialized_variable_warn off;
+# NPM accepts bodies up to 2000 MB by default and buffers them to disk before
+# the gateway can refuse them; nothing here needs more than the gateway's 64 KB.
+client_max_body_size 64k;
 
 location / {
     access_log off;

@@ -295,6 +295,9 @@ def make_comet_gateway_config(tmp_path: Path, **overrides: object) -> CometGatew
         "public_base_url": "https://comet.example.com",
         "token_length": 8,
         "enabled": True,
+        # Most gateway tests cover the full route set; tests of the default
+        # (configure page not served) pass public_configure=False.
+        "public_configure": True,
     }
     values.update(overrides)
     return CometGatewayConfig(**values)  # type: ignore[arg-type]
