@@ -9,6 +9,7 @@ from pathlib import Path
 from loguru import logger
 
 from stremioguard.env import atomic_write_text
+from stremioguard.overrides.admin import render_admin_override
 from stremioguard.overrides.api_app import render_api_app_override
 from stremioguard.overrides.config import render_config_override
 from stremioguard.overrides.config_limits import render_config_limits_override
@@ -97,6 +98,14 @@ SPECS = [
         output_name="config_validation.py",
         requirement=Requirement.REQUIRED,
         render=lambda repo_dir, ctx: render_config_limits_override(repo_dir),
+    ),
+    OverrideSpec(
+        name="admin",
+        feature="Secure cookie flag on admin login behind TLS termination",
+        container_path="/app/comet/api/endpoints/admin.py",
+        output_name="admin.py",
+        requirement=Requirement.REQUIRED,
+        render=lambda repo_dir, ctx: render_admin_override(repo_dir),
     ),
     OverrideSpec(
         name="logger",

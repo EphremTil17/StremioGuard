@@ -1,35 +1,20 @@
-# Secure access: deployment tiers
+# Secure Access: Deployment Tiers
 
-The repo's job is the **Stremio side** of inbound access — `STREMIO_BIND_ADDRS`,
-`STREMIO_HOST_PORT`, and optionally `EXTERNAL_BASE_URL`. Everything else
-(domain registration, DNS, certs, reverse proxy installation, network topology)
-is your pre-existing infrastructure. This doc lists three tiers, what each tier
-assumes you have already, and what you set in `.env` for each.
+StremioGuard controls the container-side bind surface (`STREMIO_BIND_ADDRS`, `STREMIO_HOST_PORT`, `COMET_GATEWAY_HOST_PORT`, and `EXTERNAL_BASE_URL` / `COMET_GATEWAY_PUBLIC_BASE_URL`). DNS, certificates, and any external reverse proxy live on your host infrastructure.
 
-For the Tailscale-specific MagicDNS/Serve workflow used in the unified
-StremioGuard + Comet setup, see [tailscale-runbook.md](tailscale-runbook.md).
+| Tier | What is in front | `EXTERNAL_BASE_URL` (Stremio) | Who can reach it |
+| :--- | :--- | :--- | :--- |
+| 1 | Nothing (LAN / Tailscale, or Tailscale Serve) | empty (or `https://<node>.<tailnet>.ts.net:<port>` for Serve) | LAN devices + tailnet peers |
+| 2 | Reverse proxy + domain resolving to a Tailscale CGNAT IP (`100.x.y.z`) | `https://<your-domain>` | Tailnet peers only (open internet has no route) |
+| 3 | Reverse proxy + publicly routable domain | `https://<your-domain>` | Whatever your proxy / gateway allows |
 
-The Stremio-side config is intentionally small. Tiers differ mainly in what's
-in front of Stremio.
+> **Comet vs. Stremio:** For remote or shared addon access, expose **Comet's token gateway** (`COMET_GATEWAY_HOST_PORT`, default `18001`) instead of Stremio, and follow [comet-gateway.md](comet-gateway.md) for its reverse-proxy headers, body cap, and log redaction.
 
-| Tier | What's in front of Stremio | `EXTERNAL_BASE_URL` |
-|------|----------------------------|---------------------|
-| 1 | Nothing — direct LAN/Tailscale access | empty |
-| 2 | Reverse proxy, domain only routable via your tailnet | `https://<your-domain>` |
-| 3 | Reverse proxy, publicly routable domain | `https://<your-domain>` |
+---
 
-`STREMIO_BIND_ADDRS` controls which host interfaces publish Stremio. Use one
-address for a single entry path, or a comma-separated LAN + Tailscale pair for
-direct access on both networks.
+## Tier 1 — LAN + Tailscale
 
-## Tier 1 — LAN + Tailscale only
-
-You already have:
-- This host on a LAN.
-- (Optional) Tailscale running on this host so off-LAN clients on your tailnet
-  reach the host's `100.x.y.z` address.
-
-You set in `.env`:
+Set in `.env`:
 
 ```ini
 STREMIO_HOST_PORT=11470
@@ -37,50 +22,42 @@ STREMIO_BIND_ADDRS=<host-LAN-IP>,<host-tailscale-IP>
 EXTERNAL_BASE_URL=
 ```
 
-Clients reach Stremio:
-- LAN device → `http://<host-LAN-IP>:11470`
-- Tailscale device anywhere → `http://<host-tailscale-IP>:11470`
-  (`tailscale ip -4` on this host)
+- **Stremio auth (required across all tiers):** `./stremio start` requires `STREMIO_USERNAME` and a `STREMIO_PASSWORD` of at least 12 characters. The host port maps to the Stremio image's Basic-Auth nginx (container port `8080`). Give Stremio clients `http://USER:PASSWORD@<host-LAN-IP>:11470`. (`STREMIO_ALLOW_NO_AUTH=1` opts out with a startup warning.)
+- **Raw stream gate:** Media players cannot send Basic Auth on raw stream URLs (`/<infohash>/<file>`), so `docker/stremio/gate-raw-streams.js` allows unauthenticated raw stream playback only for torrents already started through an authenticated route (`STREMIO_OPEN_RAW_STREAMS=1` restores upstream behavior).
+- **Trust boundary:** Every device on the bound LAN/tailnet can reach the published ports.
 
-Trust boundary: every device on the LAN can hit `:11470`. A compromised IoT
-device on the same `192.168.x.0/24` reaches Stremio. That's what binding on
-the LAN NIC means; if you don't accept it, Tier 1 isn't for you.
+### Tailscale Serve (Tier 1)
 
-Every tier requires `STREMIO_USERNAME` and a `STREMIO_PASSWORD` of at least
-12 characters in `.env`: the host port maps to the image's nginx (container
-port 8080), which then asks for them on every server route. Give Stremio the
-server URL with them, as `http://USER:PASSWORD@<host-LAN-IP>:11470`.
-`STREMIO_ALLOW_NO_AUTH=1` accepts an open server instead, with a warning on
-every start.
+Raw service ports (`11470` for Stremio, `18001` for Comet gateway) speak plain HTTP. To get HTTPS on a `*.ts.net` MagicDNS hostname without a public domain:
 
-Players cannot send credentials, so a raw stream URL (`/<infohash>/<file>`)
-also plays without them, but only for a torrent that already exists on the
-server. Torrents start only through authenticated routes, so nobody without
-the password can make the server download one. If a player ever fails to
-start a torrent stream (one that skips the authenticated start), set
-`STREMIO_OPEN_RAW_STREAMS=1` for upstream's behaviour: raw stream URLs for any
-torrent, without credentials.
+1. Verify MagicDNS is active (`tailscale dns status` → `MagicDNS: enabled tailnet-wide`) and note your Tailscale IP (`tailscale ip -4`).
+2. Ensure `STREMIO_BIND_ADDRS` includes `<host-tailscale-IP>` (not loopback-only, unless pointing Serve at `127.0.0.1` for an intentionally loopback-bound port).
+3. Proxy HTTPS ports with Tailscale Serve:
+   ```bash
+   # Optional Stremio server
+   sudo tailscale serve --bg --https=10000 http://<host-tailscale-ip>:11470
+   # Comet token gateway (never point Serve at raw Comet :18000 for addon users)
+   sudo tailscale serve --bg --https=8443  http://<host-tailscale-ip>:18001
+   tailscale serve status
+   ```
+4. Set `EXTERNAL_BASE_URL=https://<host>.<tailnet>.ts.net:10000` (if using Stremio) and/or `COMET_GATEWAY_PUBLIC_BASE_URL=https://<host>.<tailnet>.ts.net:8443`, then run `./stremio restart`.
+5. Validate with `./stremio status`, `./stremio comet doctor`, and `./stremio comet probe-playback --url '<playback-url>'` (expect `proxied`). To verify VPN egress inside Comet manually, use its Python (the Comet image has no `wget`):
+   ```bash
+   docker exec stremioguard-comet-1 /app/.venv/bin/python -c "import urllib.request; print(urllib.request.urlopen('https://api.ipify.org').read().decode())"
+   ```
 
-## Tier 2 — Tier 1 + reverse-proxied domain (tailnet-only)
+---
 
-Tier 1 plus a friendly hostname. The domain resolves publicly but routes only
-through your tailnet — open internet sees no Stremio.
+## Tier 2 — Reverse-Proxied Domain (Tailnet-Only)
 
-You already have:
-- A domain you own.
-- A reverse proxy of your choice (Nginx Proxy Manager, Caddy, Traefik, raw
-  nginx — anywhere that can reach the LAN). It must do TLS termination and
-  IP-based access control.
-- A DNS provider that lets you point the A record at a Tailscale CGNAT IP
-  (`100.x.y.z`). Cloudflare works; the record must be DNS-only (gray cloud),
-  never proxied.
-- A TLS cert. The A record points at a CGNAT IP, so public port 80 is
-  unreachable; HTTP-01 won't work. Use DNS-01 (NPM's DNS challenge,
-  `certbot --dns-cloudflare`, `acme.sh --dns dns_cf`).
-- A scoped DNS API token: `Zone.DNS / Edit` for the one zone. Never a Global
-  API Key.
+Recommended for off-LAN access without opening a WAN port.
 
-You set in `.env`:
+**Prerequisites:**
+- A domain whose DNS A record points at your reverse proxy's Tailscale CGNAT IP (`100.x.y.z`), **DNS-only** (gray cloud on Cloudflare; never proxied).
+- TLS issued via **DNS-01** (HTTP-01 fails because public port 80 is unreachable) using a single-zone `Zone.DNS / Edit` API token.
+- Reverse proxy (Nginx Proxy Manager, Caddy, Traefik, or raw nginx) enforcing an IP allowlist (`100.64.0.0/10` + `<LAN_CIDR>`, deny all).
+
+**In `.env` (Stremio profile):**
 
 ```ini
 STREMIO_HOST_PORT=11470
@@ -88,147 +65,92 @@ STREMIO_BIND_ADDRS=<host-LAN-IP>
 EXTERNAL_BASE_URL=https://<your-domain>
 ```
 
-On your reverse proxy:
-- Upstream → `<host-LAN-IP>:11470`.
-- Access list / IP allow: `100.64.0.0/10` (Tailscale CGNAT range) and your
-  LAN CIDR (`192.168.x.0/24`, `10.x.y.z/24`, whatever it is). Deny everything
-  else.
-- Streaming-friendly proxy directives (Stremio uses Range and long-lived
-  bodies):
+**On your reverse proxy (Stremio):**
+- Upstream → `http://<host-LAN-IP>:11470`, WebSockets enabled.
+- Streaming directives (NPM **Advanced** tab):
   ```nginx
   proxy_buffering         off;
   proxy_request_buffering off;
   proxy_read_timeout      1h;
   ```
-  In NPM this lives under the proxy host's **Advanced** tab.
-- Websockets enabled.
+- For Comet, use the gateway-specific proxy template in [comet-gateway.md](comet-gateway.md#reverse-proxy) (`access_log off;`, `client_max_body_size 64k;`, `$http_host`, cleared client-IP headers).
 
-Two enforcement layers stack here:
+**Layered enforcement:** L3 isolation (unroutable CGNAT DNS record, no open WAN port) + L7 allowlist at the proxy. Note that L7 rules run *after* the TLS handshake; the CGNAT DNS pivot is what prevents public scanners from reaching port 443 via DNS.
 
-- **L3** — Cloudflare A record is `100.x.y.z`. Public internet has no route to
-  the host. The home WAN port is never opened. Primary kill switch.
-- **L7** — Reverse proxy access list. Catches bare-IP scans that bypass DNS,
-  and any future proxy host added without an access list. Defense in depth.
+---
 
-Clients reach Stremio:
-- Tailnet device anywhere → `https://<your-domain>` (DNS resolves to CGNAT,
-  tailnet carries the connection).
-- LAN device with Tailscale → same.
-- LAN device without Tailscale → run Tailscale on the device, or set up a
-  local DNS rewrite (Pi-hole, AdGuard, router) that returns the proxy host's
-  LAN IP for `<your-domain>` on-LAN. Repo doesn't enforce either.
-- LAN device → `http://<host-LAN-IP>:11470` (Tier 1 path; still works).
-- Open internet → DNS resolves to an unroutable CGNAT IP. Nothing reaches.
+## Tier 3 — Reverse-Proxied Public Domain
 
-### TLS handshake caveat
+Same `.env` as Tier 2, except the DNS A record points at a publicly routable IP. Because L3 isolation is gone:
 
-L7 access lists run *after* the TLS handshake. Anyone scanning the proxy's IP
-on 443 completes the handshake (sees the cert) before getting a 403. The L3
-layer — the Cloudflare → CGNAT pivot — is what actually closes L4 for clients
-who only know the domain.
+- **For Comet:** Always terminate at `COMET_GATEWAY_HOST_PORT` (`18001`), keep `COMET_GATEWAY_PUBLIC_CONFIGURE=0` (use SSH tunnel or a Cloudflare Access owner portal via `COMET_GATEWAY_CONFIGURE_URL`), enforce NPM log redaction + 64 KB body cap, and verify with `./stremio comet log-canary`.
+- **For Stremio:** Keep `STREMIO_USERNAME` / `STREMIO_PASSWORD` enabled and gate the proxy further (WAF / IP allowlist / mTLS). Note that browser-based OIDC gates do not work for native mobile/TV Stremio clients.
 
-## Tier 3 — Reverse-proxied with a publicly-routable domain
+Switch tiers at any time by re-running `./stremio init` (idempotent).
 
-Same Stremio-side config as Tier 2. The difference is your side: the A record
-points at your real public IP and the WAN port is open.
-
-You already have:
-- All of Tier 2, except the A record is publicly routable.
-- A way to authenticate, rate-limit, or otherwise gate the proxy on the public
-  side. The L3 isolation Tier 2 relies on is gone.
-
-You set in `.env`:
-
-```ini
-STREMIO_HOST_PORT=11470
-STREMIO_BIND_ADDRS=<host-LAN-IP>
-EXTERNAL_BASE_URL=https://<your-domain>
-```
-
-Stremio's streaming server has no built-in auth; StremioGuard requires the
-image's basic auth (`STREMIO_USERNAME` / `STREMIO_PASSWORD`) on every server
-route (raw stream URLs: see Tier 1). Whatever your proxy adds (Authentik / Authelia
-via OIDC, mTLS, IP allowlist, WAF rules) is a further gate on the public side. Note: OIDC and CORS do not work for native
-mobile Stremio — they assume a browser. Design accordingly.
-
-## Switching tiers
-
-`./stremio init` is idempotent — rerun it and pick a different tier to
-overwrite `.env`. Going from Tier 2 back to Tier 1 just clears
-`EXTERNAL_BASE_URL`; init handles that for you.
+---
 
 ## Verification
 
-After bringing the stack up (`./stremio restart`):
-
-1. **Bind matches `.env`** (any tier):
+1. **Bind surface:** `ss -tlnp | grep -E '11470|18001'` matches `STREMIO_BIND_ADDRS` (raw Comet `18000` stays `127.0.0.1` when the gateway is enabled).
+2. **Stremio auth check (if enabled):**
    ```bash
-   ss -tlnp | grep 11470
+   curl -i http://<host-LAN-IP>:11470/stats.json                    # expect 401
+   curl -i -u USER:PASSWORD http://<host-LAN-IP>:11470/stats.json   # expect 200
+   curl -i -u USER:PASSWORD https://<your-domain>/stats.json        # Tier 2: 200 on tailnet, timeout off tailnet
    ```
-   The listener addresses should match `STREMIO_BIND_ADDRS`. If it shows only
-   `127.0.0.1`, `.env` is missing `STREMIO_BIND_ADDRS` or the guard-generated
-   compose override was not used. If it shows `0.0.0.0` and you didn't pick
-   that, init wrote the wrong value.
+3. **DNS-01 renewal:** Test renewal (`certbot renew --dry-run`, `acme.sh --renew … --force`, or NPM Renew Now) before closing public port 80.
 
-2. **LAN-direct reachability** (any tier):
-   ```bash
-   curl -v -u USER:PASSWORD http://<host-LAN-IP>:11470/stats.json
-   ```
-   200 with a JSON body (401 without the credentials). Run from a LAN device, not from this host's
-   loopback.
+---
 
-3. **Tier 2 / 3 — domain reachability**:
-   ```bash
-   curl -v https://<your-domain>/stats.json
-   ```
-   - Tier 2 from a tailnet client → 200. From a non-tailnet client (cellular,
-     no Tailscale) → connection times out. That timeout is the L3 layer
-     working.
-   - Tier 3 from any client → 200, gated by whatever your proxy applies.
+## Raw Nginx Reference (Stremio Only)
 
-4. **Tier 2 — proxy is the L7 gate** (proves the access list does work):
-   - Temporarily detach the access list on the proxy host (NPM: set Access
-     List to "Publicly Accessible").
-   - Retry from a non-tailnet client. It should now load — confirming the
-     access list, not L3 alone, is the gate.
-   - Reattach the access list. Same client → 403.
+> **Do not use this template for Comet.** Comet requires stripping client-IP headers, disabling access logs, and capping bodies at 64 KB — see [comet-gateway.md](comet-gateway.md#reverse-proxy).
 
-5. **Tier 2 / 3 — DNS-01 renewal works**:
-   - NPM: SSL Certificates → cert → ⋮ → Renew Now. Expiry advances ~90 days.
-   - certbot: `certbot renew --dry-run`.
-   - acme.sh: `acme.sh --renew -d <your-domain> --force`.
-   Renewal must succeed before you trust auto-renew. HTTP-01 stops working
-   the moment public port 80 is unreachable.
+This reference server block shows host-native nginx interface pinning + L7 allowlisting for Tier 2/3 Stremio:
 
-## Risks and gotchas
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
 
-- **Loopback bind makes Stremio unreachable.** No real deployment tier uses
-  `STREMIO_BIND_ADDRS=127.0.0.1`. The default is loopback purely as a fail-safe
-  so an unconfigured run cannot accidentally expose anything before you run
-  `./stremio init`. Init steers you away from it.
-- **`0.0.0.0` is wider than you need.** It binds on every interface — LAN,
-  loopback, docker0, tailscale0, future bridges. Picking the specific LAN IP
-  is one rung tighter. Use `0.0.0.0` only on multi-homed hosts where every
-  NIC genuinely needs to listen.
-- **WSL2 LAN reachability.** On WSL2, even with the right `STREMIO_BIND_ADDRS`,
-  whether the Windows LAN actually reaches the WSL2 VM depends on the WSL2
-  network mode. Default NAT may need
-  `netsh portproxy v4tov4 listenport=11470 connectport=11470 connectaddress=<wsl-vm-ip>`
-  on the Windows host. WSL2 `mirrored` networking removes the hop but is
-  opt-in via `~/.wslconfig`.
-- **Cloudflare CGNAT-IP records require proxy off** (Tier 2). With proxy on
-  (orange cloud), Cloudflare won't route to a `100.x.y.z` IP and may strip
-  the record. Must be DNS-only.
-- **Cert break window** (Tier 2 / 3 migration). Migrate from HTTP-01 to
-  DNS-01 *before* you point the A record at a CGNAT IP and close public port
-  80. Verify a renewal works first; otherwise the cert expires silently.
-- **Tailscale outage** (Tier 2). Tailnet down → all domain access stops.
-  Tier 1 paths (`http://<host-LAN-IP>:11470` direct, LAN clients with
-  split-horizon DNS) still work. Tier 1 alone is unaffected.
-- **Default Site fingerprinting.** Reverse proxies that fall back to a
-  default vhost (NPM does) leak their identity to unmatched-hostname probes.
-  Set the default to a 404 page or a closed connection.
-- **API token scope.** DNS-01 needs only `Zone.DNS / Edit` on the one zone.
-  Never use a Global API Key.
-- **Stremio has no built-in auth.** All gating happens before Stremio. If
-  you skip access control on a Tier 3 proxy, the streaming server is open.
+server {
+    # Pin to private interfaces only — never add `listen 0.0.0.0:443`.
+    listen <NGINX_LAN_IP>:443 ssl;
+    listen <NGINX_TS_IP>:443 ssl;
+    http2 on;
+    server_name <SERVER_NAME>;
+
+    ssl_certificate     <CERT_PATH>;
+    ssl_certificate_key <KEY_PATH>;
+
+    allow 100.64.0.0/10;
+    allow <LAN_CIDR>;
+    deny  all;
+
+    proxy_http_version 1.1;
+    proxy_set_header   Host              $http_host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_set_header   Upgrade           $http_upgrade;
+    proxy_set_header   Connection        $connection_upgrade;
+
+    proxy_buffering         off;
+    proxy_request_buffering off;
+    proxy_read_timeout      1h;
+
+    location / {
+        proxy_pass http://<STREMIO_UPSTREAM>;
+    }
+}
+```
+
+## Common Gotchas
+
+- **Loopback bind (`127.0.0.1`):** Fail-safe default only; unreachable from LAN, Tailscale, or Dockerized reverse proxies.
+- **`0.0.0.0` bind:** Exposes the port on every interface (`docker0`, `tailscale0`, LAN). Prefer explicit interface IPs.
+- **Host firewall:** Under rootless Docker, published ports enter `INPUT` (see [rootless-docker.md](rootless-docker.md)); allow only your reverse proxy's single pinned IP, and remember Tailscale's `ts-input` bypasses `ufw` unless restricted via Tailscale ACLs.
+- **Default vhost fingerprinting:** Set your reverse proxy's unmatched-host default site to `404` or connection close.
+- **WSL2:** Default NAT mode may need `netsh portproxy` on Windows, or opt-in `mirrored` networking in `~/.wslconfig`.

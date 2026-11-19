@@ -19,6 +19,7 @@ Security hardening for edge cases:
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable, MutableMapping, Sequence
 from typing import Any
@@ -31,9 +32,30 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_WHITESPACE = frozenset(b" \t\n\r")
 _LIST_KEYS = ("streams", "sources")
 _LOGIN_PATHS = frozenset({"/configure/login", "/admin/login"})
+_PREFIXED_CONFIGURE_LOGIN = re.compile(r"\A/s/[^/]+/configure/login\Z")
 _LOGIN_RATE_PER_SECOND = 6 / 60
 _LOGIN_BURST = 5.0
 _TOO_MANY_LOGINS_BODY = b'{"detail":"Too many login attempts; wait a minute and try again."}'
+# Hard ceiling on bytes buffered while sniffing or inspecting a response body,
+# so a large 200 OK JSON or text stream cannot exhaust container memory.
+_MAX_INSPECT_BYTES = 16 * 1024 * 1024
+# Baseline browser security headers for direct Comet access (such as a loopback
+# Cloudflare Access owner portal). The public gateway hides and replaces these
+# with its own stricter policy.
+_SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"same-origin"),
+    (
+        b"content-security-policy",
+        b"frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'",
+    ),
+    (
+        b"permissions-policy",
+        b"camera=(), microphone=(), geolocation=(), payment=(), usb=(), browsing-topics=()",
+    ),
+)
+_SECURITY_HEADER_NAMES = frozenset(name for name, _ in _SECURITY_HEADERS)
 
 
 class _LoginBudget:
@@ -56,6 +78,24 @@ class _LoginBudget:
 
 
 _LOGIN_BUDGETS = {path: _LoginBudget() for path in _LOGIN_PATHS}
+
+
+def _login_budget_for_path(path: str) -> _LoginBudget | None:
+    normalized = path.rstrip("/")
+    budget = _LOGIN_BUDGETS.get(normalized)
+    if budget is not None:
+        return budget
+    if _PREFIXED_CONFIGURE_LOGIN.fullmatch(normalized):
+        return _LOGIN_BUDGETS["/configure/login"]
+    return None
+
+
+def _with_security_headers(
+    headers: Sequence[tuple[bytes, bytes]],
+) -> list[tuple[bytes, bytes]]:
+    kept = [(name, value) for name, value in headers if name.lower() not in _SECURITY_HEADER_NAMES]
+    kept.extend(_SECURITY_HEADERS)
+    return kept
 
 
 def _is_torznab_path(path: str) -> bool:
@@ -179,10 +219,12 @@ async def _send_json_response(
         {
             "type": "http.response.start",
             "status": status,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode("ascii")),
-            ],
+            "headers": _with_security_headers(
+                [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ]
+            ),
         }
     )
     await send({"type": "http.response.body", "body": body, "more_body": False})
@@ -217,7 +259,7 @@ class StremioGuardResponseGuard:
             await _send_json_response(send, 404, _NOT_FOUND_BODY)
             return
 
-        login_budget = _LOGIN_BUDGETS.get(str(scope.get("path") or "").rstrip("/"))
+        login_budget = _login_budget_for_path(str(scope.get("path") or ""))
         if (
             login_budget is not None
             and str(scope.get("method") or "").upper() == "POST"
@@ -238,27 +280,40 @@ class StremioGuardResponseGuard:
         sniff_buf = bytearray()
         sniff_pos = 0
         bom_checked = False
+        buffered_bytes = 0
+        overflowed = False
 
         async def send_wrapper(message: MutableMapping[str, Any]) -> None:
-            nonlocal mode, start_message, sniff_pos, bom_checked
+            nonlocal mode, start_message, sniff_pos, bom_checked, buffered_bytes, overflowed
             msg_type = message.get("type")
 
             if msg_type == "http.response.start":
                 headers = message.get("headers") or ()
                 status = int(message.get("status", 0))
+                secured = dict(message)
+                secured["headers"] = _with_security_headers(headers)
                 mode = _classify_response(status, headers)
                 if mode == "passthrough":
-                    await send(message)
+                    await send(secured)
                     return
-                start_message = message
+                start_message = secured
                 return
 
             if msg_type == "http.response.body":
+                if overflowed:
+                    return
                 if mode == "passthrough" or start_message is None:
                     await send(message)
                     return
                 chunk = message.get("body", b"")
                 more_body = bool(message.get("more_body", False))
+                buffered_bytes += len(chunk)
+                if buffered_bytes > _MAX_INSPECT_BYTES:
+                    overflowed = True
+                    sniff_buf.clear()
+                    body_chunks.clear()
+                    await _send_json_response(send, 502, _BAD_GATEWAY_BODY)
+                    return
 
                 if mode == "sniff":
                     if chunk:

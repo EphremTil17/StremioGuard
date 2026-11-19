@@ -186,7 +186,10 @@ def test_ac1_cd_unchanged_json_and_non_stream_objects_preserve_bytes_and_headers
             _run_asgi(guard, _http_scope("/catalog/movie/top.json"))
         )
         assert status == 200
-        assert headers == orig_headers
+        assert headers[: len(orig_headers)] == orig_headers
+        hmap = _header_map(headers)
+        assert hmap[b"x-content-type-options"] == b"nosniff"
+        assert hmap[b"x-frame-options"] == b"DENY"
         assert b"".join(chunks) == raw
 
 
@@ -804,3 +807,93 @@ def test_configure_login_flood_does_not_lock_out_admin_login(
     # ...and is itself paced.
     assert status_of("/admin/login/") == 429
     assert reached.count("/admin/login") == 5
+
+
+def test_prefixed_configure_login_shares_configure_login_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Comet mounts config.router a second time under /s/<PUBLIC_API_TOKEN>."""
+    now = [1000.0]
+    guard, reached = _paced_login_guard(monkeypatch, now)
+
+    def status_of(path: str) -> int:
+        return asyncio.run(_run_asgi(guard, _login_scope(path)))[0]
+
+    assert [status_of("/configure/login") for _ in range(3)] == [303] * 3
+    assert [status_of("/s/tok123/configure/login") for _ in range(2)] == [303] * 2
+    assert status_of("/s/tok123/configure/login") == 429
+    assert status_of("/s/tok123/configure/login/") == 429
+    # Admin login stays independent.
+    assert status_of("/admin/login") == 303
+    assert reached.count("/s/tok123/configure/login") == 2
+
+
+def test_oversized_inspected_or_sniffed_body_fails_closed_with_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large 200 OK JSON or text response cannot buffer past _MAX_INSPECT_BYTES."""
+    import stremioguard.overrides.response_guard as guard_mod
+
+    monkeypatch.setattr(guard_mod, "_MAX_INSPECT_BYTES", 128)
+    for headers, chunks_to_send in (
+        ([(b"content-type", b"application/json")], [b'{"streams":', b"x" * 200, b"y" * 200]),
+        ([(b"content-type", b"text/plain")], [b" " * 80, b" " * 80, b"{}"]),
+        ([(b"content-type", b"text/plain")], [b"{" + b"a" * 80, b"b" * 80]),
+    ):
+
+        async def inner(
+            scope: Any,
+            receive: Any,
+            send: Any,
+            *,
+            hdrs: list[tuple[bytes, bytes]] = headers,
+            parts: list[bytes] = chunks_to_send,
+        ) -> None:
+            await send({"type": "http.response.start", "status": 200, "headers": list(hdrs)})
+            for idx, part in enumerate(parts):
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": part,
+                        "more_body": idx < len(parts) - 1,
+                    }
+                )
+
+        guard = StremioGuardResponseGuard(inner)
+        status, resp_headers, out_chunks = asyncio.run(
+            _run_asgi(guard, _http_scope("/s/tok/cfg/playback/a/0/0/n/n"))
+        )
+        assert status == 502
+        assert b"".join(out_chunks) == b'{"detail":"Bad Gateway"}'
+        hmap = _header_map(resp_headers)
+        assert hmap[b"x-content-type-options"] == b"nosniff"
+        assert hmap[b"x-frame-options"] == b"DENY"
+
+
+def test_security_headers_replace_weaker_upstream_values() -> None:
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/html"),
+                    (b"X-Frame-Options", b"ALLOWALL"),
+                    (b"Content-Security-Policy", b"default-src *"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"<html/>", "more_body": False})
+
+    guard = StremioGuardResponseGuard(inner)
+    status, headers, _ = asyncio.run(_run_asgi(guard, _http_scope("/admin/dashboard")))
+    assert status == 200
+    names = [k.lower() for k, _ in headers]
+    assert names.count(b"x-frame-options") == 1
+    assert names.count(b"content-security-policy") == 1
+    hmap = _header_map(headers)
+    assert hmap[b"x-frame-options"] == b"DENY"
+    assert hmap[b"x-content-type-options"] == b"nosniff"
+    assert hmap[b"referrer-policy"] == b"same-origin"
+    assert b"frame-ancestors 'none'" in hmap[b"content-security-policy"]
+    assert b"camera=()" in hmap[b"permissions-policy"]

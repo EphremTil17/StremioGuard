@@ -30,6 +30,7 @@ _REQUIRED_GUARD_CONTAINER_PATHS = (
     "/app/comet/api/endpoints/playback.py",
     "/app/comet/stremioguard_stream_guard.py",
     "/app/comet/core/config_validation.py",
+    "/app/comet/api/endpoints/admin.py",
 )
 # Comet's single gunicorn worker runs its anime-mapping refresh synchronously
 # at startup and won't answer ANY request, including /health, until it's
@@ -130,6 +131,13 @@ def import_smoke_test(
         "--rm",
         "--network",
         "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:size=64m,noexec,nosuid,nodev",
         "-w",
         "/app",
         "--entrypoint",

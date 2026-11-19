@@ -219,6 +219,18 @@ def verify_response_guard() -> list[str]:
     if stream_status != 200:
         findings.append(f"stream probe failed: expected status 200, got {stream_status}")
     else:
+        stream_header_map = {k.lower(): v for k, v in _stream_headers}
+        for header_name in (
+            b"x-content-type-options",
+            b"x-frame-options",
+            b"referrer-policy",
+            b"content-security-policy",
+            b"permissions-policy",
+        ):
+            if header_name not in stream_header_map:
+                findings.append(
+                    f"response guard missing security header {header_name.decode('ascii')!r}"
+                )
         try:
             payload = json.loads(stream_body)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -229,6 +241,32 @@ def verify_response_guard() -> list[str]:
                 findings.append(
                     f"stream probe failed: expected {expected_streams!r}, got {actual_streams!r}"
                 )
+
+    budget_lookup = getattr(guard_mod, "_login_budget_for_path", None)
+    if budget_lookup is None or budget_lookup("/s/probe/configure/login") is not budget_lookup(
+        "/configure/login"
+    ):
+        findings.append("response guard does not pace prefixed /s/<token>/configure/login")
+
+    admin_mod = importlib.import_module("comet.api.endpoints.admin")
+    is_secure = getattr(admin_mod, "_is_secure_request", None)
+    if is_secure is None:
+        findings.append("admin endpoint is missing _is_secure_request cookie patch")
+    else:
+        fake_req = types.SimpleNamespace(
+            headers={"x-forwarded-proto": "https"},
+            url=types.SimpleNamespace(scheme="http"),
+        )
+        if not is_secure(fake_req):
+            findings.append("admin _is_secure_request did not honor X-Forwarded-Proto: https")
+    admin_login_routes = [
+        route for route in admin_mod.router.routes if getattr(route, "path", None) == "/admin/login"
+    ]
+    if not admin_login_routes or any(
+        getattr(route, "endpoint", None) is not admin_mod.admin_login
+        for route in admin_login_routes
+    ):
+        findings.append("POST /admin/login route is no longer bound to admin_login")
 
     prefix = getattr(models_mod, "STREMIO_API_PREFIX", "") or ""
     torznab_path = f"{prefix}/torznab/api"

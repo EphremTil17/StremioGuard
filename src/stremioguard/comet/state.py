@@ -3,7 +3,7 @@
 Distinct from `comet.lock.py` (repo-owned: the last commit/digest the
 maintainers validated). This tracks which digest THIS deployment is actually
 running, so `./stremio` never renders a floating `:latest` tag once an
-install has resolved a digest — see docs/implementation-plan.md Phase 4.
+install has resolved a digest — see docs/comet.md.
 """
 
 from __future__ import annotations

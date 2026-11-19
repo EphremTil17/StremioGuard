@@ -1,315 +1,40 @@
 # Comet Patches
 
-This project applies a small set of managed runtime patches to Comet in order to
-make it behave better in a self-hosted StremioGuard deployment.
-
-The goal is not to fork Comet permanently. The goal is to keep upstream Comet
-vendored as-is, then generate a few narrow override files during setup/start so
-that:
-
-- proxy behavior remains reproducible
-- formatting stays readable on TV clients
-- Torrentio-backed episode results survive more like native Torrentio
-- Torrentio-style ranking signals are preserved more faithfully
-- the native RTN numeric rank remains visible beside the stream size
-
-## Why Patch Comet
-
-Stock Comet is powerful, but in this setup there were a few practical gaps:
-
-1. Stream presentation was noisy for TV use.
-2. Torrentio scraper output was not always preserved well when Comet consumed
-   resolved/debrid-style Torrentio results.
-3. Episode results inside season packs were being dropped too aggressively.
-4. Title filtering could reject valid results whose outer release title did not
-   strictly match the Stremio metadata title, even when the resolved filename
-   clearly matched the requested episode.
-5. Some valid results survived filtering but were still ranked or labeled badly
-   because Comet parsed a stripped filename instead of Torrentio's richer title
-   line.
-
-That last point matters a lot for multilingual and branded titles. Native
-Torrentio is often more permissive there, so without patching, Comet could show
-far fewer results than the user expected.
+StremioGuard applies a declarative set of runtime overrides to Comet so the upstream `g0ldyy/comet` image stays untouched while enforcing VPN/security invariants and TV-friendly stream presentation.
 
 ## Methodology
 
-The patch strategy is dynamically compiled and verified:
-
-- We extract the original source code directly from the **active image's**
-  own layer structure (e.g. `g0ldyy/comet@sha256:...`) at runtime.
-- We generate override files dynamically under `.stremio/comet/` and mount
-  them read-only into the container.
-
-### Patch Specs & Requirements
-
-Each patch is managed as a declarative spec with an explicit requirement class:
-
-| Patch Name | Feature / Purpose | Requirement Class | Degraded Mode (If Failed) |
-|------------|-------------------|-------------------|---------------------------|
-| `stream` | P2P stream block (structural second layer via `_assert_p2p_blocked`), amber uncached marker, TV-readable stream naming, gateway playback URLs, and RTN rank display | `REQUIRED` | Hard failure in every deployment: it carries the inner `stream.py` P2P block (`_assert_p2p_blocked`), a structural second layer behind `response_guard`, and is a required half of the current RTN display contract. |
-| `media_search` | Carries RTN scores to stream rendering | `REQUIRED` | Hard failure; score display cannot silently disappear. |
-| `config` | Protected gateway `/configure` credentials integration | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; the gateway deployment is not published. |
-| `template` | Configure page installer link customization | `REQUIRED_WHEN_GATEWAY` | Hard failure if gateway enabled; the gateway deployment is not published. |
-| `torrentio` | Preserves richer Torrentio scraper title and index metadata | `OPTIONAL` | Falls back to stock Torrentio parser (missing HDR, resolution tags on some items). |
-| `filtering` | Permissively filters branded/multilingual titles | `OPTIONAL` | Falls back to stock strict title matching. |
-| `formatter` | Curated TV-safe emoji/text layout | `OPTIONAL` | Stream labels default to upstream format layout. |
-| `orchestration` | Preserves episode-pack season priority and badges | `OPTIONAL` | Season pack items are dropped or ranked below single files. |
-| `logger` | Secret redaction in Comet's logs: upstream's `censor()` printed the first half of every secret (the TorBox key, admin and configure-page passwords, database credentials), `censor_url()` masked only URLs containing `://`, the protected API prefix showed ten characters of the public API token, and scraper errors printed TorBox's API key in full plus raw exceptions whose URLs carry configs. `censor()` and the token preview now print `********`, `censor_url()` masks userinfo with or without a scheme, and `DATABASE_URL` always carries the `postgresql://` scheme. Both log sinks (stderr and the `/admin/api/logs` capture) write through a scrubber that masks every credential setting's value wherever it appears, and the debrid keys of recently parsed addon configs, and scraper errors show only scheme and host (see [security-model.md](security-model.md)) | `REQUIRED` | Hard failure; a candidate whose masking code moved is rejected rather than allowed to leak. |
-| `api_app` | Hardened API key management and response guard installation: logs each request's route template (`/s/{token}/{b64config}/…`, via upstream's `_metrics_route`) instead of the raw path containing user credentials, installs `StremioGuardResponseGuard` as the outermost user middleware on `app`, and turns off credentials in upstream's allow-every-origin CORS setup, so no other site can read a page with your session | `REQUIRED` | Hard failure; a drifted candidate, a missing `app = FastAPI(` line or a changed CORS setup is rejected so neither the guard nor the CORS fix can be silently omitted. |
-| `stream_guard` | Stream proxy hardening, installed into the `mediaflow_proxy` library behind `/playback`: proxy headers come only from the request's own `Range`/`If-Range`, never from `h_`/`r_`/`rp_`/`x_headers` query parameters; the proxy connects only to plainly public addresses (reserved forms refused; IPv6 forms carrying an IPv4 address, NAT64 included, judged by that address), on the first request and on every redirect; upstream errors reach the client as a status and a fixed message; `admission_key` counts a gateway request's concurrent streams under its token's ID, only for a loopback request without any client-address header (Comet's server trusts `X-Forwarded-For` from anyone) | `REQUIRED` | Hard failure; the import smoke test also checks that it is installed. |
-| `playback` | Routes `/playback`'s proxy headers through `stream_guard` (and imports it, installing its connector and error handling), and counts its concurrent-stream limit per gateway token (`X-StremioGuard-Client`, honoured only from the gateway's loopback connection) instead of in one pool for every gateway client; the `ip` Comet passes to debrid services is unchanged | `REQUIRED` | Hard failure; a changed playback endpoint is rejected. |
-| `config_limits` | Bounded addon config parsing in `comet/core/config_validation.py`: a config over 8 KB of base64 or with more than 10 debrid services is invalid (refused by a strict check, the default config otherwise, as upstream treats any invalid config), and at most 256 parsed configs are cached (upstream 4096); every valid config's debrid keys are handed to the `logger` scrubber, which masks them from then on | `REQUIRED` | Hard failure; a changed config validation is rejected, and the import smoke test checks the limits by behaviour. |
-| `response_guard` | Response-boundary P2P filter and torznab block (`StremioGuardResponseGuard` pure-ASGI middleware): enforces that no top-level JSON `streams` list leaves Comet with a P2P entry (`infoHash` or `magnet:` `url`/`externalUrl`) across any JSON media type (`<type>/json`, `<type>/<subtype>+json`) as well as non-206 responses with missing/empty `content-type` or `text/plain` whose body begins (after optional UTF-8 BOM and JSON whitespace) with `{` or `[` (refusing non-identity `content-encoding` with 502 while streaming binary/206/non-JSON bodies unbuffered), and answers every request with a `torznab` path segment with 404 (alongside `DISABLE_TORRENT_STREAMS=True`) | `REQUIRED` | Hard failure; Comet cannot run without the response-boundary guard mounted. |
-
-### Canary & PR Flow for Maintainers
-
-To keep these patches robust against upstream updates, the project operates
-an automated validation pipeline:
-
-1. **Daily Canary Workflow:** A daily GitHub Actions job
-   (`.github/workflows/comet-canary.yml`) compares the upstream registry
-   digest of `:latest` against the lock's `tested_digest`.
-2. **Automated Validation:** If a new digest is detected, the job runs
-   `python -m stremioguard.comet.validate` to extract, patch, compile, and
-   import-smoke-test the entire patch suite inside the candidate image. The
-   import-smoke stage imports every patched module, scans all nested code
-   objects for undefined globals/names, and drives the real `app` through
-   ASGI to prove `StremioGuardResponseGuard` is the outermost middleware,
-   strips P2P entries from JSON `streams` lists, and blocks torznab with 404.
-   The validator force-enables every feature (gateway on, episode packs on)
-   so `tested_digest` vouches for all deployment shapes, and any skipped patch
-   — even an optional one — fails the run as upstream drift.
-3. **Feedback Actions:**
-   - **Pass:** The canary opens an automated PR bumping `tested_digest` in
-     `vendor/comet.lock.json`, embedding the JSON validation report.
-   - **Fail:** The canary opens (or comments on) a tracking issue carrying
-     the `comet-canary` marker label, with the failure diagnostic from the
-     JSON report, so maintainers can update the patch anchors.
-
-The regression gate (`.github/workflows/ci.yml`) runs the same validator
-against the lock's current `tested_digest` on every push and PR, so a change
-to `src/stremioguard/overrides/` that breaks against the digest we claim to
-support cannot land.
-
-The generated files currently include:
-
-- `formatting.py`
-- `stream.py`
-- `media_search.py`
-- `torrentio.py`
-- `filtering.py`
-- `orchestration.py`
-- `metadata_service.py`
-- `config.py`
-- `index.html`
-- `app.py`
-- `stremioguard_response_guard.py`
-- `logger.py`
-
-## Current Patch Logic
-
-### 1. Formatter patch
-
-Purpose:
-
-- reduce emoji-heavy output
-- make stream rows easier to scan on dark TV interfaces
-
-Approach:
-
-- switch Comet formatting to a plainer style
-- use a small curated symbol set and simpler left-side naming
-
-### 2. RTN rank-context and display patch
-
-Purpose:
-
-- preserve the numeric RTN score that Comet already calculated
-- show `R:<score>` beside the stream size without changing native result order,
-  cache policy, or playback behaviour
-
-Approach:
-
-- patch the current `services/media_search.py` handoff to add a scalar
-  `rtn_ranks` map to `MediaSearchResult`
-- derive that map from `torrent_manager.ranked_torrents` after Comet has
-  completed native RTN ranking
-- patch `api/endpoints/stream.py` to read
-  `search_result.rtn_ranks.get(info_hash)` while it formats each result
-- render `10.6 GB • R:5850` when a size exists; render a separate
-  `– R:5850` line when it does not
-
-This is a presentation-only handoff. StremioGuard never sorts, recomputes,
-promotes, or otherwise interprets an RTN rank. The current architecture is:
-
-```text
-TorrentManager.ranked_torrents
-  -> MediaSearchResult.rtn_ranks
-  -> stream endpoint display
-```
-
-The old endpoint-owned `torrent_manager` shape is deliberately unsupported.
-If Comet changes this handoff, rendering fails closed and the patch must be
-deliberately updated for the new architecture; no legacy shim is retained.
-
-### 3. Stream-name patch
-
-Purpose:
-
-- reduce left-side duplication like `TB`, `Comet`, and raw resolution spam
-- degrade more gracefully when a torrent lacks explicit resolution metadata
-- keep cached status visible: the compact names drop Comet's `⚡`/`⬇️`
-  icons, so an uncached entry's media-type line (`WEB-DL`, `BluRay`, …)
-  starts with an amber `🔸` instead of the usual `–`. Stremio cannot colour
-  text on any client, so this glyph is the nearest thing to an amber row;
-  cached entries are unchanged
-- never offer direct-torrent (P2P) streams: Stremio plays those with the
-  client device's own torrent engine, outside the VPN. Torznab is disabled
-  (`DISABLE_TORRENT_STREAMS=True` and 404 at `response_guard`), and
-  `response_guard` (`StremioGuardResponseGuard`) enforces P2P removal at
-  Comet's ASGI response boundary for every top-level JSON `streams` list.
-  In `stream.py`, forcing `enable_torrent = False` and checking it with
-  `_assert_p2p_blocked` acts as a structural second layer; both `stream` and
-  `response_guard` are `REQUIRED` in every deployment
-
-Approach:
-
-- normalize the left-side label to mostly resolution-oriented naming such as
-  `UHD`, `FHD`, `HD`
-- add a compact inline HDR indicator like `UHD | HDR` when the parsed metadata
-  clearly contains `HDR` or `DV`
-- if resolution is missing, fall back to more useful labels such as:
-  - `WEBRip`
-  - `WEB-DL`
-  - `HDTV`
-  - weak codec/container hints in lower-confidence cases
-
-### 4. Torrentio scraper patch
-
-Purpose:
-
-- support configured/native Torrentio-style resolved results better
-- preserve richer ranking metadata from Torrentio instead of collapsing too
-  early to a bare filename
-
-Approach:
-
-- extract `infoHash` and `fileIndex` not only from direct scraper fields, but
-  also from:
-  - `behaviorHints.bingeGroup`
-  - resolved Torrentio URLs
-  - resolved filename hints
-- keep both:
-  - a richer display title for RTN parsing/ranking
-  - a resolved filename for exact episode/file matching
-- prefer the most metadata-rich line when Torrentio returns a multi-line title
-  block with one line for release metadata and another for the resolved file
-
-This lets Comet ingest more of the same results that native Torrentio surfaces.
-It also reduces cases where a result survives filtering but gets buried because
-resolution, HDR, quality, or codec signals were lost before parsing.
-
-### 5. Episode-pack preservation patch
-
-Purpose:
-
-- avoid dropping valid episode results just because they came from a season pack
-  and the parsed metadata lacked explicit episode detail
-
-Approach:
-
-- relax Comet's episode-scope gate when there is still strong evidence that a
-  result belongs to the requested season/episode context
-- retain candidates with a usable playback identity when episode metadata is
-  incomplete, malformed, cached, or only partially resolved
-- use the P badge to show credible multi-file evidence; it does not claim that
-  a complete season is present
-- preserve Comet/RTN native ranking and cached/uncached behavior. Pack status
-  never moves a lower-ranked pack ahead of another result
-
-This patch is optional in setup and is controlled by:
-
-- `COMET_PATCH_EPISODE_PACK_RESULTS=1`
-
-### 6. Title-compatibility filtering patch
-
-Purpose:
-
-- preserve results where the resolved file clearly matches the requested title,
-  but the outer torrent title is branded, multilingual, or otherwise formatted
-  differently from the metadata title
-
-Approach:
-
-- first try stock `title_match(...)`
-- if that fails, inspect stronger evidence:
-  - parsed title
-  - raw source title
-  - resolved filename
-- if those clearly contain the requested Stremio title phrase, keep the result
-
-This is deliberately heuristic rather than a static studio-name mapping.
-
-## What These Patches Fix In Practice
-
-In practice, the patch set is aimed at a few recurring Torrentio/Comet mismatch
-patterns:
-
-1. Branded or multilingual titles such as `Marvel's Daredevil` versus plain
-   `Daredevil`
-2. Season-pack results where Torrentio already resolved a concrete episode file
-3. Multi-line Torrentio titles where the first line contains the useful ranking
-   metadata but a later line contains only the resolved filename
-4. Results with incomplete resolution metadata that should still display as
-   `WEBRip` or `HDTV` instead of `unknown`
-
-The goal is not to duplicate Torrentio internals exactly. The goal is to keep
-the same kinds of evidence Torrentio already gives us, then let Comet preserve
-and use that evidence more faithfully.
-
-## Why This Is Safer Than Ad-Hoc Container Patching
-
-This project used to rely more heavily on “patch and test” style iteration while
-developing the behavior. The standardized version is safer because:
-
-- overrides are regenerated deterministically
-- they live in project-controlled state on disk
-- mounts are visible in the generated Compose override
-- rebuild/restart does not lose the patch behavior
-
-## Known Tradeoffs
-
-These patches improve parity, but they are still heuristics.
-
-Tradeoffs:
-
-- more permissive matching can admit occasional false positives
-- upstream Comet changes can require refreshes to the patch generator
-- exact native Torrentio parity is still not guaranteed
-
-- RTN score display supports the current `MediaSearchResult` architecture
-  only; an upstream boundary change stops the compatible bundle rather than silently displaying incomplete information
-
-So the philosophy here is:
-
-- preserve obviously valid results
-- stay conservative enough to avoid garbage
-- avoid turning this into a giant custom fork
-
-## Areas for Improvement
-
-The best future improvements are:
-
-1. Prefer resolved filename/file-level evidence even more systematically.
-2. Carry scraper provenance through the full pipeline more explicitly.
-3. Version or invalidate local Comet cache more intelligently when patch logic
-   changes.
-4. Reduce the amount of source-code text replacement by moving toward more
-   structured extension points if upstream Comet ever exposes them.
-
-## Practical Recommendation
-
-If you enable Comet in StremioGuard, the optional episode/title compatibility
-patches are strongly recommended. Without them, Comet may surface materially
-fewer episode results than native Torrentio for some titles.
+On install, update, or start, StremioGuard extracts `/app/comet` directly from the pinned Comet image (no vendored git checkout is used), renders each override with strict fail-closed anchor matching (`replace_first_matching`), writes `.stremio/comet/bundles/<digest>/bundle-manifest.json`, and bind-mounts the rendered files read-only into the container.
+
+## Patch Specs & Requirements
+
+| Patch Name | Target in Container | Purpose | Requirement | If Anchor Drifts |
+| :--- | :--- | :--- | :--- | :--- |
+| `api_app` | `/app/comet/api/app.py` | Logs route templates (`_metrics_route`) instead of raw paths carrying tokens/configs, installs `StremioGuardResponseGuard` as outermost middleware, and disables credentialed wildcard CORS (`allow_credentials=False`) | `REQUIRED` | Hard failure |
+| `response_guard` | `/app/comet/stremioguard_response_guard.py` | Pure-ASGI boundary: strips P2P entries (`infoHash`, `magnet:`, `sources`) from top-level JSON `streams`/`sources` across all JSON media types and non-206 `text/plain`/untyped JSON bodies; refuses non-identity `content-encoding` or inspected/sniffed bodies >16 MiB with `502`; blocks `torznab` paths with `404`; paces `/configure/login` (including `/s/<token>/configure/login`) and `/admin/login` in separate 6/min budgets; emits baseline browser security headers on every response | `REQUIRED` | Hard failure |
+| `stream_guard` | `/app/comet/stremioguard_stream_guard.py` | Hardens `mediaflow_proxy`: builds proxy headers only from client `Range`/`If-Range` (ignoring `h_`/`r_`/`rp_`/`x_headers` query params), enforces `PublicOnlyConnector` on initial connections and redirects (blocking loopback, private, link-local, reserved, multicast, `3fff::/20`, and embedded IPv4/NAT64 forms), redacts upstream error bodies, and counts concurrent proxied streams per gateway token ID (`X-StremioGuard-Client`) only on loopback requests carrying no client-IP header | `REQUIRED` | Hard failure |
+| `playback` | `/app/comet/api/endpoints/playback.py` | Wires `/playback` into `stream_guard` (`safe_proxy_headers`, `admission_key`, and module import installing the connector/error handler) | `REQUIRED` | Hard failure |
+| `config_limits` | `/app/comet/core/config_validation.py` | Rejects `b64config` >8 KB or >10 `debridServices`, shrinks config LRU cache to 256 (upstream 4096), and feeds every parsed config's debrid keys to the log scrubber | `REQUIRED` | Hard failure |
+| `admin` | `/app/comet/api/endpoints/admin.py` | Honors `X-Forwarded-Proto` when setting the `Secure` attribute on `admin_session` so TLS-terminated portals (e.g. Cloudflare Access) emit `Secure` cookies | `REQUIRED` | Hard failure |
+| `logger` | `/app/comet/core/logger.py` | Replaces half-value `censor()` and token previews with `********`, fixes scheme-less `censor_url()`, scrubs all loguru sinks (stderr and `/admin/api/logs`), trims scraper error URLs to scheme+host, routes stdlib logging into scrubbed loguru, and scrubs `logging.StreamHandler.format` so non-propagating loggers (`gunicorn.error`, `uvicorn.error`) cannot bypass scrubbing | `REQUIRED` | Hard failure |
+| `stream` | `/app/comet/api/endpoints/stream.py` | Structural second-layer P2P block (`enable_torrent = False`, AST-checked by `_assert_p2p_blocked`), compact TV-readable stream names (`UHD \| HDR \| P`), amber `🔸` uncached marker, `R:<score>` display beside size, and validated `X-Forwarded-*` playback URLs | `REQUIRED` | Hard failure |
+| `media_search` | `/app/comet/services/media_search.py` | Carries RTN's already-calculated scalar `rtn_ranks` map on `MediaSearchResult` to `stream.py` (presentation-only; never reorders or recalculates ranks) | `REQUIRED` | Hard failure |
+| `config` | `/app/comet/api/endpoints/config.py` | Validates `X-Forwarded-Prefix` / `X-Forwarded-Proto` for gateway configure redirects and `configure_session` `Secure` cookies | `REQUIRED_WHEN_GATEWAY` | Hard failure when gateway is enabled |
+| `template` | `/app/comet/templates/index.html` | Rewrites configure-page install/copy URLs to target the gateway base URL and preserve token paths | `REQUIRED_WHEN_GATEWAY` | Hard failure when gateway is enabled |
+| `formatter` | `/app/comet/utils/formatting.py` | Curated TV-safe layout when `COMET_RESULT_FORMAT_STYLE=plain` | `OPTIONAL` | Falls back to upstream formatting |
+| `torrentio` | `/app/comet/scrapers/torrentio.py` | Preserves richer multi-line Torrentio outer titles for RTN parsing while passing resolved filenames/file indices separately | `OPTIONAL` | Falls back to stock Torrentio parser |
+| `filtering` | `/app/comet/services/filtering.py` | Permissively retains branded/multilingual titles when resolved filename/raw title clearly matches the requested media title | `OPTIONAL` | Falls back to stock strict title match |
+| `orchestration` | `/app/comet/services/orchestration.py` | Preserves season-pack episode candidates when `COMET_PATCH_EPISODE_PACK_RESULTS=1` and badges credible pack-backed items with `P` without altering RTN rank order | `OPTIONAL` | Season-pack candidates use stock filtering |
+| `metadata_service` | `/app/comet/metadata_service.py` | Bounded (1,024-entry) episode-count cache backed by Comet's DB with a 2 MiB-capped, no-redirect, `PublicOnlyConnector` Cinemeta fallback | `OPTIONAL` | Episode-pack lookup falls back to treating multi-episode candidates as packs |
+
+## Key Invariants & Tradeoffs
+
+- **Dual-layer P2P prevention:** `DISABLE_TORRENT_STREAMS=True`, `stream.py` (`_assert_p2p_blocked`), and `StremioGuardResponseGuard` work together so Stremio clients never receive a direct-torrent stream that would bypass the VPN.
+- **Presentation-only RTN scores:** `TorrentManager.ranked_torrents -> MediaSearchResult.rtn_ranks -> stream.py` forwards scalar ranks for display only (`10.6 GB • R:5850`). No legacy shim exists for retired Comet layouts.
+- **Heuristics are optional and best-effort:** `torrentio`, `filtering`, and `orchestration` improve parity with native Torrentio for branded titles and season packs, at the trade-off of occasional permissive matches.
+
+## Canary & CI Validation Flow
+
+1. **Daily Canary (`.github/workflows/comet-canary.yml`):** Compares upstream `:latest` against `vendor/comet.lock.json` and runs `python -m stremioguard.comet.validate` with every feature enabled (gateway on, episode packs on, plain style).
+2. **Hardened Import Smoke:** Runs inside the candidate image with `--network none --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp`, imports every patched module, scans all nested bytecode objects for undefined names, and drives the real ASGI app to prove `StremioGuardResponseGuard`, `stream_guard`, `config_limits`, `admin` route binding/cookies, and log scrubbing all hold. Any skipped patch — even an `OPTIONAL` one — fails the canary as drift.
+3. **CI Regression Gate (`.github/workflows/ci.yml`):** Runs the same validator against `tested_digest` on every push and pull request.

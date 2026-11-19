@@ -71,11 +71,12 @@ instead.
 
 If your firewall default-denies inbound, `COMET_GATEWAY_HOST_PORT` becomes
 unreachable the moment you switch, and every container stays healthy while the
-reverse-proxied path returns errors. Add an explicit rule scoped to whatever
-needs to reach it, for example with ufw:
+reverse-proxied path returns errors. Add an explicit rule scoped to the reverse
+proxy's own pinned IP (not its entire Docker subnet; see
+[security-model.md](security-model.md#security-hardening-for-edge-cases)):
 
 ```bash
-sudo ufw allow proto tcp from <proxy-subnet> to <bind-address> port <gateway-port>
+sudo ufw allow proto tcp from <proxy-ip> to <bind-address> port <gateway-port>
 ```
 
 This is worth doing deliberately rather than resenting: the rule that was never

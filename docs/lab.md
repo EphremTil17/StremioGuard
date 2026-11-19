@@ -20,7 +20,7 @@ Options:
 - `--name-prefix <prefix>`: Container and temp directory prefix (default `sglab-`, validated against `^[a-z0-9][a-z0-9-]{0,30}$`).
 - `--pull`: Pull missing images (by default only local images are used).
 
-Matrix coverage:
+Matrix coverage (note: `scripts/lab.py` currently defines cases expecting the public configure routes from before `COMET_GATEWAY_PUBLIC_CONFIGURE` defaulted to `0`; for live gateway integration testing against all modes — default closed, portal redirect, and public configure — run `STREMIOGUARD_DOCKER_TESTS=1 uv run pytest tests/test_gateway_integration.py`):
 
 - Allowed addon routes (`/comet/<token>/s/<api>/manifest.json` with and without config blob, `/stream/...`, `/playback/...`, `/configure`, `/configure/login`) proxied with raw path and query unchanged, `X-Forwarded-Prefix: /comet/<token>` on token routes and none on public `/configure` and `/health`.
 - `Host` with port preserved as both `Host` and `X-Forwarded-Host`, and client `X-Forwarded-For` / `CF-Connecting-IP` stripped before reaching upstream.

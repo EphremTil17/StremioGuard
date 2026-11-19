@@ -42,29 +42,32 @@ https://comet.example.com/comet/<token>/s/<api>/<config>/stream/<type>/<id>.json
 https://comet.example.com/comet/<token>/s/<api>/<config>/playback/<hash>/<svc>/<idx>/<season>/<episode>
 ```
 
-Opening `/comet/<token>` or `/comet/<token>/` answers `302` with a relative
-`Location: /comet/<token>/configure` so token-scoped configure pages keep the
-token in their install/copy links.
+Opening `/comet/<token>` or `/comet/<token>/` returns `403` by default, `302`
+to `<COMET_GATEWAY_CONFIGURE_URL>/configure` when a portal URL is configured, or
+`302` with a relative `Location: /comet/<token>/configure` when
+`COMET_GATEWAY_PUBLIC_CONFIGURE=1`.
 
 ### Allowed and Blocked Routes
 
 Under `/comet/<token>`, the gateway matches tokens byte-for-byte
 (case-sensitively) and allows only the Stremio addon routes Comet actually serves
-plus the token's configure page, evaluated strictly on the raw `$request_uri`
-path (dot segments, empty segments, `%2F`, `%2E`, `%5C`, `\`, `;`, `#`, and
-case variants are denied):
+(plus the token configure routes when `COMET_GATEWAY_PUBLIC_CONFIGURE=1`),
+evaluated strictly on the raw `$request_uri` path (dot segments, empty segments,
+`%2F`, `%2E`, `%5C`, `\`, `;`, `#`, and case variants are denied):
 
 | Allowed shape under `/comet/<token>` | Comet route |
 | :--- | :--- |
 | `/s/<api>/manifest.json`, `/s/<api>/<config>/manifest.json` | Addon manifest |
 | `/s/<api>/stream/<seg>/<seg>.json`, `/s/<api>/<config>/stream/<seg>/<seg>.json` | Stream search |
 | `/s/<api>/<config>/playback/<seg>/<seg>/<seg>/<seg>/<seg>` (5 segments) | Stream playback |
-| `/configure`, `/<config>/configure`, `/s/<api>/configure`, `/s/<api>/<config>/configure` | Configure page (only with `COMET_GATEWAY_PUBLIC_CONFIGURE=1`) |
-| `/configure/login` | Configure form login POST target (only with `COMET_GATEWAY_PUBLIC_CONFIGURE=1`) |
+| `/configure`, `/<config>/configure`, `/s/<api>/configure`, `/s/<api>/<config>/configure` | Configure page (only with `COMET_GATEWAY_PUBLIC_CONFIGURE=1`; redirects to portal if `COMET_GATEWAY_CONFIGURE_URL` is set) |
+| `/configure/login` | Configure form login POST target (only with `COMET_GATEWAY_PUBLIC_CONFIGURE=1`; redirects to portal if `COMET_GATEWAY_CONFIGURE_URL` is set) |
 
-Everything else under `/comet/<token>/` (and at top level outside the public
-routes `/`, `/configure`, `/configure/...`, `/static/`, `/health`) is denied
-with `403` (`503` when rate-limited) and never reaches Comet, including:
+Everything else under `/comet/<token>/` (and at top level outside `/health`,
+plus `/`, `/configure`, `/configure/...`, `/static/` only when
+`COMET_GATEWAY_PUBLIC_CONFIGURE=1`, or portal redirects on `/` and
+`/configure/...` when `COMET_GATEWAY_CONFIGURE_URL` is set) is denied with `403`
+(`503` when rate-limited) and never reaches Comet, including:
 
 - `/s/<api>/<config>/debrid-sync/...`: blocked deliberately. If a user enables
   "scrape debrid account torrents", Comet's "Comet Sync" stream entry points at
@@ -154,10 +157,22 @@ needs access.
 
 ## Reverse Proxy
 
-Point the public Comet domain to the gateway port, not the raw Comet port:
+Point the public Comet domain to the gateway port, not the raw Comet port. For
+Nginx Proxy Manager, paste this complete block into the proxy host's
+**Advanced** tab (NPM inserts it at server level after its own log directives):
 
 ```nginx
+# Server level: NPM's Force-SSL/Block-Exploits includes `return` and read an
+# uninitialized variable before a location is chosen, which would log the full
+# request line (token + config blob). Cap bodies at 64 KB here too, before NPM
+# buffers up to 2000 MB to disk.
+access_log off;
+uninitialized_variable_warn off;
+client_max_body_size 64k;
+
 location / {
+    access_log off;
+    error_log /data/logs/proxy-host-<id>_error.log crit;
     proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-For "";
     proxy_set_header X-Real-IP "";
@@ -166,12 +181,17 @@ location / {
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $http_connection;
     proxy_http_version 1.1;
-    proxy_pass http://<SERVERIP:18001>$request_uri;
+    proxy_pass http://<HOST_IP:18001>$request_uri;
 }
 ```
 
-Replace `<SERVERIP:18001>` with the host address and
-`COMET_GATEWAY_HOST_PORT` your reverse proxy can reach.
+Replace `<HOST_IP:18001>` with the host address and `COMET_GATEWAY_HOST_PORT`
+your reverse proxy can reach, and `<id>` with your NPM proxy host ID (for raw
+nginx outside NPM, replace the `error_log` path with your vhost's error log).
+Keep `$request_uri` on `proxy_pass` so the reverse proxy forwards the raw path
+without normalizing `%2F` or dot segments ahead of the gateway's allowlist.
+Do not edit NPM's generated `data/nginx/proxy_host/<id>.conf` directly; NPM
+overwrites it from its database.
 
 The gateway validates `Host` at server level (returning `400` if missing or
 malformed) and preserves `$http_host` — including any non-default port — as both
@@ -341,32 +361,12 @@ per-request log is sanitized by the `api_app` override (see `comet-patches.md`).
 
 This applies to the generated gateway and Comet logs only. Your reverse proxy
 sees the full URL (token and config blob) before the gateway does and must not
-log it either. For Nginx Proxy Manager, put this in the proxy host's
-**Advanced** tab (NPM inserts that text at server level, after its own log
-directives), keeping your existing `location /` settings:
-
-```nginx
-# Server level: NPM's Force-SSL/Block-Exploits includes `return` and read an
-# uninitialized variable *before* a location is chosen, and both log the full
-# request line through the server-level logs.
-access_log off;
-uninitialized_variable_warn off;
-# NPM accepts bodies up to 2000 MB by default and buffers them to disk before
-# the gateway can refuse them; nothing here needs more than the gateway's 64 KB.
-client_max_body_size 64k;
-
-location / {
-    access_log off;
-    error_log /data/logs/proxy-host-<id>_error.log crit;
-    # ... existing proxy_set_header / proxy_pass lines ...
-}
-```
-
-A location-level `error_log` alone is not enough: nginx writes to every error
-log defined at one level, and server-phase warnings never reach the location.
-Do not edit `data/nginx/proxy_host/<id>.conf` directly; NPM regenerates it
-from its database. The gateway's masked access log keeps per-request status
-and timings, so nothing useful is lost.
+log it either — use the complete reverse-proxy block in
+[Reverse Proxy](#reverse-proxy) above. Both the server-level and location-level
+directives are required: nginx writes to every `error_log` defined at a given
+level, and server-phase warnings (`Force-SSL`, `Block-Exploits`) never reach
+`location /`. The gateway's own masked access log keeps per-request status and
+timings, so nothing useful is lost.
 
 ### Log canary
 

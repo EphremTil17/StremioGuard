@@ -325,6 +325,7 @@ MINIMAL_BUNDLE_OUTPUTS = {
     "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
     "playback.py": "/app/comet/api/endpoints/playback.py",
     "config_validation.py": "/app/comet/core/config_validation.py",
+    "admin.py": "/app/comet/api/endpoints/admin.py",
 }
 
 
@@ -491,6 +492,7 @@ REQUIRED_PATCH_OUTPUTS = {
     "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
     "playback.py": "/app/comet/api/endpoints/playback.py",
     "config_validation.py": "/app/comet/core/config_validation.py",
+    "admin.py": "/app/comet/api/endpoints/admin.py",
 }
 
 
@@ -567,9 +569,47 @@ def write_comet_config_validation(
     target.write_text(source, encoding="utf-8")
 
 
+# The upstream shape of comet/api/endpoints/admin.py where the admin cookie patch applies.
+COMET_ADMIN_SOURCE = """\
+from fastapi import APIRouter, Request
+from fastapi.responses import RedirectResponse
+
+router = APIRouter()
+ADMIN_SESSION_COOKIE = "admin_session"
+ADMIN_SESSION_TTL = 86400
+
+
+def create_admin_session():
+    return "tok"
+
+
+@router.post("/admin/login")
+async def admin_login(
+    request: Request,
+):
+    response = RedirectResponse("/admin/dashboard", status_code=303)
+    response.set_cookie(
+        key=ADMIN_SESSION_COOKIE,
+        value=create_admin_session(),
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        max_age=ADMIN_SESSION_TTL,
+    )
+    return response
+"""
+
+
+def write_comet_admin(repo_root: Path, source: str = COMET_ADMIN_SOURCE) -> None:
+    target = repo_root / "comet" / "api" / "endpoints" / "admin.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+
+
 def write_required_comet_sources(repo_root: Path) -> None:
     """Upstream files every required override patches."""
     write_comet_api_app(repo_root)
     write_comet_logger(repo_root)
     write_comet_playback(repo_root)
     write_comet_config_validation(repo_root)
+    write_comet_admin(repo_root)

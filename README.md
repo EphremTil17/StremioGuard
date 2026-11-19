@@ -99,6 +99,22 @@ Tier 2 is the recommended way to reach the stack away from home without exposing
 Point a reverse proxy at the gateway port (`18001` by default), never at Comet directly. Steps
 per tier: [secure access](docs/secure-access.md).
 
+## Security coverage
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/security-coverage-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/security-coverage-light.svg">
+  <img alt="StremioGuard security coverage map (v0.4.2): measured Python unit line+branch coverage alongside estimated audit depth and real-container test markers" src="docs/assets/security-coverage-dark.svg">
+</picture>
+
+Measured unit coverage (`84.9%` line+branch across `src/stremioguard`) comes from
+`uv run python scripts/coverage_by_domain.py`; `overrides/stream_guard.py` reads `0%` there
+because it runs only inside the real Comet image (`STREMIOGUARD_DOCKER_TESTS=1`). Numbers
+labelled `est.` are engineering judgement of audit depth, not formal proofs. Third-party
+sidecars (`stremthru`, `comet-postgres`) are isolated rather than source-audited, and external
+host or reverse-proxy hardening remains user-managed. Full threat boundaries and controls:
+[security model](docs/security-model.md).
+
 ## Documentation
 
 | Read | For |
@@ -107,7 +123,7 @@ per tier: [secure access](docs/secure-access.md).
 | [Watchdog](docs/watchdog.md) | verdicts, lockouts and recovery, systemd supervision, alerts, boot |
 | [Comet](docs/comet.md) | sources, patches, pinning and updates, the token gateway |
 | [Security model](docs/security-model.md) | the exact egress boundary and every defence layer |
-| [All documentation](docs/README.md) | gateway reference, patch notes, Tailscale, the test lab |
+| [All documentation](docs/README.md) | gateway reference, patch specs, rootless Docker, the test lab |
 | [Changelog](docs/changelogs/README.md) | what changed in each release |
 
 ## Development

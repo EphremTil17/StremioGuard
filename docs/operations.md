@@ -24,9 +24,8 @@ With no arguments, `./stremio` behaves like `./stremio start`.
    - the egress IP matches your saved home-IP baseline,
    - `EXPECTED_VPN_IP` is set and does not match, or
    - neither the host's IP nor a baseline is available to compare against.
-6. Starts Stremio inside gluetun's network namespace.
-7. If `COMET_ENABLED=1`, renders Comet's patch bundle from its pinned image and starts Comet
-   plus its PostgreSQL dependency inside the same gluetun network namespace.
+6. If `STREMIO_ENABLED=1`, starts Stremio inside gluetun's network namespace.
+7. If `COMET_ENABLED=1`, renders Comet's patch bundle from its pinned image and starts `comet-postgres`, `stremthru`, `comet`, and (when `COMET_GATEWAY_ENABLED=1`) `comet-gateway` inside gluetun's network namespace.
 8. Starts the watchdog as the `stremioguard-watchdog.service` systemd user unit,
    waits until it reports ready, and returns to the shell. The check that a
    user service manager is reachable runs before step 3, so protected
@@ -34,7 +33,7 @@ With no arguments, `./stremio` behaves like `./stremio start`.
 
 ## Container restart policy
 
-- `stremio`, `comet`, `comet-postgres`, and `comet-gateway` use `restart: "no"` so Docker does not revive them before the verifier and validation checks have run.
+- `stremio`, `comet`, `stremthru`, `comet-postgres`, and `comet-gateway` use `restart: "no"` so Docker does not revive them before the verifier and validation checks have run.
 - `gluetun` uses `restart: unless-stopped` so it can recover across host reboots and transient handshake failures.
 - Every other third-party image (`stremthru`, `comet-gateway`'s nginx, `comet-postgres`, and the `docker compose up` gate's busybox) is pinned by digest; Dependabot proposes bumps, and Postgres majors stay manual because they need a data-directory upgrade. Comet is pinned by the generated override to the digest `./stremio comet update` promoted.
 - `gluetun` is pinned by digest too, and Dependabot proposes its bumps. It is the container the kill switch lives in, and the watchdog relies on details of it (its healthcheck, `wget`, its log wording, the control-server route), so a new release is reviewed rather than picked up by whichever start happens next. `./stremio start`/`restart` best-effort pull the pinned image when it is missing; a failed or slow pull only logs a warning and gluetun boots from the image already on the host.
@@ -95,7 +94,7 @@ The local Stremio image is built from a digest-pinned `tsaridas/stremio-docker` 
   Keeps ffprobe and HLS self-references on loopback instead of probing back out through the reverse proxy.
 
 - `STREMIO_HOST_PORT=11470`
-  Host-side TCP port published by the generated Compose override. The guard maps each selected bind address as `<bind-address>:<STREMIO_HOST_PORT>:11470`.
+  Host-side TCP port published by the generated Compose override. Maps each selected bind address as `<bind-address>:<STREMIO_HOST_PORT>:8080` (the Stremio image's Basic-Auth nginx, which proxies to internal port `11470`). Requires `STREMIO_USERNAME` and `STREMIO_PASSWORD` (12+ chars) unless `STREMIO_ALLOW_NO_AUTH=1`.
 
 - `STREMIO_BIND_ADDRS=127.0.0.1`
   Comma-separated host interfaces for gluetun's published Stremio port. Use a LAN IP plus a Tailscale IP, such as `192.168.1.10,100.64.0.10`, for Tier 1 LAN + Tailscale access without binding on every interface. Set it empty to publish no host port, or use `0.0.0.0` only when you intentionally want every interface.

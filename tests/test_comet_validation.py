@@ -63,6 +63,7 @@ _GUARD_OUTPUTS = {
     "playback.py": "/app/comet/api/endpoints/playback.py",
     "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
     "config_validation.py": "/app/comet/core/config_validation.py",
+    "admin.py": "/app/comet/api/endpoints/admin.py",
 }
 
 
@@ -104,6 +105,10 @@ class ImportSmokeTestTests(unittest.TestCase):
 
         args = runner.run.call_args.args[0]
         self.assertEqual(args[:5], ["docker", "run", "--rm", "--network", "none"])
+        self.assertIn("--cap-drop", args)
+        self.assertEqual(args[args.index("--cap-drop") + 1], "ALL")
+        self.assertIn("no-new-privileges:true", args)
+        self.assertIn("--read-only", args)
         self.assertEqual(args[args.index("--entrypoint") + 1], "uv")
         # Only .py outputs are bind-mounted; the template is not a module.
         self.assertIn(
@@ -125,6 +130,7 @@ class ImportSmokeTestTests(unittest.TestCase):
             args[image_index + 5 :],
             [
                 "comet.api.app",
+                "comet.api.endpoints.admin",
                 "comet.api.endpoints.playback",
                 "comet.api.endpoints.stream",
                 "comet.core.config_validation",

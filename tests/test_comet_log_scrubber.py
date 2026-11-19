@@ -223,3 +223,40 @@ def test_urls_never_show_anything_from_before_an_at_sign(
     scrubber: types.ModuleType, line: str, expected: str
 ) -> None:
     assert scrubber._SG_URL.sub(scrubber._sg_origin_only, line) == expected
+
+
+def test_non_propagating_stream_handlers_scrub_secrets_and_urls(
+    scrubber: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gunicorn and UvicornWorker attach StreamHandlers with propagate=False."""
+    import io
+    import logging
+
+    monkeypatch.setenv("TORBOX_API_KEY", "sgcanaryTORBOXkey0123456789")
+    monkeypatch.setattr(logging.StreamHandler, "format", logging.StreamHandler.format)
+    root = logging.getLogger()
+    before_handlers = list(root.handlers)
+    try:
+        scrubber._sg_route_stdlib_logging()
+        buf = io.StringIO()
+        isolated = logging.getLogger("sg.test.gunicorn.error")
+        isolated.handlers = [logging.StreamHandler(buf)]
+        isolated.propagate = False
+        isolated.setLevel(logging.WARNING)
+        try:
+            raise RuntimeError("boom sgcanaryTORBOXkey0123456789")
+        except RuntimeError:
+            isolated.exception(
+                "ASGI error on https://u:pw@cdn.example/comet/secretToken/stream?k=%s",
+                "sgcanaryTORBOXkey0123456789",
+            )
+        output = buf.getvalue()
+        assert "sgcanaryTORBOXkey0123456789" not in output
+        assert "secretToken" not in output
+        assert "https://cdn.example" in output
+        assert "********" in output
+    finally:
+        root.handlers[:] = before_handlers
+        isolated = logging.getLogger("sg.test.gunicorn.error")
+        isolated.handlers.clear()
+        isolated.propagate = True

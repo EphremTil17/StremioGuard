@@ -71,13 +71,7 @@ What happens when the watchdog stops unexpectedly:
 
 While a lockout marker exists—or while `stremioguard-failsafe.service` is `failed` or `activating` (for example, if the fail-safe could not write the marker to disk)—`./stremio start`, the boot unit, and the watchdog itself all refuse to run (exit 78). Note that systemd forgets a failed unit state across a reboot, so a lockout whose marker could never be written to disk does not survive a host reboot. Recover deliberately with `./stremio restart`, which clears any existing lockout marker once the reset runs (even if VPN preflight fails, handing bounded recovery back to the watchdog, which writes a fresh marker if the VPN does not recover) and resets the failed units after a successful restart; or inspect and clear the marker with `./stremio unlock`.
 
-Start at boot:
-
-```bash
-systemctl --user enable stremioguard.service
-```
-
-If you used the older `@reboot ./stremio start` cron entry or a hand-installed `stremio-vpn-watch.service`, remove them. The CLI warns while the old unit file is present. A watchdog started by a pre-systemd version is stopped automatically on the next `./stremio start`, `restart` or `stop`.
+If you used an older `@reboot ./stremio start` cron entry or a hand-installed `stremio-vpn-watch.service`, remove them. The CLI warns while the old unit file is present, and stops any pre-systemd watchdog automatically on the next `./stremio start`, `restart`, or `stop`.
 
 Without systemd, run `uv run python -m stremioguard.orchestrator start` and keep `uv run python -m stremioguard.orchestrator watchdog` running under a supervisor of your own.
 
@@ -94,10 +88,10 @@ This saves your non-VPN public IPv4 address to `.stremio/home-ip` (refusing if n
 If your VPN endpoint has a stable IP, you can make the check stricter:
 
 ```bash
-EXPECTED_VPN_IP=1.2.3.4 ./stremio start
+EXPECTED_VPN_IP=<vpn-exit-ip> ./stremio start
 ```
 
-## Start automatically (Persistent Boot Setup)
+## Start at boot
 
 Run `./stremio start` once (it installs the units), then enable the boot unit:
 
@@ -105,4 +99,4 @@ Run `./stremio start` once (it installs the units), then enable the boot unit:
 systemctl --user enable stremioguard.service
 ```
 
-It starts after your user's Docker service and runs the same `./stremio start`, so the lockout check, the VPN verification and the supervised watchdog all apply at boot. Lingering (`loginctl enable-linger $USER`) is what starts your user's service manager at boot without a login. See [Watchdog supervision](#watchdog-supervision) for how crashes are handled.
+It starts after your user's Docker service and runs `./stremio start`, so the lockout check, VPN verification, and supervised watchdog all apply at boot. Lingering (`loginctl enable-linger $USER`) starts your user's service manager at boot without a login.

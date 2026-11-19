@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from stremioguard.overrides.admin import render_admin_override
 from stremioguard.overrides.api_app import render_api_app_override
 from stremioguard.overrides.bundle import (
     SPECS,
@@ -17,11 +18,13 @@ from stremioguard.overrides.bundle import (
 from stremioguard.publishing import StackPublisher
 
 from .conftest import (
+    COMET_ADMIN_SOURCE,
     COMET_API_APP_SOURCE,
     make_comet_config,
     make_comet_gateway_config,
     record_test_digest,
     write_bundle,
+    write_comet_admin,
     write_comet_api_app,
     write_comet_logger,
     write_required_comet_sources,
@@ -148,6 +151,7 @@ class TestOverridesBundle(unittest.TestCase):
                     "stremioguard_stream_guard.py": "/app/comet/stremioguard_stream_guard.py",
                     "playback.py": "/app/comet/api/endpoints/playback.py",
                     "config_validation.py": "/app/comet/core/config_validation.py",
+                    "admin.py": "/app/comet/api/endpoints/admin.py",
                 },
                 extra={
                     "image_digest": "sha256:123",
@@ -862,3 +866,27 @@ class CredentialFreeCorsTests(unittest.TestCase):
                 write_comet_api_app(root, changed)
                 with self.assertRaisesRegex(RuntimeError, "credentialed CORS"):
                     render_api_app_override(root)
+
+
+class AdminCookieOverrideTests(unittest.TestCase):
+    """Admin login must set Secure on admin_session behind TLS termination."""
+
+    def test_render_admin_override_honors_forwarded_proto_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_comet_admin(root)
+            rendered = render_admin_override(root)
+            self.assertIn("def _is_secure_request(request: Request) -> bool:", rendered)
+            self.assertIn("secure=_is_secure_request(request),", rendered)
+            self.assertNotIn('secure=request.url.scheme == "https",', rendered)
+            compile(rendered, "admin.py", "exec")
+
+    def test_changed_admin_cookie_anchor_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            changed = COMET_ADMIN_SOURCE.replace(
+                'secure=request.url.scheme == "https",', "secure=False,"
+            )
+            write_comet_admin(root, changed)
+            with self.assertRaisesRegex(RuntimeError, "admin cookie patch"):
+                render_admin_override(root)

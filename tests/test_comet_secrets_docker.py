@@ -122,6 +122,7 @@ def sources(
             "stream_guard",
             "playback",
             "config_limits",
+            "admin",
         }:
             target = patched / spec.container_path.removeprefix("/app/comet/")
             rendered = spec.render(upstream.parent, CONTEXT)
@@ -524,3 +525,102 @@ def test_a_callers_config_keys_are_masked_in_logs(sources: tuple[str, Path, Path
     assert "VALID True True" in patched_out
     assert not [key for key in keys if key in patched_out], patched_out[-2000:]
     assert "scraper failed with ********" in patched_out
+
+
+GUNICORN_LOG_PROBE = """
+import logging, os
+import comet.core.logger  # noqa: F401
+from gunicorn.config import Config
+from gunicorn.glogging import Logger as GLogger
+
+key = os.environ["TORBOX_API_KEY"]
+token = os.environ["PUBLIC_API_TOKEN"]
+cfg = Config()
+cfg.set("loglevel", "warning")
+glog = GLogger(cfg)
+for name, src in (("uvicorn.error", glog.error_log), ("uvicorn.access", glog.access_log)):
+    lg = logging.getLogger(name)
+    lg.handlers = src.handlers
+    lg.setLevel(src.level)
+    lg.propagate = False
+
+try:
+    raise RuntimeError("boom " + key)
+except RuntimeError:
+    logging.getLogger("uvicorn.error").exception(
+        "ASGI failure url=https://u:pw@cdn.example/comet/%s/stream", token
+    )
+logging.getLogger("gunicorn.error").warning("worker error secret=%s", key)
+"""
+
+
+def test_gunicorn_and_uvicorn_non_propagating_logs_are_scrubbed(
+    sources: tuple[str, Path, Path],
+) -> None:
+    """Real Gunicorn/UvicornWorker propagate=False handlers must scrub secrets."""
+    image, upstream, patched = sources
+    upstream_out = _run(image, upstream, GUNICORN_LOG_PROBE)
+    assert CANARIES["TORBOX_API_KEY"] in upstream_out, "positive control: upstream must leak"
+    assert CANARIES["PUBLIC_API_TOKEN"] in upstream_out, "positive control: upstream must leak"
+    patched_out = _run(image, patched, GUNICORN_LOG_PROBE)
+    assert _leaks(patched_out) == [], patched_out[-2000:]
+    assert "https://cdn.example" in patched_out
+    assert "********" in patched_out
+
+
+ADMIN_AND_PREFIXED_LOGIN_PROBE = """
+import json, os
+from fastapi.testclient import TestClient
+from comet.api.app import app
+from comet.core.models import settings
+
+client = TestClient(app, raise_server_exceptions=False)
+prefix = settings.STREMIO_API_PREFIX
+admin_resp = client.post(
+    "/admin/login",
+    data={"password": os.environ["ADMIN_DASHBOARD_PASSWORD"]},
+    headers={"X-Forwarded-Proto": "https"},
+    follow_redirects=False,
+)
+prefixed_statuses = [
+    client.post(f"{prefix}/configure/login", data={"password": "wrong"}).status_code
+    for _ in range(7)
+]
+print("RESULT", json.dumps({
+    "admin_status": admin_resp.status_code,
+    "admin_cookie": admin_resp.headers.get("set-cookie", ""),
+    "xfo": admin_resp.headers.get("x-frame-options"),
+    "xcto": admin_resp.headers.get("x-content-type-options"),
+    "csp": admin_resp.headers.get("content-security-policy"),
+    "prefixed_statuses": prefixed_statuses,
+}))
+"""
+
+
+def test_admin_cookie_secure_headers_and_prefixed_login_budget(
+    sources: tuple[str, Path, Path],
+) -> None:
+    import json
+
+    image, upstream, patched = sources
+
+    def result(comet_dir: Path) -> dict[str, Any]:
+        out = _run(image, comet_dir, ADMIN_AND_PREFIXED_LOGIN_PROBE)
+        for line in out.splitlines():
+            tag, _, payload = line.partition(" ")
+            if tag == "RESULT":
+                return json.loads(payload)
+        raise AssertionError(out[-2000:])
+
+    before = result(upstream)
+    assert "Secure" not in before["admin_cookie"], "positive control: upstream omits Secure"
+    assert before["xfo"] is None, "positive control: upstream omits security headers"
+    assert 429 not in before["prefixed_statuses"], "positive control: upstream does not pace"
+
+    after = result(patched)
+    assert after["admin_status"] == 303
+    assert "; Secure" in after["admin_cookie"]
+    assert after["xfo"] == "DENY"
+    assert after["xcto"] == "nosniff"
+    assert "frame-ancestors 'none'" in (after["csp"] or "")
+    assert after["prefixed_statuses"] == [200, 200, 200, 200, 200, 429, 429]

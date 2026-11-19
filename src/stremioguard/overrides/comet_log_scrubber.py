@@ -225,6 +225,22 @@ def _sg_describe_error(error):
 
 
 _SG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_sg_original_stream_format = _sg_logging.StreamHandler.format
+
+
+def _sg_scrub_stdlib_text(text):
+    try:
+        return _sg_scrub(_SG_URL.sub(_sg_origin_only, text))
+    except Exception:
+        return _SG_WITHHELD.rstrip("\n")
+
+
+def _sg_scrubbed_stream_format(self, record):
+    try:
+        text = _sg_original_stream_format(self, record)
+    except Exception:
+        return _SG_WITHHELD.rstrip("\n")
+    return _sg_scrub_stdlib_text(text)
 
 
 class _SGStdlibToLoguru(_sg_logging.Handler):
@@ -254,3 +270,10 @@ def _sg_route_stdlib_logging():
     root = _sg_logging.getLogger()
     if not any(isinstance(handler, _SGStdlibToLoguru) for handler in root.handlers):
         root.addHandler(_SGStdlibToLoguru())
+    # Gunicorn and UvicornWorker attach their own StreamHandlers to
+    # `gunicorn.error` / `uvicorn.error` with `propagate = False`, bypassing
+    # root handlers. Scrubbing at `StreamHandler.format` covers every stdlib
+    # stream/file handler regardless of propagation or initialization order.
+    if not getattr(_sg_logging.StreamHandler.format, "_sg_scrubbed", False):
+        _sg_scrubbed_stream_format._sg_scrubbed = True  # type: ignore[attr-defined]
+        _sg_logging.StreamHandler.format = _sg_scrubbed_stream_format  # type: ignore[method-assign]

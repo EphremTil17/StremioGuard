@@ -171,7 +171,7 @@ services:
 
   comet-gateway:
     # Sees the gateway tokens: pinned by digest; Dependabot proposes bumps.
-    image: nginx:1.31.8-alpine@sha256:fed7e14be83cbd2661a75cdc5b872d936cf155d46c327084d30b8df19ae88d72
+    image: nginx:1.31.9-alpine@sha256:90b6bd2aec278b16b98221d64deb1d6d35d164567f507ab0716e6053878315aa
     # restart: "no" like stremio: nothing that fronts debrid traffic should be
     # revived by Docker before the watchdog has re-verified the VPN path. The
     # watchdog auto-starts the Comet trio once gluetun is healthy.
