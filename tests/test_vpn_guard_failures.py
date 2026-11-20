@@ -346,7 +346,7 @@ def test_ac4_hour_long_probe_timeout_outage_does_not_lock_out_and_recovers(
         guard.warn = capture_warn  # type: ignore[method-assign]
         orch = Orchestrator(guard)
 
-        with mock.patch.object(guard, "public_ip", return_value=None):
+        with mock.patch.object(guard, "public_ip", autospec=True, return_value=None):
             for i in range(360):
                 assert orch._tick() is True
                 assert orch.consecutive_loop_errors == 0
@@ -364,7 +364,7 @@ def test_ac4_hour_long_probe_timeout_outage_does_not_lock_out_and_recovers(
 
         # URL 1 recovers -> starts on first SAFE tick.
         probe_recovered["ok"] = True
-        with mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST):
+        with mock.patch.object(guard, "public_ip", autospec=True, return_value=PUBLIC_IPV4_HOST):
             assert orch._tick() is True
         assert services_running["stremio"] is True
         assert list(up_stremio) in runner.calls
@@ -388,15 +388,22 @@ def test_ac5_recovery_budget_ignores_healthy_unknown_time(tmp_path: Path) -> Non
     with (
         mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
         mock.patch.object(orchestrator_mod.time, "time", side_effect=lambda: clock["now"]),
-        mock.patch.object(guard, "gluetun_healthy", side_effect=lambda: healthy["value"]),
         mock.patch.object(
-            guard, "public_ip_assessment", side_effect=lambda **_: assessment["value"]
+            guard, "gluetun_healthy", autospec=True, side_effect=lambda: healthy["value"]
         ),
-        mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
-        mock.patch.object(guard, "stop_active_services", return_value=True),
-        mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
-        mock.patch.object(guard, "restart_gluetun", return_value=True) as restart_gluetun,
-        mock.patch.object(guard, "stop_gluetun"),
+        mock.patch.object(
+            guard,
+            "public_ip_assessment",
+            autospec=True,
+            side_effect=lambda **_: assessment["value"],
+        ),
+        mock.patch.object(guard, "gluetun_auth_evidence", autospec=True, return_value=None),
+        mock.patch.object(guard, "stop_active_services", autospec=True, return_value=True),
+        mock.patch.object(guard, "services_confirmed_stopped", autospec=True, return_value=True),
+        mock.patch.object(
+            guard, "restart_gluetun", autospec=True, return_value=True
+        ) as restart_gluetun,
+        mock.patch.object(guard, "stop_gluetun", autospec=True),
     ):
         # 1 tick unhealthy -> enters outage, restarts once.
         orch.watch_once()
@@ -437,12 +444,12 @@ def test_ac5_regression_continuous_unhealthy_budget_exhausted(tmp_path: Path) ->
     with (
         mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
         mock.patch.object(orchestrator_mod.time, "time", side_effect=lambda: clock["now"]),
-        mock.patch.object(guard, "gluetun_healthy", return_value=False),
-        mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
-        mock.patch.object(guard, "stop_active_services", return_value=True),
-        mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
-        mock.patch.object(guard, "restart_gluetun", return_value=True),
-        mock.patch.object(guard, "stop_gluetun"),
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+        mock.patch.object(guard, "gluetun_auth_evidence", autospec=True, return_value=None),
+        mock.patch.object(guard, "stop_active_services", autospec=True, return_value=True),
+        mock.patch.object(guard, "services_confirmed_stopped", autospec=True, return_value=True),
+        mock.patch.object(guard, "restart_gluetun", autospec=True, return_value=True),
+        mock.patch.object(guard, "stop_gluetun", autospec=True),
     ):
         orch.watch_once()
         clock["now"] = 1300.0
@@ -478,11 +485,15 @@ def test_ac6_leak_matrix_same_family_and_ipv4_mapped_normalization(tmp_path: Pat
         guard = GluetunGuard(cfg, FakeRunner({}))
         warnings: list[str] = []
         with (
-            mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-            mock.patch.object(guard, "public_ip_via_control_server", return_value=None),
-            mock.patch.object(guard, "public_ip_via_gluetun", return_value=egress),
-            mock.patch.object(guard, "public_ip", return_value=host),
-            mock.patch.object(guard, "warn", side_effect=warnings.append),
+            mock.patch.object(
+                guard, "namespace_dns_block_active", autospec=True, return_value=True
+            ),
+            mock.patch.object(
+                guard, "public_ip_via_control_server", autospec=True, return_value=None
+            ),
+            mock.patch.object(guard, "public_ip_via_gluetun", autospec=True, return_value=egress),
+            mock.patch.object(guard, "public_ip", autospec=True, return_value=host),
+            mock.patch.object(guard, "warn", autospec=True, side_effect=warnings.append),
         ):
             return guard.public_ip_assessment(force_probe=True), warnings
 
@@ -541,16 +552,21 @@ def test_ac7_intermittent_leaks_24h_window(tmp_path: Path) -> None:
 
         with (
             mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
-            mock.patch.object(guard, "gluetun_healthy", return_value=True),
+            mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
             mock.patch.object(
-                guard, "public_ip_assessment", side_effect=lambda **_: verdict["val"]
+                guard, "public_ip_assessment", autospec=True, side_effect=lambda **_: verdict["val"]
             ),
-            mock.patch.object(guard, "stop_active_services", side_effect=do_stop) as stop,
-            mock.patch.object(guard, "stop_gluetun"),
             mock.patch.object(
-                guard, "container_running", side_effect=lambda **_: running["stremio"]
+                guard, "stop_active_services", autospec=True, side_effect=do_stop
+            ) as stop,
+            mock.patch.object(guard, "stop_gluetun", autospec=True),
+            mock.patch.object(
+                guard,
+                "container_running",
+                autospec=True,
+                side_effect=lambda **_: running["stremio"],
             ),
-            mock.patch.object(guard, "start_services", side_effect=do_start),
+            mock.patch.object(guard, "start_services", autospec=True, side_effect=do_start),
         ):
             for t_offset, v in steps:
                 clock["now"] = 10_000.0 + t_offset
@@ -615,67 +631,16 @@ def test_ac7_intermittent_leaks_24h_window(tmp_path: Path) -> None:
 
 
 def test_ac8_unknown_running_state_stops_all_and_never_auto_starts(tmp_path: Path) -> None:
-    """AC-8 (INV-6): compose ps timeout/error stops all on stop, never starts on watch."""
+    """AC-8 (INV-6): an unanswered compose ps never lets the watchdog auto-start.
+
+    The stop half of AC-8 (an unknown state stops everything named and is
+    not reported as done) runs against FakeDocker in test_guard.py: see
+    test_stop_active_services_waits_out_a_slow_daemon and
+    test_stop_active_services_on_a_hung_daemon_reports_failure_in_bounded_time.
+    """
     cfg = make_config(tmp_path, max_auto_starts_per_hour=3)
     prefix = compose_args_prefix(tmp_path)
     status_cmd = [*prefix, "ps", *ACTIVE_STATUS_ARGS, "--services", "stremio"]
-    stop_cmd = [*prefix, "stop", "stremio"]
-    ps_q_cmd = [*prefix, "ps", "-q", "stremio"]
-    docker_stop_cmd = ["docker", "stop", "-t", "5", "stremio-cid"]
-
-    # (a) stop_active_services with compose ps raising TimeoutExpired
-    confirm_result = {"ok": False}
-
-    class _PsTimeoutRunner(FakeRunner):
-        def run(
-            self,
-            args: list[str],
-            *,
-            check: bool = False,
-            capture: bool = True,
-            timeout: float | None = None,
-            env: dict[str, str] | None = None,
-            input: str | None = None,
-        ) -> subprocess.CompletedProcess[str]:
-            self.calls.append(args)
-            self.envs.append(env)
-            self.timeouts.append(timeout)
-            self.inputs.append(input)
-            if args == status_cmd:
-                if confirm_result["ok"]:
-                    return completed(args, "")
-                raise subprocess.TimeoutExpired(args, timeout or 30)
-            if args == stop_cmd:
-                return completed(args)
-            if args == ps_q_cmd:
-                return completed(args, "stremio-cid\n")
-            if args == docker_stop_cmd:
-                return completed(args)
-            return completed(args, "")
-
-    runner_a = _PsTimeoutRunner({})
-    guard_a = GluetunGuard(cfg, runner_a)
-    assert guard_a.stop_active_services(["stremio"]) is False
-    assert stop_cmd in runner_a.calls
-    assert docker_stop_cmd in runner_a.calls
-
-    # When later confirm query succeeds with empty, returns True.
-    class _LaterConfirmRunner(_PsTimeoutRunner):
-        def __init__(self) -> None:
-            super().__init__({})
-            self.status_calls = 0
-
-        def run(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            if args == status_cmd:
-                self.status_calls += 1
-                self.calls.append(args)
-                if self.status_calls < 3:
-                    raise subprocess.TimeoutExpired(args, 30)
-                return completed(args, "")
-            return super().run(args, **kwargs)  # type: ignore[arg-type]
-
-    guard_a2 = GluetunGuard(cfg, _LaterConfirmRunner())
-    assert guard_a2.stop_active_services(["stremio"]) is True
 
     # (b) Watchdog in steady state, SAFE, compose ps timing out then non-zero for 20 ticks
     ps_mode = {"mode": "timeout"}  # "timeout" | "fail" | "empty"
@@ -712,8 +677,10 @@ def test_ac8_unknown_running_state_stops_all_and_never_auto_starts(tmp_path: Pat
     clock = {"now": 1000.0}
     with (
         mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
-        mock.patch.object(guard_b, "gluetun_healthy", return_value=True),
-        mock.patch.object(guard_b, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
+        mock.patch.object(guard_b, "gluetun_healthy", autospec=True, return_value=True),
+        mock.patch.object(
+            guard_b, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+        ),
     ):
         for i in range(20):
             ps_mode["mode"] = "timeout" if i < 10 else "fail"
@@ -856,6 +823,11 @@ def test_ac10_bounded_teardown_and_failsafe_unit_timeout(
             if args[:2] == ["docker", "compose"] and "-q" in args:
                 svc = args[-1]
                 return completed(args, f"{svc}-cid\n")
+            # The docker stop fallback finds containers by Compose's labels.
+            if args[:3] == ["docker", "ps", "--no-trunc"]:
+                svc = args[4].rsplit("=", 1)[1]
+                line = f"{svc}-cid\t{guard_mod.compose_project_name(model2_root)}\t{model2_root}"
+                return completed(args, line + "\n")
             if args[:2] == ["docker", "stop"]:
                 return completed(args)
             return completed(args)
@@ -1184,7 +1156,7 @@ def test_ac13_start_and_restart_without_safe_stops_services_and_confirms(tmp_pat
         guard.success = lambda m, o=orig_success: _rec("OK", o, m)  # type: ignore[method-assign]
         orch = Orchestrator(guard)
 
-        with mock.patch.object(guard, "preflight", return_value=False):
+        with mock.patch.object(guard, "preflight", autospec=True, return_value=False):
             orch.start_active_services()
 
         assert running["stremio"] is False
@@ -1199,30 +1171,31 @@ def test_ac13_start_and_restart_without_safe_stops_services_and_confirms(tmp_pat
     guard_real = GluetunGuard(make_config(tmp_path), FakeRunner({}))
     preflight_warnings: list[str] = []
     with (
-        mock.patch.object(guard_real, "require_commands"),
-        mock.patch.object(guard_real, "check_vpn_lockout"),
-        mock.patch.object(guard_real, "check_bind_addresses"),
-        mock.patch.object(guard_real, "write_compose_override"),
-        mock.patch.object(guard_real, "refresh_gluetun_image"),
-        mock.patch.object(guard_real, "compose_fresh"),
+        mock.patch.object(guard_real, "require_commands", autospec=True),
+        mock.patch.object(guard_real, "check_vpn_lockout", autospec=True),
+        mock.patch.object(guard_real, "check_bind_addresses", autospec=True),
+        mock.patch.object(guard_real, "write_compose_override", autospec=True),
+        mock.patch.object(guard_real, "refresh_gluetun_image", autospec=True),
+        mock.patch.object(guard_real, "compose_fresh", autospec=True),
         mock.patch.object(
             guard_real,
             "wait_for_gluetun_healthy",
+            autospec=True,
             side_effect=guard_mod.GluetunUnavailableError("down"),
         ),
-        mock.patch.object(guard_real, "warn", side_effect=preflight_warnings.append),
+        mock.patch.object(guard_real, "warn", autospec=True, side_effect=preflight_warnings.append),
     ):
         assert guard_real.preflight(defer_vpn_recovery=True) is False
     with (
-        mock.patch.object(guard_real, "require_commands"),
-        mock.patch.object(guard_real, "check_vpn_lockout"),
-        mock.patch.object(guard_real, "check_bind_addresses"),
-        mock.patch.object(guard_real, "write_compose_override"),
-        mock.patch.object(guard_real, "refresh_gluetun_image"),
-        mock.patch.object(guard_real, "compose_fresh"),
-        mock.patch.object(guard_real, "wait_for_gluetun_healthy"),
-        mock.patch.object(guard_real, "public_ip_safe", return_value=False),
-        mock.patch.object(guard_real, "warn", side_effect=preflight_warnings.append),
+        mock.patch.object(guard_real, "require_commands", autospec=True),
+        mock.patch.object(guard_real, "check_vpn_lockout", autospec=True),
+        mock.patch.object(guard_real, "check_bind_addresses", autospec=True),
+        mock.patch.object(guard_real, "write_compose_override", autospec=True),
+        mock.patch.object(guard_real, "refresh_gluetun_image", autospec=True),
+        mock.patch.object(guard_real, "compose_fresh", autospec=True),
+        mock.patch.object(guard_real, "wait_for_gluetun_healthy", autospec=True),
+        mock.patch.object(guard_real, "public_ip_safe", autospec=True, return_value=False),
+        mock.patch.object(guard_real, "warn", autospec=True, side_effect=preflight_warnings.append),
     ):
         assert guard_real.preflight(defer_vpn_recovery=True) is False
     assert len(preflight_warnings) == 2
@@ -1239,7 +1212,7 @@ def test_ac13_start_and_restart_without_safe_stops_services_and_confirms(tmp_pat
     )
     guard_reset = GluetunGuard(make_config(tmp_path), runner_reset)
     with (
-        mock.patch.object(guard_reset, "preflight", return_value=False),
+        mock.patch.object(guard_reset, "preflight", autospec=True, return_value=False),
         mock.patch.object(orchestrator_mod.time, "sleep"),
     ):
         Orchestrator(guard_reset).setup_active_services(reset=True)
@@ -1249,9 +1222,9 @@ def test_ac13_start_and_restart_without_safe_stops_services_and_confirms(tmp_pat
     guard_fail = GluetunGuard(make_config(tmp_path), FakeRunner({}))
     orch_fail = Orchestrator(guard_fail)
     with (
-        mock.patch.object(guard_fail, "compose_instance_exists", return_value=True),
-        mock.patch.object(guard_fail, "preflight", return_value=False),
-        mock.patch.object(guard_fail, "stop_active_services", return_value=False),
+        mock.patch.object(guard_fail, "compose_instance_exists", autospec=True, return_value=True),
+        mock.patch.object(guard_fail, "preflight", autospec=True, return_value=False),
+        mock.patch.object(guard_fail, "stop_active_services", autospec=True, return_value=False),
         pytest.raises(RuntimeError, match="could not be confirmed stopped"),
     ):
         orch_fail.start_active_services()
@@ -1322,8 +1295,8 @@ def test_ac14_all_marker_forms_block_and_survive_failsafe(
 
             orch = Orchestrator(guard)
             with (
-                mock.patch.object(guard, "require_commands"),
-                mock.patch.object(guard, "stop_active_services", return_value=True),
+                mock.patch.object(guard, "require_commands", autospec=True),
+                mock.patch.object(guard, "stop_active_services", autospec=True, return_value=True),
             ):
                 if form == "valid_symlink":
                     orch.fail_safe()
@@ -1373,9 +1346,11 @@ def test_ac15_running_watchdog_stops_and_exits_78_on_new_marker(tmp_path: Path) 
 
     with (
         mock.patch.object(orchestrator_mod, "notify"),
-        mock.patch.object(guard, "gluetun_healthy", return_value=True),
-        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
-        mock.patch.object(guard, "container_running", return_value=True),
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
+        mock.patch.object(
+            guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+        ),
+        mock.patch.object(guard, "container_running", autospec=True, return_value=True),
     ):
         assert orch._tick() is True
 
@@ -1384,9 +1359,11 @@ def test_ac15_running_watchdog_stops_and_exits_78_on_new_marker(tmp_path: Path) 
 
     with (
         mock.patch.object(orchestrator_mod, "notify"),
-        mock.patch.object(guard, "start_services") as start_mock,
-        mock.patch.object(guard, "stop_active_services", return_value=True) as stop_services,
-        mock.patch.object(guard, "stop_gluetun") as stop_gluetun,
+        mock.patch.object(guard, "start_services", autospec=True) as start_mock,
+        mock.patch.object(
+            guard, "stop_active_services", autospec=True, return_value=True
+        ) as stop_services,
+        mock.patch.object(guard, "stop_gluetun", autospec=True) as stop_gluetun,
         pytest.raises(typer.Exit) as excinfo,
     ):
         orch._tick()
@@ -1709,13 +1686,15 @@ def test_ac20_recovery_budget_exhausts_under_alternating_healthy_unhealthy_ticks
     with (
         mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
         mock.patch.object(orchestrator_mod.time, "time", side_effect=lambda: clock["now"]),
-        mock.patch.object(guard, "gluetun_healthy", side_effect=is_healthy),
-        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN),
-        mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
-        mock.patch.object(guard, "stop_active_services", return_value=True),
-        mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
-        mock.patch.object(guard, "restart_gluetun", return_value=True),
-        mock.patch.object(guard, "stop_gluetun"),
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, side_effect=is_healthy),
+        mock.patch.object(
+            guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.UNKNOWN
+        ),
+        mock.patch.object(guard, "gluetun_auth_evidence", autospec=True, return_value=None),
+        mock.patch.object(guard, "stop_active_services", autospec=True, return_value=True),
+        mock.patch.object(guard, "services_confirmed_stopped", autospec=True, return_value=True),
+        mock.patch.object(guard, "restart_gluetun", autospec=True, return_value=True),
+        mock.patch.object(guard, "stop_gluetun", autospec=True),
     ):
         locked_out = False
         for tick in range(80):
@@ -1816,7 +1795,7 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
 
         runner = _FaultRunner(fault)
         guard = GluetunGuard(cfg, runner)
-        with mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST):
+        with mock.patch.object(guard, "public_ip", autospec=True, return_value=PUBLIC_IPV4_HOST):
             assert guard.public_ip_assessment(force_probe=True) == PublicIPAssessment.SAFE
         assert control_cmd in runner.calls
         assert egress_cmd in runner.calls
@@ -1848,7 +1827,7 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
 
     guard_real = GluetunGuard(cfg, SubprocessRunner())
-    with mock.patch.object(guard_real, "public_ip", return_value=PUBLIC_IPV4_EGRESS):
+    with mock.patch.object(guard_real, "public_ip", autospec=True, return_value=PUBLIC_IPV4_EGRESS):
         assert (
             guard_real.public_ip_assessment(force_probe=True)
             == PublicIPAssessment.UNSAFE_DEFINITIVE
@@ -1882,11 +1861,11 @@ def test_expected_vpn_ip_pins_the_tunnel_exit(
     host = PUBLIC_IPV6_HOST if ":" in egress else PUBLIC_IPV4_HOST
     warnings: list[str] = []
     with (
-        mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-        mock.patch.object(guard, "public_ip_via_control_server", return_value=None),
-        mock.patch.object(guard, "public_ip_via_gluetun", return_value=egress),
-        mock.patch.object(guard, "public_ip", return_value=host),
-        mock.patch.object(guard, "warn", side_effect=warnings.append),
+        mock.patch.object(guard, "namespace_dns_block_active", autospec=True, return_value=True),
+        mock.patch.object(guard, "public_ip_via_control_server", autospec=True, return_value=None),
+        mock.patch.object(guard, "public_ip_via_gluetun", autospec=True, return_value=egress),
+        mock.patch.object(guard, "public_ip", autospec=True, return_value=host),
+        mock.patch.object(guard, "warn", autospec=True, side_effect=warnings.append),
     ):
         assert guard.public_ip_assessment(force_probe=True) == verdict
     mismatch = [w for w in warnings if "EXPECTED_VPN_IP" in w]

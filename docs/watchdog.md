@@ -33,7 +33,7 @@ On a bad signal, the watchdog fails closed:
 
 The lockout marker records the reason and the evidence behind it (for example the log line, or how long gluetun stayed unhealthy); `./stremio status` shows both.
 
-Restarting services never touches gluetun (`docker compose up --no-deps`), so the tunnel that was just verified is the one they join.
+Restarting services never touches gluetun (`docker compose up --no-deps`), so the tunnel that was just verified is the one they join. Restarting gluetun during an outage never touches the services either (`docker compose restart --no-deps gluetun`): a plain `compose restart` would also restart every service in gluetun's namespace, starting the ones the outage just stopped before the tunnel is verified. Compose releases too old for the flag fail the restart, and the outage then runs out its budget with the services stopped.
 
 ## What the stack runs from
 
@@ -59,7 +59,7 @@ Set `STREMIO_ALERT_URL` in `.env` to an HTTP(S) endpoint to be told about events
 | `stremioguard-failsafe.service` | Runs only when the watchdog unit fails for good. It writes a `watchdog_unstable` lockout (keeping any existing marker), stops the protected services, and checks with Docker that they really stopped. |
 | `stremioguard.service` | Opt-in boot unit that runs `./stremio start` after Docker comes up. |
 
-Every stop path (the fail-safe, a leak or outage stop, `./stremio stop`) treats a running, restarting, paused or removing container as active, and counts as stopped only an answer from Docker it fully understood: output other than the requested service names counts as "maybe running", so the services are stopped (with `docker stop` as a fallback) and the stop is not reported as done.
+Every stop path (the fail-safe, a leak or outage stop, `./stremio stop`) treats a running, restarting, paused or removing container as active, and counts as stopped only an answer from Docker it fully understood: output other than the requested service names counts as "maybe running", so the services are stopped (with `docker stop` as a fallback) and the stop is not reported as done. The `docker stop` fallback finds containers by Compose's labels with plain `docker ps`, so it still works when Compose cannot read the project (a broken file, or a Compose release that rejects it). A container counts as this stack's when its project label is the name Compose derives from this checkout's directory or its working-directory label is this checkout, so another stack's service of the same name (a second gluetun, for one) is never touched. Only Compose can confirm the stop, so in that case it is still reported as not done.
 
 Because the watchdog runs in your user's service manager, it no longer belongs to whatever started it. Closing an SSH session or terminal, or ending an automation job, does not kill it.
 

@@ -6,6 +6,7 @@ import http.client
 import ipaddress
 import json
 import os
+import re
 import stat
 import subprocess
 import threading
@@ -74,6 +75,31 @@ PROBE_REQUEST_HEADERS: tuple[tuple[str, str], ...] = (
 )
 # docker-compose.yml's `docker compose up` guard; it is not a protected service.
 COMPOSE_GATE_SERVICE = "use-stremio-start-instead"
+# Labels Compose puts on every container it creates. The working directory
+# ties a container to this checkout: other stacks on the host can have a
+# service of the same name (a second gluetun, for one).
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+COMPOSE_WORKING_DIR_LABEL = "com.docker.compose.project.working_dir"
+COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
+# One line per container: ID, project label, working-directory label.
+COMPOSE_LABELS_FORMAT = "\t".join(
+    (
+        "{{.ID}}",
+        f'{{{{.Label "{COMPOSE_PROJECT_LABEL}"}}}}',
+        f'{{{{.Label "{COMPOSE_WORKING_DIR_LABEL}"}}}}',
+    )
+)
+
+
+def compose_project_name(root_dir: Path) -> str:
+    """The project name Compose derives from this checkout's directory.
+
+    Compose lowercases the directory name, drops every character outside
+    [a-z0-9_-] and strips leading `_` and `-`.
+    """
+    return re.sub(r"[^a-z0-9_-]", "", root_dir.name.lower()).lstrip("_-")
+
+
 GLUETUN_PULL_TIMEOUT_SECONDS = 180
 GLUETUN_STATE_FORMAT = "{{.State.Health.Status}}|{{.State.StartedAt}}"
 ENDPOINT_ENV_KEYS = ("OPENVPN_ENDPOINT_IP", "WIREGUARD_ENDPOINT_IP")
@@ -1315,22 +1341,71 @@ class GluetunGuard:
             if service not in {"gluetun", COMPOSE_GATE_SERVICE}
         ]
 
+    def stack_container_ids(self, service: str) -> list[str] | None:
+        """This stack's containers for ``service`` that hold a process, found without Compose.
+
+        `docker ps` filtered by Compose's service label needs neither the
+        Compose file nor the plugin, so it still answers when Compose cannot
+        read the project. Other stacks on the host can have a service of the
+        same name (a second gluetun, for one), so a container counts only if
+        its project label is the name Compose derives for this checkout or
+        its working-directory label is this checkout: either survives the
+        other being changed (an overridden project name, a moved checkout).
+        One query per service, so the stop paths' time budget is unchanged.
+        None when Docker did not answer.
+        """
+        result = self.runner.run(
+            [
+                "docker",
+                "ps",
+                "--no-trunc",
+                "--filter",
+                f"label={COMPOSE_SERVICE_LABEL}={service}",
+                "--format",
+                COMPOSE_LABELS_FORMAT,
+            ],
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            return None
+        project = compose_project_name(self.config.root_dir)
+        working_dir = str(self.config.root_dir)
+        container_ids: list[str] = []
+        for line in (result.stdout or "").splitlines():
+            # Not stripped: an empty label must stay an empty last field.
+            fields = line.split("\t")
+            # A line this parser does not understand names no container it may stop.
+            if len(fields) != 3 or not fields[0] or any(c.isspace() for c in fields[0]):
+                continue
+            if fields[1] == project or fields[2] == working_dir:
+                container_ids.append(fields[0])
+        return container_ids
+
     def _docker_stop_service(self, service: str) -> None:
+        """Stop ``service``'s containers with plain `docker stop`, the stop paths' fallback.
+
+        The containers are found by Compose's labels (`stack_container_ids`),
+        so this still works when Compose itself is what failed.
+        """
         try:
-            container_id = self.service_container_id(service)
+            container_ids = self.stack_container_ids(service)
         except (subprocess.SubprocessError, OSError) as error:
             self.warn(f"Could not resolve container ID for {service}: {error}")
             return
-        if not container_id:
-            return
-        try:
-            self.runner.run(
-                ["docker", "stop", "-t", "5", container_id],
-                check=False,
-                timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
-            )
-        except (subprocess.SubprocessError, OSError) as error:
-            self.warn(f"Direct `docker stop` failed for {service} ({container_id[:12]}): {error}")
+        # None: Docker did not answer. Silent like an unanswered query elsewhere:
+        # the caller reports the unconfirmed stop, and an outage retries it.
+        for container_id in container_ids or []:
+            try:
+                self.runner.run(
+                    ["docker", "stop", "-t", "5", container_id],
+                    check=False,
+                    timeout=DOCKER_QUERY_TIMEOUT_SECONDS,
+                )
+            except (subprocess.SubprocessError, OSError) as error:
+                self.warn(
+                    f"Direct `docker stop` failed for {service} ({container_id[:12]}): {error}"
+                )
 
     def stop_active_services(self, services: list[str] | None = None) -> bool:
         """Stop ``services`` (default: all protected) and return whether that was verified."""
@@ -1444,7 +1519,12 @@ class GluetunGuard:
         )
         if env_override:
             return self._recreate_gluetun(env_override)
-        result = self.compose("restart", "gluetun", check=False)
+        # `--no-deps`: a plain `compose restart gluetun` also restarts every
+        # service in gluetun's namespace, starting the ones the outage path
+        # just stopped, before the tunnel is verified (Compose 5.6.1, checked
+        # by tests/test_docker_fake_contract_docker.py). A Compose too old for
+        # the flag fails the restart, and the outage fails closed.
+        result = self.compose("restart", "--no-deps", "gluetun", check=False)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip().splitlines()
             self.warn(

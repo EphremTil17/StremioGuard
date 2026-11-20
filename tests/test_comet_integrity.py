@@ -535,12 +535,14 @@ def test_ac6_stack_lock_refuses_concurrent_process_and_allows_nested_preflight(
     )
     guard = GluetunGuard(guard_cfg, guard_runner)
     with (
-        mock.patch.object(guard, "check_vpn_lockout"),
-        mock.patch.object(guard, "check_bind_addresses"),
-        mock.patch.object(guard, "refresh_gluetun_image"),
-        mock.patch.object(guard, "compose_fresh"),
-        mock.patch.object(guard, "wait_for_gluetun_healthy"),
-        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
+        mock.patch.object(guard, "check_vpn_lockout", autospec=True),
+        mock.patch.object(guard, "check_bind_addresses", autospec=True),
+        mock.patch.object(guard, "refresh_gluetun_image", autospec=True),
+        mock.patch.object(guard, "compose_fresh", autospec=True),
+        mock.patch.object(guard, "wait_for_gluetun_healthy", autospec=True),
+        mock.patch.object(
+            guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+        ),
         mock.patch.object(
             CometManager, "ensure_image", side_effect=lambda self, ref: ref.rsplit("@", 1)[1]
         )

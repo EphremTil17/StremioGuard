@@ -25,7 +25,7 @@ from stremioguard.config import (
     CometConfig,
     Config,
 )
-from stremioguard.guard import GluetunGuard
+from stremioguard.guard import GluetunGuard, compose_project_name
 from stremioguard.orchestrator import (
     HEARTBEAT_SLEEP_CHUNK_SECONDS,
     TICK_HEARTBEAT_CEILING_SECONDS,
@@ -244,6 +244,11 @@ def _run_tick_case(
             if len(args) >= 3 and args[-3:-1] == ["ps", "-q"]:
                 svc = args[-1]
                 return completed(args, f"{svc}-cid\n")
+
+            # The docker stop fallback finds containers by Compose's labels.
+            if args[:3] == ["docker", "ps", "--no-trunc"]:
+                svc = args[4].rsplit("=", 1)[1]
+                return completed(args, f"{svc}-cid\t{compose_project_name(root)}\t{root}\n")
 
             if args[:2] == ["docker", "logs"] and ("--since" in args or "--tail" in args):
                 if raise_on_docker_logs and "--since" in args:

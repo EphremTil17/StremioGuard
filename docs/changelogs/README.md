@@ -5,6 +5,7 @@ up to v0.3.53, exist only as tags (`git tag -l 'v*'`).
 
 | Release | Date | About |
 | :-- | :-- | :-- |
+| [v0.4.3](v0.4.3.md) | 2026-11-19 | fix release: outage restarts keep services stopped, crash-looping gluetun stopped at lockout, `docker stop` by Compose labels, DNS block as DROP; mutation testing, Docker model and watchdog scenarios |
 | [v0.4.2](v0.4.2.md) | 2026-11-18 | security release: nginx 1.31.9 pin, Gunicorn/Uvicorn log scrubbing, response cap, admin Secure cookie, metadata & Stremio hardening, coverage map, docs cleanup |
 | [v0.4.1](v0.4.1.md) | 2026-11-17 | security release: edge-case hardening across logs, stream proxy, gateway and Stremio; configure page portal redirect |
 | [v0.4.0](v0.4.0.md) | 2026-11-16 | security release: audit fixes, hardened containers, supervised watchdog, automated Comet and Stremio updates |

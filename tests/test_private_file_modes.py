@@ -79,12 +79,12 @@ def test_start_preflight_tightens_state_and_log_files() -> None:
         old_log.chmod(0o644)
         guard = GluetunGuard(config, FakeRunner({}))
         with (
-            mock.patch.object(guard, "require_commands"),
-            mock.patch.object(guard, "check_bind_addresses"),
-            mock.patch.object(guard, "wait_for_gluetun_healthy"),
-            mock.patch.object(guard, "public_ip_safe", return_value=True),
-            mock.patch.object(guard, "compose"),
-            mock.patch.object(guard, "compose_fresh"),
+            mock.patch.object(guard, "require_commands", autospec=True),
+            mock.patch.object(guard, "check_bind_addresses", autospec=True),
+            mock.patch.object(guard, "wait_for_gluetun_healthy", autospec=True),
+            mock.patch.object(guard, "public_ip_safe", autospec=True, return_value=True),
+            mock.patch.object(guard, "compose", autospec=True),
+            mock.patch.object(guard, "compose_fresh", autospec=True),
         ):
             guard.preflight()
         assert _mode(state_dir / "daemon-id") == 0o600
@@ -117,7 +117,7 @@ def test_stremio_with_credentials_disabled_or_opted_out_passes(tmp_path: Path) -
         "STREMIO_ALLOW_NO_AUTH=1\n",
     ):
         guard = _stremio_guard(tmp_path, env)
-        with mock.patch.object(guard, "warn") as warn:
+        with mock.patch.object(guard, "warn", autospec=True) as warn:
             guard.check_stremio_auth()
         assert warn.called == ("ALLOW" in env)
 
@@ -130,5 +130,5 @@ def test_stremio_must_publish_the_port_where_auth_applies(tmp_path: Path) -> Non
         _stremio_guard(tmp_path, creds + "STREMIO_CONTAINER_PORT=11470\n").check_stremio_auth()
     _stremio_guard(tmp_path, creds + "STREMIO_CONTAINER_PORT=8080\n").check_stremio_auth()
     guard = _stremio_guard(tmp_path, "STREMIO_ALLOW_NO_AUTH=1\nSTREMIO_CONTAINER_PORT=11470\n")
-    with mock.patch.object(guard, "warn"):
+    with mock.patch.object(guard, "warn", autospec=True):
         guard.check_stremio_auth()

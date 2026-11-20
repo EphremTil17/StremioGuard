@@ -63,8 +63,8 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             with (
-                mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch.object(guard, "require_commands", autospec=True, return_value=None),
+                mock.patch.object(guard, "preflight", autospec=True, return_value=None),
             ):
                 orch.setup_active_services(reset=True)
 
@@ -81,8 +81,8 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             with (
-                mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch.object(guard, "require_commands", autospec=True, return_value=None),
+                mock.patch.object(guard, "preflight", autospec=True, return_value=None),
                 mock.patch("stremioguard.comet.CometManager") as manager_cls,
             ):
                 orch.setup_active_services(reset=True)
@@ -103,8 +103,8 @@ class OrchestratorTests(unittest.TestCase):
 
             advisory_manager = mock.MagicMock()
             with (
-                mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch.object(guard, "require_commands", autospec=True, return_value=None),
+                mock.patch.object(guard, "preflight", autospec=True, return_value=None),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
@@ -134,8 +134,8 @@ class OrchestratorTests(unittest.TestCase):
                 advisory_manager = mock.MagicMock()
                 advisory_manager.log_canary.side_effect = canary_error
                 with (
-                    mock.patch.object(guard, "require_commands", return_value=None),
-                    mock.patch.object(guard, "preflight", return_value=None),
+                    mock.patch.object(guard, "require_commands", autospec=True, return_value=None),
+                    mock.patch.object(guard, "preflight", autospec=True, return_value=None),
                     mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                     mock.patch(
                         "stremioguard.comet_gateway.CometGatewayConfig.from_env",
@@ -164,8 +164,8 @@ class OrchestratorTests(unittest.TestCase):
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=False)
 
             with (
-                mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch.object(guard, "require_commands", autospec=True, return_value=None),
+                mock.patch.object(guard, "preflight", autospec=True, return_value=None),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
@@ -192,8 +192,8 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             with (
-                mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch.object(guard, "require_commands", autospec=True, return_value=None),
+                mock.patch.object(guard, "preflight", autospec=True, return_value=None),
             ):
                 orch.start_active_services()
 
@@ -209,9 +209,13 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             with (
-                mock.patch.object(guard, "preflight", return_value=False) as preflight_mock,
-                mock.patch.object(guard, "stop_active_services", return_value=True) as stop_mock,
-                mock.patch.object(guard, "compose_fresh") as compose_fresh_mock,
+                mock.patch.object(
+                    guard, "preflight", autospec=True, return_value=False
+                ) as preflight_mock,
+                mock.patch.object(
+                    guard, "stop_active_services", autospec=True, return_value=True
+                ) as stop_mock,
+                mock.patch.object(guard, "compose_fresh", autospec=True) as compose_fresh_mock,
             ):
                 orch.setup_active_services(reset=False)
 
@@ -229,8 +233,8 @@ class OrchestratorTests(unittest.TestCase):
             guard = GluetunGuard(make_config(Path(directory)), FakeRunner({}))
             guard.config.vpn_lockout_file.write_text("{}", encoding="utf-8")
             with (
-                mock.patch.object(guard, "preflight", return_value=False),
-                mock.patch.object(guard, "stop_active_services", return_value=True),
+                mock.patch.object(guard, "preflight", autospec=True, return_value=False),
+                mock.patch.object(guard, "stop_active_services", autospec=True, return_value=True),
             ):
                 Orchestrator(guard).setup_active_services(reset=False)
             self.assertTrue(guard.config.vpn_lockout_file.exists())
@@ -249,7 +253,7 @@ class OrchestratorTests(unittest.TestCase):
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
-            with mock.patch.object(guard, "gluetun_healthy", return_value=False):
+            with mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False):
                 orch.watch_once()
 
             prefix = compose_args_prefix(tmp_path)
@@ -272,9 +276,12 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNSAFE_DEFINITIVE
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.UNSAFE_DEFINITIVE,
                 ),
             ):
                 orch.watch_once()
@@ -290,11 +297,14 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.SAFE,
                 ),
-                mock.patch.object(guard, "container_running", return_value=False),
+                mock.patch.object(guard, "container_running", autospec=True, return_value=False),
             ):
                 orch.watch_once()
 
@@ -308,12 +318,15 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.SAFE,
                 ),
-                mock.patch.object(guard, "container_running", return_value=True),
-                mock.patch.object(guard, "log") as log_mock,
+                mock.patch.object(guard, "container_running", autospec=True, return_value=True),
+                mock.patch.object(guard, "log", autospec=True) as log_mock,
             ):
                 orch.watch_once()
 
@@ -332,12 +345,15 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(guard_mod.time, "monotonic", return_value=16.0),
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.SAFE,
                 ),
-                mock.patch.object(guard, "container_running", return_value=True),
-                mock.patch.object(guard, "log") as log_mock,
+                mock.patch.object(guard, "container_running", autospec=True, return_value=True),
+                mock.patch.object(guard, "log", autospec=True) as log_mock,
             ):
                 orch.watch_once()
 
@@ -359,10 +375,12 @@ class OrchestratorTests(unittest.TestCase):
         messages: list[str] = []
         with (
             mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=advance),
-            mock.patch.object(guard, "gluetun_healthy", return_value=True),
-            mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
-            mock.patch.object(guard, "container_running", return_value=True),
-            mock.patch.object(guard, "log", side_effect=messages.append),
+            mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
+            mock.patch.object(
+                guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+            ),
+            mock.patch.object(guard, "container_running", autospec=True, return_value=True),
+            mock.patch.object(guard, "log", autospec=True, side_effect=messages.append),
         ):
             for _ in range(ticks):
                 clock["now"] += step
@@ -427,7 +445,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(orch._summary_eventful())
             with (
                 mock.patch.object(orchestrator_mod.time, "monotonic", return_value=301.0),
-                mock.patch.object(guard, "log") as log_mock,
+                mock.patch.object(guard, "log", autospec=True) as log_mock,
             ):
                 orch._maybe_log_summary()
             self.assertTrue(any("Watchdog summary" in c.args[0] for c in log_mock.call_args_list))
@@ -446,13 +464,18 @@ class OrchestratorTests(unittest.TestCase):
                 mock.patch.object(
                     orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]
                 ),
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.UNKNOWN,
                 ),
-                mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
-                mock.patch.object(guard, "warn", side_effect=warnings.append),
-                mock.patch.object(guard, "log", side_effect=logs.append),
+                mock.patch.object(
+                    guard, "stop_active_services", autospec=True, return_value=True
+                ) as stop,
+                mock.patch.object(guard, "warn", autospec=True, side_effect=warnings.append),
+                mock.patch.object(guard, "log", autospec=True, side_effect=logs.append),
             ):
                 # One hour of a public-IP checker outage, 10 s ticks.
                 for _ in range(360):
@@ -469,12 +492,15 @@ class OrchestratorTests(unittest.TestCase):
             self.assertGreaterEqual(sum("Watchdog summary" in m for m in logs), 11)
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.SAFE,
                 ),
-                mock.patch.object(guard, "container_running", return_value=True),
-                mock.patch.object(guard, "log", side_effect=logs.append),
+                mock.patch.object(guard, "container_running", autospec=True, return_value=True),
+                mock.patch.object(guard, "log", autospec=True, side_effect=logs.append),
             ):
                 orch.watch_once()
             self.assertTrue(any("recovered after 360 failures" in m for m in logs))
@@ -495,7 +521,7 @@ class OrchestratorTests(unittest.TestCase):
             orch = Orchestrator(guard)
 
             with (
-                mock.patch.object(guard, "public_ip", return_value="203.0.113.20"),
+                mock.patch.object(guard, "public_ip", autospec=True, return_value="203.0.113.20"),
                 self.assertRaises(RuntimeError) as ctx,
             ):
                 orch.record_home_ip()
@@ -519,7 +545,9 @@ class OrchestratorTests(unittest.TestCase):
             guard = GluetunGuard(make_config(tmp_path), runner)
             orch = Orchestrator(guard)
 
-            with mock.patch.object(guard, "public_ip", return_value="198.51.100.10") as probe:
+            with mock.patch.object(
+                guard, "public_ip", autospec=True, return_value="198.51.100.10"
+            ) as probe:
                 orch.record_home_ip()
 
             # An IPv6 baseline could never match the IPv4 tunnel egress.
@@ -544,8 +572,8 @@ class OrchestratorTests(unittest.TestCase):
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
             with (
-                mock.patch.object(guard, "require_commands", return_value=None),
-                mock.patch.object(guard, "preflight", return_value=None),
+                mock.patch.object(guard, "require_commands", autospec=True, return_value=None),
+                mock.patch.object(guard, "preflight", autospec=True, return_value=None),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
@@ -597,7 +625,7 @@ class OrchestratorTests(unittest.TestCase):
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=False),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
@@ -628,11 +656,14 @@ class OrchestratorTests(unittest.TestCase):
             gateway_cfg = make_comet_gateway_config(tmp_path, enabled=True)
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.SAFE,
                 ),
-                mock.patch.object(guard, "container_running", return_value=False),
+                mock.patch.object(guard, "container_running", autospec=True, return_value=False),
                 mock.patch("stremioguard.config.CometConfig.from_env", return_value=comet_cfg),
                 mock.patch(
                     "stremioguard.comet_gateway.CometGatewayConfig.from_env",
@@ -676,9 +707,12 @@ class OrchestratorTests(unittest.TestCase):
 
             # 1st UNKNOWN: should warn but NOT stop stremio
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.UNKNOWN,
                 ),
             ):
                 orch.watch_once()
@@ -689,9 +723,12 @@ class OrchestratorTests(unittest.TestCase):
 
             # 2nd UNKNOWN: should warn but NOT stop stremio
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.UNKNOWN,
                 ),
             ):
                 orch.watch_once()
@@ -700,9 +737,12 @@ class OrchestratorTests(unittest.TestCase):
 
             # 3rd UNKNOWN: should stop stremio
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNKNOWN
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.UNKNOWN,
                 ),
             ):
                 orch.watch_once()
@@ -725,9 +765,12 @@ class OrchestratorTests(unittest.TestCase):
 
             # 1st UNSAFE: should stop stremio immediately
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.UNSAFE_DEFINITIVE
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.UNSAFE_DEFINITIVE,
                 ),
             ):
                 orch.watch_once()
@@ -762,7 +805,9 @@ class OrchestratorTests(unittest.TestCase):
             with (
                 mock.patch.object(orch, "watch_once", side_effect=mock_watch_once),
                 mock.patch("stremioguard.orchestrator.time.sleep", side_effect=lambda s: None),
-                mock.patch.object(guard, "stop_active_services", return_value=True) as stop_mock,
+                mock.patch.object(
+                    guard, "stop_active_services", autospec=True, return_value=True
+                ) as stop_mock,
                 self.assertRaises(KeyboardInterrupt),
             ):
                 orch.watch_stremio()
@@ -809,11 +854,15 @@ class OrchestratorTests(unittest.TestCase):
             )
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_evidence", return_value=line) as evidence,
-                mock.patch.object(guard, "stop_active_services") as mock_stop_services,
-                mock.patch.object(guard, "restart_gluetun") as mock_restart,
-                mock.patch.object(guard, "stop_gluetun") as mock_stop_gluetun,
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+                mock.patch.object(
+                    guard, "gluetun_auth_evidence", autospec=True, return_value=line
+                ) as evidence,
+                mock.patch.object(
+                    guard, "stop_active_services", autospec=True
+                ) as mock_stop_services,
+                mock.patch.object(guard, "restart_gluetun", autospec=True) as mock_restart,
+                mock.patch.object(guard, "stop_gluetun", autospec=True) as mock_stop_gluetun,
                 mock.patch("time.monotonic", return_value=1000.0),
                 mock.patch("time.time", return_value=5000.0),
             ):
@@ -844,14 +893,19 @@ class OrchestratorTests(unittest.TestCase):
             now = [1000.0]
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=False),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
                 mock.patch.object(
-                    guard, "gluetun_auth_evidence", side_effect=lambda **_: answers.pop(0)
+                    guard,
+                    "gluetun_auth_evidence",
+                    autospec=True,
+                    side_effect=lambda **_: answers.pop(0),
                 ),
-                mock.patch.object(guard, "stop_active_services"),
-                mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
-                mock.patch.object(guard, "restart_gluetun") as mock_restart,
-                mock.patch.object(guard, "stop_gluetun") as mock_stop_gluetun,
+                mock.patch.object(guard, "stop_active_services", autospec=True),
+                mock.patch.object(
+                    guard, "services_confirmed_stopped", autospec=True, return_value=True
+                ),
+                mock.patch.object(guard, "restart_gluetun", autospec=True) as mock_restart,
+                mock.patch.object(guard, "stop_gluetun", autospec=True) as mock_stop_gluetun,
                 mock.patch("time.monotonic", side_effect=lambda: now[0]),
                 mock.patch("time.time", side_effect=lambda: now[0]),
             ):
@@ -914,12 +968,14 @@ class OrchestratorTests(unittest.TestCase):
                 return current_time
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
-                mock.patch.object(guard, "stop_active_services") as mock_stop_services,
-                mock.patch.object(guard, "restart_gluetun") as mock_restart,
-                mock.patch.object(guard, "stop_gluetun") as mock_stop_gluetun,
-                mock.patch.object(guard, "write_vpn_lockout") as mock_write_lockout,
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", autospec=True, return_value=None),
+                mock.patch.object(
+                    guard, "stop_active_services", autospec=True
+                ) as mock_stop_services,
+                mock.patch.object(guard, "restart_gluetun", autospec=True) as mock_restart,
+                mock.patch.object(guard, "stop_gluetun", autospec=True) as mock_stop_gluetun,
+                mock.patch.object(guard, "write_vpn_lockout", autospec=True) as mock_write_lockout,
                 mock.patch("time.monotonic", side_effect=fake_time),
                 mock.patch("time.time", side_effect=fake_time),
             ):
@@ -973,11 +1029,15 @@ class OrchestratorTests(unittest.TestCase):
                 return current_time
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
-                mock.patch.object(guard, "stop_active_services"),
-                mock.patch.object(guard, "restart_gluetun") as mock_restart_preferred,
-                mock.patch.object(guard, "restart_gluetun_relaxed") as mock_restart_relaxed,
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", autospec=True, return_value=None),
+                mock.patch.object(guard, "stop_active_services", autospec=True),
+                mock.patch.object(
+                    guard, "restart_gluetun", autospec=True
+                ) as mock_restart_preferred,
+                mock.patch.object(
+                    guard, "restart_gluetun_relaxed", autospec=True
+                ) as mock_restart_relaxed,
                 mock.patch("time.monotonic", side_effect=fake_time),
                 mock.patch("time.time", side_effect=fake_time),
             ):
@@ -1013,13 +1073,16 @@ class OrchestratorTests(unittest.TestCase):
             orch.escalation_triggered = True
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=True),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
                 mock.patch.object(
-                    guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE
+                    guard,
+                    "public_ip_assessment",
+                    autospec=True,
+                    return_value=PublicIPAssessment.SAFE,
                 ) as mock_assessment,
-                mock.patch.object(guard, "clear_vpn_lockout") as mock_clear_lockout,
-                mock.patch.object(guard, "container_running", return_value=False),
-                mock.patch.object(guard, "compose_fresh") as mock_compose_fresh,
+                mock.patch.object(guard, "clear_vpn_lockout", autospec=True) as mock_clear_lockout,
+                mock.patch.object(guard, "container_running", autospec=True, return_value=False),
+                mock.patch.object(guard, "compose_fresh", autospec=True) as mock_compose_fresh,
             ):
                 orch.watch_once()
 
@@ -1055,9 +1118,15 @@ class OrchestratorTests(unittest.TestCase):
                 call_order.append("stop_gluetun")
 
             with (
-                mock.patch.object(guard, "write_vpn_lockout", side_effect=record_write),
-                mock.patch.object(guard, "stop_active_services", side_effect=record_stop_services),
-                mock.patch.object(guard, "stop_gluetun", side_effect=record_stop_gluetun),
+                mock.patch.object(
+                    guard, "write_vpn_lockout", autospec=True, side_effect=record_write
+                ),
+                mock.patch.object(
+                    guard, "stop_active_services", autospec=True, side_effect=record_stop_services
+                ),
+                mock.patch.object(
+                    guard, "stop_gluetun", autospec=True, side_effect=record_stop_gluetun
+                ),
                 self.assertRaises(typer.Exit),
             ):
                 orch._trip_circuit_breaker(reason="auth_rejected")
@@ -1085,10 +1154,12 @@ class OrchestratorTests(unittest.TestCase):
                 return current_time
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_evidence", side_effect=mock_auth_evidence),
-                mock.patch.object(guard, "stop_active_services"),
-                mock.patch.object(guard, "restart_gluetun"),
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+                mock.patch.object(
+                    guard, "gluetun_auth_evidence", autospec=True, side_effect=mock_auth_evidence
+                ),
+                mock.patch.object(guard, "stop_active_services", autospec=True),
+                mock.patch.object(guard, "restart_gluetun", autospec=True),
                 mock.patch("time.monotonic", side_effect=fake_time),
                 mock.patch("time.time", side_effect=fake_time),
             ):
@@ -1123,11 +1194,13 @@ class OrchestratorTests(unittest.TestCase):
             current_time = 1000.0
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
-                mock.patch.object(guard, "stop_active_services"),
-                mock.patch.object(guard, "restart_gluetun"),
-                mock.patch.object(guard, "restart_gluetun_relaxed") as mock_restart_relaxed,
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", autospec=True, return_value=None),
+                mock.patch.object(guard, "stop_active_services", autospec=True),
+                mock.patch.object(guard, "restart_gluetun", autospec=True),
+                mock.patch.object(
+                    guard, "restart_gluetun_relaxed", autospec=True
+                ) as mock_restart_relaxed,
                 mock.patch("time.monotonic", side_effect=lambda: current_time),
                 mock.patch("time.time", side_effect=lambda: current_time),
             ):
@@ -1155,11 +1228,13 @@ class OrchestratorTests(unittest.TestCase):
             current_time = 1000.0
 
             with (
-                mock.patch.object(guard, "gluetun_healthy", return_value=False),
-                mock.patch.object(guard, "gluetun_auth_evidence", return_value=None),
-                mock.patch.object(guard, "stop_active_services"),
-                mock.patch.object(guard, "restart_gluetun"),
-                mock.patch.object(guard, "restart_gluetun_relaxed") as mock_restart_relaxed,
+                mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+                mock.patch.object(guard, "gluetun_auth_evidence", autospec=True, return_value=None),
+                mock.patch.object(guard, "stop_active_services", autospec=True),
+                mock.patch.object(guard, "restart_gluetun", autospec=True),
+                mock.patch.object(
+                    guard, "restart_gluetun_relaxed", autospec=True
+                ) as mock_restart_relaxed,
                 mock.patch("time.monotonic", side_effect=lambda: current_time),
                 mock.patch("time.time", side_effect=lambda: current_time),
             ):
@@ -1179,10 +1254,15 @@ class OrchestratorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    guard, "write_vpn_lockout", side_effect=OSError("Read-only filesystem")
+                    guard,
+                    "write_vpn_lockout",
+                    autospec=True,
+                    side_effect=OSError("Read-only filesystem"),
                 ),
-                mock.patch.object(guard, "stop_active_services") as mock_stop_services,
-                mock.patch.object(guard, "stop_gluetun") as mock_stop_gluetun,
+                mock.patch.object(
+                    guard, "stop_active_services", autospec=True
+                ) as mock_stop_services,
+                mock.patch.object(guard, "stop_gluetun", autospec=True) as mock_stop_gluetun,
             ):
                 with self.assertRaises(typer.Exit) as ctx:
                     orch._trip_circuit_breaker(reason="auth_rejected")
@@ -1205,7 +1285,7 @@ class SupervisedWatchdogTests(unittest.TestCase):
             orch = self._orchestrator(Path(directory))
             orch.guard.config.vpn_lockout_file.write_text("{}", encoding="utf-8")
             with (
-                mock.patch.object(orch.guard, "require_commands"),
+                mock.patch.object(orch.guard, "require_commands", autospec=True),
                 mock.patch.object(orchestrator_mod, "notify") as notify,
                 mock.patch.object(orch, "_watch_loop") as loop,
                 self.assertRaises(LockoutActiveError),
@@ -1233,7 +1313,10 @@ class SupervisedWatchdogTests(unittest.TestCase):
             events: list[str] = []
             with (
                 mock.patch.object(
-                    orch.guard, "require_commands", side_effect=lambda: events.append("checked")
+                    orch.guard,
+                    "require_commands",
+                    autospec=True,
+                    side_effect=lambda: events.append("checked"),
                 ),
                 mock.patch.object(
                     orchestrator_mod, "notify", side_effect=lambda state: events.append(state)
@@ -1277,8 +1360,10 @@ class SupervisedWatchdogTests(unittest.TestCase):
             orch = self._orchestrator(Path(directory))
             g = orch.guard
             with (
-                mock.patch.object(g, "require_commands"),
-                mock.patch.object(g, "stop_active_services", return_value=True) as stop,
+                mock.patch.object(g, "require_commands", autospec=True),
+                mock.patch.object(
+                    g, "stop_active_services", autospec=True, return_value=True
+                ) as stop,
             ):
                 orch.fail_safe()
             stop.assert_called_once_with()
@@ -1290,8 +1375,8 @@ class SupervisedWatchdogTests(unittest.TestCase):
             g = orch.guard
             g.config.vpn_lockout_file.write_text('{"reason": "auth_rejected"}', encoding="utf-8")
             with (
-                mock.patch.object(g, "require_commands"),
-                mock.patch.object(g, "stop_active_services", return_value=True),
+                mock.patch.object(g, "require_commands", autospec=True),
+                mock.patch.object(g, "stop_active_services", autospec=True, return_value=True),
             ):
                 orch.fail_safe()
             self.assertEqual(g.read_vpn_lockout(), {"reason": "auth_rejected"})
@@ -1301,9 +1386,13 @@ class SupervisedWatchdogTests(unittest.TestCase):
             orch = self._orchestrator(Path(directory))
             g = orch.guard
             with (
-                mock.patch.object(g, "write_vpn_lockout", side_effect=OSError("read-only")),
-                mock.patch.object(g, "require_commands"),
-                mock.patch.object(g, "stop_active_services", return_value=True) as stop,
+                mock.patch.object(
+                    g, "write_vpn_lockout", autospec=True, side_effect=OSError("read-only")
+                ),
+                mock.patch.object(g, "require_commands", autospec=True),
+                mock.patch.object(
+                    g, "stop_active_services", autospec=True, return_value=True
+                ) as stop,
                 self.assertRaises(RuntimeError),
             ):
                 orch.fail_safe()
@@ -1315,8 +1404,8 @@ class SupervisedWatchdogTests(unittest.TestCase):
             orch = self._orchestrator(Path(directory))
             g = orch.guard
             with (
-                mock.patch.object(g, "require_commands"),
-                mock.patch.object(g, "stop_active_services", return_value=False),
+                mock.patch.object(g, "require_commands", autospec=True),
+                mock.patch.object(g, "stop_active_services", autospec=True, return_value=False),
                 self.assertRaises(RuntimeError),
             ):
                 orch.fail_safe()
@@ -1360,7 +1449,9 @@ class SupervisedWatchdogTests(unittest.TestCase):
             orch.consecutive_loop_errors = 2
             with (
                 mock.patch.object(orch, "watch_once", side_effect=RuntimeError("bad .env")),
-                mock.patch.object(orch.guard, "stop_active_services", return_value=False),
+                mock.patch.object(
+                    orch.guard, "stop_active_services", autospec=True, return_value=False
+                ),
                 self.assertRaises(RuntimeError),
             ):
                 orch._tick()
@@ -1371,7 +1462,9 @@ class SupervisedWatchdogTests(unittest.TestCase):
             orch.consecutive_loop_errors = 2
             with (
                 mock.patch.object(orch, "watch_once", side_effect=RuntimeError("bad .env")),
-                mock.patch.object(orch.guard, "stop_active_services", return_value=True),
+                mock.patch.object(
+                    orch.guard, "stop_active_services", autospec=True, return_value=True
+                ),
             ):
                 self.assertFalse(orch._tick())
 
@@ -1381,10 +1474,12 @@ class SupervisedWatchdogTests(unittest.TestCase):
             orch.outage_started_at = orch.outage_start_wall = time.monotonic()
             g = orch.guard
             with (
-                mock.patch.object(g, "gluetun_healthy", return_value=False),
-                mock.patch.object(g, "gluetun_auth_evidence", return_value=None),
-                mock.patch.object(g, "services_confirmed_stopped", return_value=False),
-                mock.patch.object(g, "stop_active_services") as stop,
+                mock.patch.object(g, "gluetun_healthy", autospec=True, return_value=False),
+                mock.patch.object(g, "gluetun_auth_evidence", autospec=True, return_value=None),
+                mock.patch.object(
+                    g, "services_confirmed_stopped", autospec=True, return_value=False
+                ),
+                mock.patch.object(g, "stop_active_services", autospec=True) as stop,
             ):
                 orch.watch_once()
             stop.assert_called_once_with(services=["stremio"])
@@ -1425,10 +1520,12 @@ class SupervisedWatchdogTests(unittest.TestCase):
             g = orch.guard
             g.config.vpn_lockout_file.write_text("{}", encoding="utf-8")
             with (
-                mock.patch.object(g, "compose"),
-                mock.patch.object(g, "preflight", return_value=False),
-                mock.patch.object(g, "stop_active_services", return_value=True) as stop_services,
-                mock.patch.object(g, "start_services") as start_services,
+                mock.patch.object(g, "compose", autospec=True),
+                mock.patch.object(g, "preflight", autospec=True, return_value=False),
+                mock.patch.object(
+                    g, "stop_active_services", autospec=True, return_value=True
+                ) as stop_services,
+                mock.patch.object(g, "start_services", autospec=True) as start_services,
                 mock.patch.object(orchestrator_mod.time, "sleep"),
             ):
                 orch.setup_active_services(reset=True)
@@ -1510,12 +1607,15 @@ def test_gluetun_identity_change_restarts_a_stale_service(tmp_path: Path) -> Non
         return real_start(services, **kwargs)  # type: ignore[arg-type]
 
     with (
-        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
-        mock.patch.object(guard, "stop_active_services", side_effect=stop),
-        mock.patch.object(guard, "start_services", side_effect=start),
+        mock.patch.object(
+            guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+        ),
+        mock.patch.object(guard, "stop_active_services", autospec=True, side_effect=stop),
+        mock.patch.object(guard, "start_services", autospec=True, side_effect=start),
         mock.patch.object(
             guard,
             "container_running",
+            autospec=True,
             side_effect=lambda services: all(running[s] for s in services),
         ),
     ):
@@ -1557,8 +1657,10 @@ def test_unverifiable_namespace_keeps_identity_unverified(tmp_path: Path) -> Non
     guard = GluetunGuard(make_config(tmp_path), runner, frozen=True)
     orch = Orchestrator(guard)
     with (
-        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
-        mock.patch.object(guard, "stop_active_services") as stop,
+        mock.patch.object(
+            guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+        ),
+        mock.patch.object(guard, "stop_active_services", autospec=True) as stop,
     ):
         orch.watch_once()
         orch.watch_once()
@@ -1581,15 +1683,16 @@ def test_second_consecutive_leak_verdict_locks_out(tmp_path: Path) -> None:
 
     guard, orch = _leak_orchestrator(tmp_path)
     with (
-        mock.patch.object(guard, "gluetun_healthy", return_value=True),
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
         mock.patch.object(
             guard,
             "public_ip_assessment",
+            autospec=True,
             side_effect=[PublicIPAssessment.UNSAFE_DEFINITIVE] * 2,
         ),
-        mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
-        mock.patch.object(guard, "stop_gluetun") as stop_gluetun,
-        mock.patch.object(guard, "start_services") as start,
+        mock.patch.object(guard, "stop_active_services", autospec=True, return_value=True) as stop,
+        mock.patch.object(guard, "stop_gluetun", autospec=True) as stop_gluetun,
+        mock.patch.object(guard, "start_services", autospec=True) as start,
     ):
         # First verdict: services stop at once, no lockout yet.
         orch.watch_once()
@@ -1614,20 +1717,21 @@ def test_single_leak_verdict_followed_by_safe_resumes_then_second_locks_out(
 
     guard, orch = _leak_orchestrator(tmp_path)
     with (
-        mock.patch.object(guard, "gluetun_healthy", return_value=True),
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
         mock.patch.object(
             guard,
             "public_ip_assessment",
+            autospec=True,
             side_effect=[
                 PublicIPAssessment.UNSAFE_DEFINITIVE,
                 PublicIPAssessment.SAFE,
                 PublicIPAssessment.UNSAFE_DEFINITIVE,
             ],
         ),
-        mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
-        mock.patch.object(guard, "stop_gluetun") as stop_gluetun,
-        mock.patch.object(guard, "container_running", return_value=False),
-        mock.patch.object(guard, "start_services") as start,
+        mock.patch.object(guard, "stop_active_services", autospec=True, return_value=True) as stop,
+        mock.patch.object(guard, "stop_gluetun", autospec=True) as stop_gluetun,
+        mock.patch.object(guard, "container_running", autospec=True, return_value=False),
+        mock.patch.object(guard, "start_services", autospec=True) as start,
     ):
         orch.watch_once()
         orch.watch_once()
@@ -1652,12 +1756,14 @@ def test_auto_start_limit_trips_service_flapping(tmp_path: Path) -> None:
     clock = {"now": 10_000.0}
     with (
         mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
-        mock.patch.object(guard, "gluetun_healthy", return_value=True),
-        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
-        mock.patch.object(guard, "container_running", return_value=False),
-        mock.patch.object(guard, "start_services") as start,
-        mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
-        mock.patch.object(guard, "stop_gluetun"),
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
+        mock.patch.object(
+            guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+        ),
+        mock.patch.object(guard, "container_running", autospec=True, return_value=False),
+        mock.patch.object(guard, "start_services", autospec=True) as start,
+        mock.patch.object(guard, "stop_active_services", autospec=True, return_value=True) as stop,
+        mock.patch.object(guard, "stop_gluetun", autospec=True),
     ):
         for _ in range(3):
             clock["now"] += 60
@@ -1679,10 +1785,12 @@ def test_auto_starts_older_than_an_hour_do_not_count(tmp_path: Path) -> None:
     clock = {"now": 10_000.0}
     with (
         mock.patch.object(orchestrator_mod.time, "monotonic", side_effect=lambda: clock["now"]),
-        mock.patch.object(guard, "gluetun_healthy", return_value=True),
-        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
-        mock.patch.object(guard, "container_running", return_value=False),
-        mock.patch.object(guard, "start_services") as start,
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
+        mock.patch.object(
+            guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+        ),
+        mock.patch.object(guard, "container_running", autospec=True, return_value=False),
+        mock.patch.object(guard, "start_services", autospec=True) as start,
     ):
         for _ in range(6):
             clock["now"] += 1801  # two per hour at most
@@ -1694,10 +1802,12 @@ def test_auto_starts_older_than_an_hour_do_not_count(tmp_path: Path) -> None:
 def test_auto_start_limit_zero_disables_it(tmp_path: Path) -> None:
     guard, orch = _leak_orchestrator(tmp_path, max_auto_starts_per_hour=0)
     with (
-        mock.patch.object(guard, "gluetun_healthy", return_value=True),
-        mock.patch.object(guard, "public_ip_assessment", return_value=PublicIPAssessment.SAFE),
-        mock.patch.object(guard, "container_running", return_value=False),
-        mock.patch.object(guard, "start_services") as start,
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
+        mock.patch.object(
+            guard, "public_ip_assessment", autospec=True, return_value=PublicIPAssessment.SAFE
+        ),
+        mock.patch.object(guard, "container_running", autospec=True, return_value=False),
+        mock.patch.object(guard, "start_services", autospec=True) as start,
     ):
         for _ in range(25):
             orch.watch_once()
@@ -1802,9 +1912,14 @@ def test_breaker_stops_everything_and_exits_78_when_alerting_raises(tmp_path: Pa
     with (
         mock.patch.object(orchestrator_mod, "send_alert", side_effect=exploding_alert) as send,
         mock.patch.object(
-            guard, "stop_active_services", side_effect=lambda **_: order.append("stop_services")
+            guard,
+            "stop_active_services",
+            autospec=True,
+            side_effect=lambda **_: order.append("stop_services"),
         ),
-        mock.patch.object(guard, "stop_gluetun", side_effect=lambda: order.append("stop_gluetun")),
+        mock.patch.object(
+            guard, "stop_gluetun", autospec=True, side_effect=lambda: order.append("stop_gluetun")
+        ),
         pytest.raises(typer.Exit) as excinfo,
     ):
         orch._trip_circuit_breaker("egress_leak", evidence="probe saw the home IP")
@@ -1845,15 +1960,18 @@ def test_deferred_tick_still_stops_services_on_a_definitive_leak(tmp_path: Path)
     fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         with (
-            mock.patch.object(guard, "gluetun_healthy", return_value=True),
+            mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=True),
             mock.patch.object(
                 guard,
                 "public_ip_assessment",
+                autospec=True,
                 side_effect=[PublicIPAssessment.SAFE, PublicIPAssessment.UNSAFE_DEFINITIVE],
             ),
-            mock.patch.object(guard, "stop_active_services", return_value=True) as stop,
-            mock.patch.object(guard, "start_services") as start,
-            mock.patch.object(guard, "restart_gluetun") as restart,
+            mock.patch.object(
+                guard, "stop_active_services", autospec=True, return_value=True
+            ) as stop,
+            mock.patch.object(guard, "start_services", autospec=True) as start,
+            mock.patch.object(guard, "restart_gluetun", autospec=True) as restart,
             mock.patch.object(orch, "watch_once") as watch_once,
             mock.patch.object(orchestrator_mod, "notify"),
         ):
@@ -1878,7 +1996,7 @@ def test_restart_moves_the_auth_scan_cursor_past_the_restart(tmp_path: Path) -> 
     guard, orch = _leak_orchestrator(tmp_path)
     orch.last_auth_check_mono = 1000.0
     with (
-        mock.patch.object(guard, "restart_gluetun", return_value=True),
+        mock.patch.object(guard, "restart_gluetun", autospec=True, return_value=True),
         mock.patch.object(orchestrator_mod.time, "monotonic", return_value=1042.0),
     ):
         orch._restart_gluetun(relaxed=False)
@@ -1899,9 +2017,9 @@ def test_auth_scan_survives_a_backward_clock_step(tmp_path: Path) -> None:
 
     # Wall clock stepped back an hour since that scan; monotonic moved 10 s.
     with (
-        mock.patch.object(guard, "gluetun_healthy", return_value=False),
-        mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
-        mock.patch.object(guard, "gluetun_auth_evidence", side_effect=evidence),
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+        mock.patch.object(guard, "services_confirmed_stopped", autospec=True, return_value=True),
+        mock.patch.object(guard, "gluetun_auth_evidence", autospec=True, side_effect=evidence),
         mock.patch.object(orchestrator_mod.time, "monotonic", return_value=600.0),
         mock.patch.object(orchestrator_mod.time, "time", return_value=1_700_000_000.0),
         mock.patch.object(orch, "_restart_gluetun", return_value=False),
@@ -1919,14 +2037,15 @@ def test_failed_restart_does_not_increment_generation_or_trip_false_auth_lockout
     orch.outage_start_wall = 900.0
     orch.restart_generation = 0
     with (
-        mock.patch.object(guard, "gluetun_healthy", return_value=False),
-        mock.patch.object(guard, "services_confirmed_stopped", return_value=True),
+        mock.patch.object(guard, "gluetun_healthy", autospec=True, return_value=False),
+        mock.patch.object(guard, "services_confirmed_stopped", autospec=True, return_value=True),
         mock.patch.object(
             guard,
             "gluetun_auth_evidence",
+            autospec=True,
             return_value="AUTH error from server A",
         ),
-        mock.patch.object(guard, "restart_gluetun", return_value=False),
+        mock.patch.object(guard, "restart_gluetun", autospec=True, return_value=False),
         mock.patch.object(orchestrator_mod.time, "monotonic", return_value=920.0),
         mock.patch.object(orchestrator_mod.time, "time", return_value=920.0),
     ):

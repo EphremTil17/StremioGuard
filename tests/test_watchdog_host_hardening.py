@@ -353,8 +353,10 @@ def test_ac2_public_ip_assessment_skips_non_public_answers_across_paths(tmp_path
             guard = GluetunGuard(cfg, _ProbeRunner({}))
             warnings: list[str] = []
             with (
-                mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-                mock.patch.object(guard, "warn", side_effect=warnings.append),
+                mock.patch.object(
+                    guard, "namespace_dns_block_active", autospec=True, return_value=True
+                ),
+                mock.patch.object(guard, "warn", autospec=True, side_effect=warnings.append),
             ):
                 verdict = guard.public_ip_assessment(force_probe=True)
             return verdict, guard, warnings
@@ -431,10 +433,12 @@ def test_ac3_non_public_home_baseline_rejected(
     cfg.home_ip_file.write_text(baseline_content, encoding="utf-8")
     guard = GluetunGuard(cfg, FakeRunner({}))
     with (
-        mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-        mock.patch.object(guard, "public_ip_via_control_server", return_value=None),
-        mock.patch.object(guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS),
-        mock.patch.object(guard, "public_ip", return_value=None),
+        mock.patch.object(guard, "namespace_dns_block_active", autospec=True, return_value=True),
+        mock.patch.object(guard, "public_ip_via_control_server", autospec=True, return_value=None),
+        mock.patch.object(
+            guard, "public_ip_via_gluetun", autospec=True, return_value=PUBLIC_IPV4_EGRESS
+        ),
+        mock.patch.object(guard, "public_ip", autospec=True, return_value=None),
     ):
         assert guard.public_ip_assessment(force_probe=True) == expected
 
@@ -549,10 +553,16 @@ def test_ac5_public_ip_assessment_and_status_handle_unusable_baselines(tmp_path:
             guard = GluetunGuard(cfg, FakeRunner({}))
             t0 = time.monotonic()
             with (
-                mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-                mock.patch.object(guard, "public_ip_via_control_server", return_value=None),
-                mock.patch.object(guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS),
-                mock.patch.object(guard, "public_ip", return_value=None),
+                mock.patch.object(
+                    guard, "namespace_dns_block_active", autospec=True, return_value=True
+                ),
+                mock.patch.object(
+                    guard, "public_ip_via_control_server", autospec=True, return_value=None
+                ),
+                mock.patch.object(
+                    guard, "public_ip_via_gluetun", autospec=True, return_value=PUBLIC_IPV4_EGRESS
+                ),
+                mock.patch.object(guard, "public_ip", autospec=True, return_value=None),
             ):
                 verdict = _run_bounded(
                     lambda g=guard: g.public_ip_assessment(force_probe=True),
@@ -627,7 +637,7 @@ def test_ac6_record_home_ip_replaces_fifo_and_symlink_but_refuses_directory(
     sentinel_bytes = b"SENTINEL_UNTOUCHED\n"
     sentinel.write_bytes(sentinel_bytes)
 
-    with mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST):
+    with mock.patch.object(guard, "public_ip", autospec=True, return_value=PUBLIC_IPV4_HOST):
         # FIFO at home_ip_file
         os.mkfifo(cfg.home_ip_file)
         t0 = time.monotonic()
@@ -955,7 +965,7 @@ def test_ac9_wiring_guard_restarts_and_run_context_env(
     cache_path = tmp_path / ".stremio" / "nordvpn-endpoint-cache.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     prefix = compose_args_prefix(tmp_path)
-    restart_cmd = [*prefix, "restart", "gluetun"]
+    restart_cmd = [*prefix, "restart", "--no-deps", "gluetun"]
     up_cmd = [*prefix, "up", "-d", "--no-deps", "--force-recreate", "gluetun"]
 
     with mock.patch.object(

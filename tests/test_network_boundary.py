@@ -188,12 +188,14 @@ def test_ac6_dns_block_matrix_and_warning_rate_limit(
         guard._last_egress_probe_time = 1e12
         warnings: list[str] = []
         with (
-            mock.patch.object(guard, "public_ip_via_control_server", return_value=None),
             mock.patch.object(
-                guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS
+                guard, "public_ip_via_control_server", autospec=True, return_value=None
+            ),
+            mock.patch.object(
+                guard, "public_ip_via_gluetun", autospec=True, return_value=PUBLIC_IPV4_EGRESS
             ) as ep,
-            mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST),
-            mock.patch.object(guard, "warn", side_effect=warnings.append),
+            mock.patch.object(guard, "public_ip", autospec=True, return_value=PUBLIC_IPV4_HOST),
+            mock.patch.object(guard, "warn", autospec=True, side_effect=warnings.append),
         ):
             verdict = guard.public_ip_assessment(force_probe=True)
         return verdict, warnings, ep.call_count, guard
@@ -301,9 +303,11 @@ def test_ac6_dns_block_matrix_and_warning_rate_limit(
     # 100 calls with (b) -> warning appears once
     loop_warnings: list[str] = []
     with (
-        mock.patch.object(guard_b, "public_ip_via_control_server", return_value=None),
-        mock.patch.object(guard_b, "public_ip_via_gluetun") as loop_ep,
-        mock.patch.object(guard_b, "warn", side_effect=loop_warnings.append),
+        mock.patch.object(
+            guard_b, "public_ip_via_control_server", autospec=True, return_value=None
+        ),
+        mock.patch.object(guard_b, "public_ip_via_gluetun", autospec=True) as loop_ep,
+        mock.patch.object(guard_b, "warn", autospec=True, side_effect=loop_warnings.append),
         mock.patch.object(guard_mod.time, "monotonic", return_value=1000.0),
     ):
         guard_b._dns_block_warned_at = None
@@ -328,10 +332,16 @@ def test_ac7_dns_block_identity_caching_orchestrator_and_preflight(tmp_path: Pat
     guard.last_gluetun_state = GluetunState("cid-1", "healthy", "2026-11-16T00:00:00Z")
     with (
         mock.patch.object(guard_mod.time, "monotonic", side_effect=lambda: clock["now"]),
-        mock.patch.object(guard, "namespace_dns_block_active", return_value=True) as dns_check,
-        mock.patch.object(guard, "public_ip_via_control_server", return_value=PUBLIC_IPV4_EGRESS),
-        mock.patch.object(guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS),
-        mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST),
+        mock.patch.object(
+            guard, "namespace_dns_block_active", autospec=True, return_value=True
+        ) as dns_check,
+        mock.patch.object(
+            guard, "public_ip_via_control_server", autospec=True, return_value=PUBLIC_IPV4_EGRESS
+        ),
+        mock.patch.object(
+            guard, "public_ip_via_gluetun", autospec=True, return_value=PUBLIC_IPV4_EGRESS
+        ),
+        mock.patch.object(guard, "public_ip", autospec=True, return_value=PUBLIC_IPV4_HOST),
     ):
         for _ in range(10):
             assert guard.public_ip_assessment() == PublicIPAssessment.SAFE
@@ -507,12 +517,14 @@ def test_unknown_gluetun_identity_never_reuses_a_cached_safe_verdict(
     guard.last_gluetun_state = state
     with (
         mock.patch.object(guard_mod.time, "monotonic", side_effect=lambda: clock["now"]),
-        mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
-        mock.patch.object(guard, "public_ip_via_control_server", return_value=PUBLIC_IPV4_EGRESS),
+        mock.patch.object(guard, "namespace_dns_block_active", autospec=True, return_value=True),
         mock.patch.object(
-            guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS
+            guard, "public_ip_via_control_server", autospec=True, return_value=PUBLIC_IPV4_EGRESS
+        ),
+        mock.patch.object(
+            guard, "public_ip_via_gluetun", autospec=True, return_value=PUBLIC_IPV4_EGRESS
         ) as egress_probe,
-        mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST),
+        mock.patch.object(guard, "public_ip", autospec=True, return_value=PUBLIC_IPV4_HOST),
     ):
         for _ in range(3):
             assert guard.public_ip_assessment() == PublicIPAssessment.SAFE
