@@ -98,7 +98,7 @@ AUTH_REJECTION_MARKERS = (
     "incorrect key size",
 )
 EVIDENCE_LINE_LIMIT = 300
-DNS_BLOCK_RULE = "-A OUTPUT -d 127.0.0.11/32 -j REJECT --reject-with icmp-port-unreachable"
+DNS_BLOCK_RULE = "-A OUTPUT -d 127.0.0.11/32 -j DROP"
 
 
 # `docker compose ps --status` values. Start and health checks want running
@@ -873,7 +873,7 @@ class GluetunGuard:
                         self.warn(
                             "Gluetun's OUTPUT chain does not start with the Docker DNS block "
                             f"({DNS_BLOCK_RULE}). Ensure docker-compose.yml mounts "
-                            "gluetun-post-rules-v1 at /iptables/post-rules.txt and restart gluetun."
+                            "gluetun-post-rules-v2 at /iptables/post-rules.txt and restart gluetun."
                         )
                     else:
                         self.warn(
@@ -1382,6 +1382,13 @@ class GluetunGuard:
         return False
 
     def stop_gluetun(self) -> None:
+        """Stop gluetun and report success only once Docker confirms it stopped.
+
+        The proof is `services_confirmed_stopped`, as for the protected
+        services: gluetun is the one service with a restart policy, so a
+        crash-looping ("restarting") or paused gluetun is still active, and an
+        unanswered query is not proof of anything.
+        """
         self.log("Stopping gluetun VPN container.")
         compose_ok = False
         try:
@@ -1391,9 +1398,9 @@ class GluetunGuard:
             self.warn(
                 f"`docker compose stop gluetun` failed ({error}); falling back to `docker stop`."
             )
-        if self.container_running(["gluetun"]) is not False or not compose_ok:
+        if not compose_ok or not self.services_confirmed_stopped(["gluetun"]):
             self._docker_stop_service("gluetun")
-            if self.container_running(["gluetun"]) is not False:
+            if not self.services_confirmed_stopped(["gluetun"]):
                 self.warn(
                     "FATAL: Gluetun VPN container could not be stopped. "
                     "Container may still be running in the background."

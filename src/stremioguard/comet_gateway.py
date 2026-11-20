@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from loguru import logger
-
 from stremioguard.config import (
     COMET_GATEWAY_CONTAINER_PORT,
     COMET_GATEWAY_HEALTH_PORT,
@@ -787,22 +785,6 @@ http {{
 
     def service_container_id(self) -> str | None:
         return service_container_id(self.runner, self.config.root_dir, self.config.service_name)
-
-    def status(self) -> None:
-        container_id = self.service_container_id()
-        result = (
-            self.runner.run(
-                ["docker", "inspect", "--format", "{{.State.Status}}", container_id or ""],
-                check=False,
-            )
-            if container_id
-            else None
-        )
-        state = (result.stdout or "").strip() if result and result.returncode == 0 else "not found"
-        logger.info(f"Comet gateway container: {state}")
-        logger.info(f"Active tokens: {len(self.load_tokens())}")
-        logger.info(f"Default token: {self.default_token_id() or '-'}")
-        logger.info(f"Public base URL: {self.public_base_url()}")
 
     def reload_nginx(self) -> None:
         """Apply the config and token map to the running gateway and prove they landed.

@@ -19,4 +19,5 @@
 | [comet-gateway.md](comet-gateway.md) | the gateway's URL model, route allowlist, reverse-proxy setup, Cloudflare Access owner portal, rate limits, log canary |
 | [comet-patches.md](comet-patches.md) | all 16 declarative Comet patches, requirements, canary validation contract, heuristics and tradeoffs |
 | [lab.md](lab.md) | testing the gateway and patches against real containers (`scripts/lab.py`) |
+| [test-quality.md](test-quality.md) | whether the tests would catch a bug: mutation testing, fix-site coverage, test overlap |
 | [changelogs/](changelogs/README.md) | what changed in each release |

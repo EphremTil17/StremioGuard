@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -389,6 +390,70 @@ class TestGatewayReload:
         ):
             manager.reload_nginx()
         assert not any(call[-2:] == ["-s", "reload"] for call in runner.calls)
+
+    def _nginx(self) -> tuple[str, ...]:
+        return (
+            "docker",
+            "exec",
+            "cid",
+            "nginx",
+            "-c",
+            f"{gateway_mod.GATEWAY_CONFIG_DIR}/nginx.conf",
+        )
+
+    def test_reload_stops_when_nginx_rejects_the_config(self, tmp_path: Path) -> None:
+        # `nginx -t` failing must abort before any reload: the CLI then says the
+        # token change is NOT active instead of reporting it applied.
+        manager, runner = self._manager(tmp_path)
+        runner.responses[(*self._nginx(), "-t")] = completed(
+            [], returncode=1, stderr="nginx: [emerg] unexpected end of file"
+        )
+        with (
+            mock.patch.object(manager, "service_container_id", return_value="cid"),
+            pytest.raises(subprocess.CalledProcessError),
+        ):
+            manager.reload_nginx()
+        assert not any("sha256sum" in call for call in runner.calls)
+        assert not any(call[-2:] == ["-s", "reload"] for call in runner.calls)
+
+    def test_reload_failure_is_raised_not_reported_as_applied(self, tmp_path: Path) -> None:
+        # nginx keeps serving the old token map when `-s reload` fails, so a
+        # revoked token would still be admitted: the failure must surface.
+        manager, runner = self._manager(tmp_path)
+        runner.responses[(*self._nginx(), "-s", "reload")] = completed(
+            [], returncode=1, stderr="nginx: [error] invalid PID number"
+        )
+        with (
+            mock.patch.object(manager, "service_container_id", return_value="cid"),
+            pytest.raises(subprocess.CalledProcessError),
+        ):
+            manager.reload_nginx()
+        assert runner.calls[-1][-2:] == ["-s", "reload"]
+
+    def test_reload_bounds_every_docker_call(self, tmp_path: Path) -> None:
+        manager, runner = self._manager(tmp_path)
+        with mock.patch.object(manager, "service_container_id", return_value="cid"):
+            manager.reload_nginx()
+        assert len(runner.timeouts) == 4  # nginx -t, two sha256sum, nginx -s reload
+        assert set(runner.timeouts) == {gateway_mod.DOCKER_QUERY_TIMEOUT_SECONDS}
+
+    @pytest.mark.parametrize("inspect_stdout", ["true\n", "false\n"])
+    def test_container_running_bounds_both_docker_queries(
+        self, tmp_path: Path, inspect_stdout: str
+    ) -> None:
+        config = make_comet_gateway_config(tmp_path)
+        ps_q = tuple(gateway_mod.compose_command(config.root_dir, "ps", "-q", config.service_name))
+        inspect = ("docker", "inspect", "--format", "{{.State.Running}}", "cid")
+        runner = FakeRunner(
+            {
+                ps_q: completed(list(ps_q), "cid\n"),
+                inspect: completed(list(inspect), inspect_stdout),
+            }
+        )
+        manager = CometGatewayManager(config, runner)
+        assert manager.container_running() is (inspect_stdout == "true\n")
+        assert runner.calls == [list(ps_q), list(inspect)]
+        assert set(runner.timeouts) == {gateway_mod.DOCKER_QUERY_TIMEOUT_SECONDS}
 
     def test_reload_refuses_when_container_not_running(self, tmp_path: Path) -> None:
         manager, runner = self._manager(tmp_path)

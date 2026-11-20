@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -379,25 +381,30 @@ def _generate_vpn_certs(cfg_dir: Path) -> None:
 
 
 def _repo_gluetun_compose_fragment() -> tuple[dict[str, object], dict[str, dict[str, str]]]:
-    res = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-p",
-            f"{PREFIX}config",
-            "-f",
-            str(REPO_ROOT / "docker-compose.yml"),
-            "config",
-            "--format",
-            "json",
-            "--no-env-resolution",
-            "gluetun",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    with tempfile.TemporaryDirectory(prefix="sg-compose-frag-") as tmp:
+        tmp_dir = Path(tmp)
+        shutil.copy2(REPO_ROOT / "docker-compose.yml", tmp_dir / "docker-compose.yml")
+        (tmp_dir / ".stremio").mkdir()
+        (tmp_dir / ".stremio" / "gluetun.env").write_text("", encoding="utf-8")
+        res = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-p",
+                f"{PREFIX}config",
+                "-f",
+                str(tmp_dir / "docker-compose.yml"),
+                "config",
+                "--format",
+                "json",
+                "--no-env-resolution",
+                "gluetun",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
     data = json.loads(res.stdout)
     gluetun = data["services"]["gluetun"]
     configs = data.get("configs", {})
@@ -722,7 +729,7 @@ def test_ac1_real_gluetun_dns_block_survives_reconnect_and_restart(tmp_path: Pat
                     proto = "TCP" if proto_tcp else "UDP"
                     timings.append(f"{phase} (a) 127.0.0.11:53 {proto}: {elapsed:.3f}s ({out})")
                     assert rc != 0 and "ANSWERED" not in out, out
-                    assert "PermissionError" in out or "ConnectionRefusedError" in out, out
+                    assert "PermissionError" in out or "TimeoutError" in out, out
                     assert elapsed < 5.0
 
                 # (b) UDP and TCP straight to resolver DNAT ports
@@ -743,7 +750,7 @@ def test_ac1_real_gluetun_dns_block_survives_reconnect_and_restart(tmp_path: Pat
                             f"{phase} (b) 127.0.0.11:{dport} {proto}: {elapsed:.3f}s ({out})"
                         )
                         assert rc != 0 and "ANSWERED" not in out, out
-                        assert "PermissionError" in out or "ConnectionRefusedError" in out, out
+                        assert "PermissionError" in out or "TimeoutError" in out, out
 
                 # (c) vpn_name through 127.0.0.1 returns no address
                 rc_c, out_c, elapsed_c = _run_dig_probe(
@@ -796,6 +803,10 @@ def test_ac1_real_gluetun_dns_block_survives_reconnect_and_restart(tmp_path: Pat
                 )
             _docker("start", sb["tls_name"])
             _wait_gluetun_ready(gt_id, min_dns_ready_count=before_dns_ready, timeout_seconds=60.0)
+            after_logs = _docker("logs", gt_id, check=False)
+            combined_after = f"{after_logs.stdout}\n{after_logs.stderr}"
+            assert "cannot remove outdated VPN" not in combined_after, combined_after
+            assert "chain rule is malformed" not in combined_after, combined_after
             assert_blocked_phase("after-vpn-restart")
 
             # (f) docker restart of gluetun container

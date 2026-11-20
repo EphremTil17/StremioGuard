@@ -135,7 +135,8 @@ uv run pytest && uv run ruff check && uv run ruff format --check && uv run pyrig
 The default suite needs neither Docker nor systemd. The opt-in suites run real containers
 (`STREMIOGUARD_DOCKER_TESTS=1`, `tests/*_docker.py` and the integration tests) and real systemd
 units (`STREMIOGUARD_SYSTEMD_TESTS=1`), always under throwaway names. [The lab](docs/lab.md)
-tests the gateway and the patches against real containers.
+tests the gateway and the patches against real containers. [Test quality](docs/test-quality.md)
+measures whether the tests would catch a bug: mutation testing, fix-site coverage and overlap.
 
 ## License
 

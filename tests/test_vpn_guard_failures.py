@@ -32,6 +32,7 @@ from stremioguard.guard import GluetunGuard, LockoutActiveError, PublicIPAssessm
 from stremioguard.orchestrator import Orchestrator
 from tests.conftest import (
     ACTIVE_STATUS_ARGS,
+    PUBLIC_IPV4_ALT,
     PUBLIC_IPV4_EGRESS,
     PUBLIC_IPV4_HOST,
     PUBLIC_IPV6_EGRESS,
@@ -1852,3 +1853,41 @@ def test_ac21_control_server_probe_faults_do_not_escape_assessment(
             guard_real.public_ip_assessment(force_probe=True)
             == PublicIPAssessment.UNSAFE_DEFINITIVE
         )
+
+
+@pytest.mark.parametrize(
+    ("expected_vpn_ip", "egress", "verdict"),
+    [
+        # A different tunnel exit than the one pinned is a definitive failure.
+        (PUBLIC_IPV4_ALT, PUBLIC_IPV4_EGRESS, PublicIPAssessment.UNSAFE_DEFINITIVE),
+        (PUBLIC_IPV4_EGRESS, PUBLIC_IPV4_EGRESS, PublicIPAssessment.SAFE),
+        # The pin is compared in canonical form, so another spelling of the
+        # same address is not a mismatch.
+        (PUBLIC_IPV6_EGRESS.upper(), PUBLIC_IPV6_EGRESS, PublicIPAssessment.SAFE),
+        (
+            "2001:4860:4860:0:0:0:0:8888",
+            PUBLIC_IPV6_EGRESS,
+            PublicIPAssessment.SAFE,
+        ),
+        # A pin that is not a public address can never match: fail closed.
+        ("10.0.0.1", PUBLIC_IPV4_EGRESS, PublicIPAssessment.UNSAFE_DEFINITIVE),
+    ],
+    ids=["mismatch", "match", "ipv6-uppercase", "ipv6-uncompressed", "non-public-pin"],
+)
+def test_expected_vpn_ip_pins_the_tunnel_exit(
+    tmp_path: Path, expected_vpn_ip: str, egress: str, verdict: PublicIPAssessment
+) -> None:
+    cfg = make_config(tmp_path, expected_vpn_ip=expected_vpn_ip)
+    guard = GluetunGuard(cfg, FakeRunner({}))
+    host = PUBLIC_IPV6_HOST if ":" in egress else PUBLIC_IPV4_HOST
+    warnings: list[str] = []
+    with (
+        mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
+        mock.patch.object(guard, "public_ip_via_control_server", return_value=None),
+        mock.patch.object(guard, "public_ip_via_gluetun", return_value=egress),
+        mock.patch.object(guard, "public_ip", return_value=host),
+        mock.patch.object(guard, "warn", side_effect=warnings.append),
+    ):
+        assert guard.public_ip_assessment(force_probe=True) == verdict
+    mismatch = [w for w in warnings if "EXPECTED_VPN_IP" in w]
+    assert bool(mismatch) == (verdict == PublicIPAssessment.UNSAFE_DEFINITIVE)

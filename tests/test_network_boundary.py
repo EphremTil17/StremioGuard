@@ -31,9 +31,9 @@ from tests.conftest import (
 
 PREFIX = "sgfix8-"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_POST_RULES = "iptables -I OUTPUT -d 127.0.0.11/32 -j REJECT\n"
+EXPECTED_POST_RULES = "iptables -I OUTPUT -d 127.0.0.11/32 -j DROP\n"
 PINNED_CONFIG_SHA256 = {
-    "gluetun-post-rules-v1": "5af4fc1b96b3f2342d4e9b4a02af5d8080539171e9ae58696fd1114199414d78",
+    "gluetun-post-rules-v2": "c501fbbb465742056a341e5ec3dc7e7b0ce1e8b79d71ca4bd5a9388645943a47",
     "comet-postgres-hba-v1": "172afd075c77dedf26b58490ad5fa77c1269c6cfa5c5abde731495b686a9fe50",
 }
 
@@ -122,15 +122,18 @@ def test_ac8_compose_configs_pin_sha256_and_match_dns_block_rule() -> None:
             "recreate a container when only the config content changes."
         )
 
-    post_rules = configs["gluetun-post-rules-v1"]
+    post_rules = configs["gluetun-post-rules-v2"]
     assert isinstance(post_rules, dict)
     assert post_rules["content"] == EXPECTED_POST_RULES
     line = post_rules["content"].strip()
     assert line.startswith("iptables -I OUTPUT ")
     assert " -d 127.0.0.11/32 " in line
-    assert line.endswith(" -j REJECT")
+    assert line.endswith(" -j DROP")
+    # REJECT emits `reject-with icmp-port-unreachable`, which breaks gluetun's
+    # Go iptables chain parser when removing outdated VPN rules on reconnect.
+    assert " -j REJECT" not in line
     assert " -d 127.0.0.11/32 " in DNS_BLOCK_RULE
-    assert " -j REJECT" in DNS_BLOCK_RULE
+    assert " -j DROP" in DNS_BLOCK_RULE
 
 
 def test_ac6_dns_block_matrix_and_warning_rate_limit(
@@ -214,7 +217,7 @@ def test_ac6_dns_block_matrix_and_warning_rate_limit(
     assert probes_b == 0
     assert guard_b._verified_egress_ip is None
     assert len(warnings_b) == 1
-    assert "gluetun-post-rules-v1" in warnings_b[0]
+    assert "gluetun-post-rules-v2" in warnings_b[0]
     assert "/iptables/post-rules.txt" in warnings_b[0]
 
     # (c) rule after -A OUTPUT -o lo -j ACCEPT -> UNKNOWN
@@ -228,9 +231,13 @@ def test_ac6_dns_block_matrix_and_warning_rate_limit(
     assert probes_c == 0
     assert guard_c._verified_egress_ip is None
 
-    # (d) -j DROP instead -> UNKNOWN
+    # (d) legacy -j REJECT instead -> UNKNOWN (breaks gluetun's iptables parser on reconnect)
     verdict_d, _, probes_d, guard_d = run_case(
-        completed(list(iptables_cmd), "-P OUTPUT DROP\n-A OUTPUT -d 127.0.0.11/32 -j DROP\n")
+        completed(
+            list(iptables_cmd),
+            "-P OUTPUT DROP\n"
+            "-A OUTPUT -d 127.0.0.11/32 -j REJECT --reject-with icmp-port-unreachable\n",
+        )
     )
     assert verdict_d == PublicIPAssessment.UNKNOWN
     assert probes_d == 0
@@ -478,3 +485,43 @@ def test_ac18_compose_config_postgres_hba_and_listen_addresses() -> None:
         and m.get("target") == "/etc/postgresql/pg_hba.conf"
         for m in mounts
     ), mounts
+
+
+@pytest.mark.parametrize(
+    "state",
+    [None, GluetunState(None, None, None), GluetunState("cid-1", "healthy", None)],
+    ids=["no-observation", "no-container", "no-start-time"],
+)
+def test_unknown_gluetun_identity_never_reuses_a_cached_safe_verdict(
+    tmp_path: Path, state: GluetunState | None
+) -> None:
+    """A SAFE probed while gluetun's identity was unknown proves nothing for the next tick.
+
+    The cached verdict is tied to the gluetun container it was probed in
+    (F-5). With no identity there is nothing to tie it to, so every call
+    probes the tunnel again instead of trusting an identity-less cache.
+    """
+    cfg = make_config(tmp_path, egress_probe_interval_seconds=300)
+    clock = {"now": 1000.0}
+    guard = GluetunGuard(cfg, FakeRunner({}))
+    guard.last_gluetun_state = state
+    with (
+        mock.patch.object(guard_mod.time, "monotonic", side_effect=lambda: clock["now"]),
+        mock.patch.object(guard, "namespace_dns_block_active", return_value=True),
+        mock.patch.object(guard, "public_ip_via_control_server", return_value=PUBLIC_IPV4_EGRESS),
+        mock.patch.object(
+            guard, "public_ip_via_gluetun", return_value=PUBLIC_IPV4_EGRESS
+        ) as egress_probe,
+        mock.patch.object(guard, "public_ip", return_value=PUBLIC_IPV4_HOST),
+    ):
+        for _ in range(3):
+            assert guard.public_ip_assessment() == PublicIPAssessment.SAFE
+            clock["now"] += 1.0  # well inside the 300 s cache window
+        assert egress_probe.call_count == 3
+
+        # Once the identity is known, the next SAFE is cached for that container.
+        guard.last_gluetun_state = GluetunState("cid-1", "healthy", "2026-11-16T00:00:00Z")
+        for _ in range(3):
+            assert guard.public_ip_assessment() == PublicIPAssessment.SAFE
+            clock["now"] += 1.0
+        assert egress_probe.call_count == 4

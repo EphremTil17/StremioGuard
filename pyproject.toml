@@ -16,6 +16,7 @@ packages = ["src/stremioguard"]
 
 [dependency-groups]
 dev = [
+    "mutmut>=3.8.1",
     "pyright>=1.1.414",
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",
@@ -38,3 +39,12 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mutmut]
+# Mutation testing; scripts/mutation_report.py summarises a run.
+# Mutate one security domain at a time by editing only_mutate.
+source_paths = ["src/stremioguard/"]
+only_mutate = ["src/stremioguard/guard.py", "src/stremioguard/comet_gateway.py"]
+also_copy = ["docker-compose.yml", "docker/", "docs/", "scripts/", "stremio", ".env.example", "assets/", "vendor/", "AGENTS.md", "README.md"]
+pytest_add_cli_args = ["-p", "no:cacheprovider", "-q"]
+pytest_add_cli_args_test_selection = ["tests/"]

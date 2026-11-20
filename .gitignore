@@ -38,3 +38,6 @@ certs/*.key
 # Local lessons learned ledger (must not be committed to remote)
 docs/lessons_learned_and_anti_patterns.md
 .agents/*
+
+# mutmut working copy and results (scripts/mutation_report.py)
+mutants/

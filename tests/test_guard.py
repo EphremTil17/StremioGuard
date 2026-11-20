@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import os
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1045,46 +1047,6 @@ class DaemonIdentityTests(unittest.TestCase):
             self.assertTrue(any("exit 1" in w and "daemon busy" in w for w in warnings))
             self.assertTrue(any("exit 17" in w and "pull access denied" in w for w in warnings))
 
-    def test_stop_gluetun_fallback_and_failure_handling(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            runner = FakeRunner({})
-            guard = GluetunGuard(make_config(tmp_path), runner)
-
-            # Scenario 1: Compose stop fails (e.g. nonzero return or container still running),
-            # fallback docker stop succeeds
-            running_states = [True, False]
-
-            def fake_running_succeeds(*args: object, **kwargs: object) -> bool:
-                return running_states.pop(0) if running_states else False
-
-            with (
-                mock.patch.object(guard, "service_container_id", return_value="gluetun-xyz"),
-                mock.patch.object(guard, "container_running", side_effect=fake_running_succeeds),
-                mock.patch.object(guard, "success") as mock_success,
-                mock.patch.object(guard, "warn") as mock_warn,
-            ):
-                guard.stop_gluetun()
-                self.assertIn(["docker", "stop", "-t", "5", "gluetun-xyz"], runner.calls)
-                mock_success.assert_called_once_with("Gluetun VPN container is stopped.")
-                mock_warn.assert_not_called()
-
-            # Scenario 2: Both Compose stop and fallback docker stop fail
-            # (container remains running)
-            with (
-                mock.patch.object(guard, "service_container_id", return_value="gluetun-xyz"),
-                mock.patch.object(guard, "container_running", return_value=True),
-                mock.patch.object(guard, "success") as mock_success,
-                mock.patch.object(guard, "warn") as mock_warn,
-            ):
-                guard.stop_gluetun()
-                mock_warn.assert_called_once()
-                self.assertIn(
-                    "FATAL: Gluetun VPN container could not be stopped",
-                    mock_warn.call_args[0][0],
-                )
-                mock_success.assert_not_called()
-
     def _running_query(self, tmp_path: Path, *services: str) -> tuple[str, ...]:
         return (
             *compose_args_prefix(tmp_path),
@@ -1915,3 +1877,225 @@ def test_stop_with_persistently_unreadable_state_is_not_reported_as_done(tmp_pat
         assert guard.stop_active_services(["stremio"]) is False
     assert stop in runner.calls
     assert guard.services_confirmed_stopped(["stremio"]) is False
+
+
+# stop_gluetun runs on the lockout shutdown path. Its tests used to mock
+# `container_running`, the very query whose state handling was wrong (it
+# counted only "running", so a crash-looping gluetun read as stopped); these
+# drive the real `docker compose ps --status ...` queries instead, answered
+# by a small model of Docker that filters on the container's actual state
+# the way Compose does.
+
+
+class _GluetunDocker(FakeRunner):
+    """Docker as `stop_gluetun` sees it: one gluetun container in ``state``.
+
+    ``compose_stop`` and ``docker_stop`` say what each stop command does:
+    "stops" (the container exits), "fails" (nonzero, nothing changes) or
+    "lies" (exit 0, nothing changes: a restart policy brought it back).
+    """
+
+    def __init__(
+        self, tmp_path: Path, state: str, *, compose_stop: str, docker_stop: str = "stops"
+    ) -> None:
+        super().__init__({})
+        self.state = state
+        self.compose_stop = compose_stop
+        self.docker_stop = docker_stop
+        self.ps_answers = True
+        self.prefix = compose_args_prefix(tmp_path)
+
+    def _apply(self, args: list[str], behaviour: str) -> subprocess.CompletedProcess[str]:
+        if behaviour == "stops":
+            self.state = "exited"
+        return completed(args, returncode=1 if behaviour == "fails" else 0)
+
+    def run(  # type: ignore[override]
+        self, args: list[str], *, check: bool = False, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(args)
+        self.timeouts.append(kwargs.get("timeout"))  # type: ignore[arg-type]
+        if args == [*self.prefix, "stop", "gluetun"]:
+            return self._apply(args, self.compose_stop)
+        if args == [*self.prefix, "ps", "-q", "gluetun"]:
+            return completed(args, "gluetun-cid\n")
+        if args == ["docker", "stop", "-t", "5", "gluetun-cid"]:
+            return self._apply(args, self.docker_stop)
+        if args[: len(self.prefix) + 1] == [*self.prefix, "ps"] and args[-2:] == [
+            "--services",
+            "gluetun",
+        ]:
+            if not self.ps_answers:
+                return completed(args, returncode=1, stderr="Cannot connect to the Docker daemon")
+            statuses = {args[i + 1] for i, arg in enumerate(args) if arg == "--status"}
+            return completed(args, "gluetun\n" if self.state in statuses else "")
+        raise AssertionError(f"unexpected command: {args}")
+
+
+def _stop_gluetun(guard: GluetunGuard) -> tuple[list[str], list[str]]:
+    successes: list[str] = []
+    warnings: list[str] = []
+    with (
+        mock.patch.object(guard, "success", side_effect=successes.append),
+        mock.patch.object(guard, "warn", side_effect=warnings.append),
+    ):
+        guard.stop_gluetun()
+    return successes, warnings
+
+
+@pytest.mark.parametrize("mode", [{"frozen": True}, {"teardown": True}])
+def test_stop_gluetun_confirms_a_plain_compose_stop(tmp_path: Path, mode: dict[str, bool]) -> None:
+    # The lockout shutdown runs in the watchdog (frozen) and the fail-safe
+    # (teardown); both bound every Docker call. Only an interactive CLI,
+    # which a person can interrupt, leaves `compose stop` unbounded.
+    docker = _GluetunDocker(tmp_path, "running", compose_stop="stops")
+    successes, warnings = _stop_gluetun(GluetunGuard(make_config(tmp_path), docker, **mode))
+    assert docker.state == "exited"
+    assert successes == ["Gluetun VPN container is stopped."] and warnings == []
+    assert ["docker", "stop", "-t", "5", "gluetun-cid"] not in docker.calls
+    assert None not in docker.timeouts, "every Docker call on the shutdown path is bounded"
+
+
+def test_stop_gluetun_falls_back_when_compose_reports_success_but_it_still_runs(
+    tmp_path: Path,
+) -> None:
+    # Exit 0 from `compose stop` is an attempt, not proof: the state is checked.
+    docker = _GluetunDocker(tmp_path, "running", compose_stop="lies")
+    successes, warnings = _stop_gluetun(GluetunGuard(make_config(tmp_path), docker))
+    assert ["docker", "stop", "-t", "5", "gluetun-cid"] in docker.calls
+    assert docker.state == "exited"
+    assert successes == ["Gluetun VPN container is stopped."] and warnings == []
+
+
+@pytest.mark.parametrize("state", ["running", "restarting", "paused", "removing"])
+@pytest.mark.parametrize("compose_stop", ["fails", "lies"])
+def test_stop_gluetun_never_reports_an_active_container_as_stopped(
+    tmp_path: Path, state: str, compose_stop: str
+) -> None:
+    # gluetun is the one service with `restart: unless-stopped`, so a lockout
+    # for rejected credentials typically finds it crash-looping ("restarting").
+    # The stop paths count every state that still holds a process or comes
+    # back (ACTIVE_STATES), as stop_active_services already does.
+    docker = _GluetunDocker(tmp_path, state, compose_stop=compose_stop, docker_stop="lies")
+    successes, warnings = _stop_gluetun(GluetunGuard(make_config(tmp_path), docker))
+    assert ["docker", "stop", "-t", "5", "gluetun-cid"] in docker.calls
+    assert successes == []
+    assert len(warnings) == 1 and "could not be stopped" in warnings[0]
+
+
+@pytest.mark.parametrize("state", ["restarting", "paused"])
+def test_stop_gluetun_stops_a_crash_looping_or_paused_container(tmp_path: Path, state: str) -> None:
+    docker = _GluetunDocker(tmp_path, state, compose_stop="lies", docker_stop="stops")
+    successes, warnings = _stop_gluetun(GluetunGuard(make_config(tmp_path), docker))
+    assert ["docker", "stop", "-t", "5", "gluetun-cid"] in docker.calls
+    assert docker.state == "exited"
+    assert successes == ["Gluetun VPN container is stopped."] and warnings == []
+
+
+def test_stop_gluetun_does_not_claim_success_when_docker_cannot_answer(tmp_path: Path) -> None:
+    docker = _GluetunDocker(tmp_path, "running", compose_stop="stops")
+    docker.ps_answers = False
+    successes, warnings = _stop_gluetun(GluetunGuard(make_config(tmp_path), docker))
+    assert successes == []
+    assert len(warnings) == 1 and "could not be stopped" in warnings[0]
+
+
+def _compose_file_services() -> set[str]:
+    """Top-level service names in the repository's docker-compose.yml."""
+    services: set[str] = set()
+    in_services = False
+    compose = Path(__file__).resolve().parent.parent / "docker-compose.yml"
+    for line in compose.read_text(encoding="utf-8").splitlines():
+        if line and not line[0].isspace():
+            in_services = line.rstrip() == "services:"
+            continue
+        stripped = line.rstrip()
+        top_level_key = stripped.startswith("  ") and not stripped.startswith("   ")
+        if in_services and top_level_key and stripped.endswith(":"):
+            services.add(stripped.strip()[:-1])
+    return services
+
+
+def test_stop_fallback_list_names_every_protected_compose_service(tmp_path: Path) -> None:
+    # When Compose cannot list the services and .env no longer parses, the
+    # stop path falls back to a fixed list. It must name every service that
+    # shares gluetun's namespace, or a lockout would leave one running.
+    protected = _compose_file_services() - {"gluetun", guard_mod.COMPOSE_GATE_SERVICE}
+    assert protected, "docker-compose.yml was not parsed"
+    runner = FakeRunner({})  # `config --services` and every ps query fail
+    guard = GluetunGuard(make_config(tmp_path), runner)
+    with (
+        mock.patch.object(guard, "enabled_runtime_services", side_effect=ValueError("bad .env")),
+        mock.patch.object(guard, "warn"),
+    ):
+        assert guard.stop_active_services() is False  # nothing could be confirmed
+    prefix = compose_args_prefix(tmp_path)
+    stops = [call for call in runner.calls if call[: len(prefix) + 1] == [*prefix, "stop"]]
+    assert len(stops) == 1
+    assert set(stops[0][len(prefix) + 1 :]) == protected
+
+
+# The IP probe's bounds: it reads at most 128 bytes, passes its deadline to the
+# connection, and returns on time even when the server never answers.
+
+
+class _ProbeOpener:
+    """urllib opener stand-in with real ``read(n)`` semantics, optionally hanging."""
+
+    def __init__(self, body: bytes, *, hang: threading.Event | None = None) -> None:
+        self.body = body
+        self.hang = hang
+        self.timeouts: list[float] = []
+        self.read_sizes: list[int | None] = []
+
+    def open(self, request: object, timeout: float) -> io.BytesIO:
+        self.timeouts.append(timeout)
+        if self.hang is not None:
+            self.hang.wait(10)
+        sizes = self.read_sizes
+
+        class _Response(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
+                sizes.append(size)
+                return super().read(size)
+
+        return _Response(self.body)
+
+
+def test_ip_probe_reads_at_most_128_bytes_under_its_deadline() -> None:
+    opener = _ProbeOpener(f"{PUBLIC_IPV4_HOST}\n".encode() + b"x" * 4096)
+    body = GluetunGuard._fetch_ip_url(opener, "https://ip.example.test", 2.0)  # type: ignore[arg-type]
+    assert body is not None and len(body) == 128
+    assert body.startswith(PUBLIC_IPV4_HOST)
+    assert opener.read_sizes == [128]
+    assert opener.timeouts == [2.0]
+
+
+def test_ip_probe_clamps_a_negative_deadline_to_zero() -> None:
+    opener = _ProbeOpener(b"")
+    GluetunGuard._fetch_ip_url(opener, "https://ip.example.test", -5.0)  # type: ignore[arg-type]
+    deadline = time.monotonic() + 2.0
+    while not opener.timeouts and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert opener.timeouts == [0.0]
+
+
+def test_ip_probe_returns_on_time_when_the_server_never_answers() -> None:
+    hang = threading.Event()
+    release = threading.Timer(5.0, hang.set)
+    release.start()
+    try:
+        opener = _ProbeOpener(f"{PUBLIC_IPV4_HOST}\n".encode(), hang=hang)
+        started = time.monotonic()
+        body = GluetunGuard._fetch_ip_url(opener, "https://ip.example.test", 0.2)  # type: ignore[arg-type]
+        elapsed = time.monotonic() - started
+        assert body is None
+        # deadline (0.2 s) plus the bounded join after cancelling (0.5 s)
+        assert elapsed < 1.5, f"probe blocked for {elapsed:.2f}s"
+        probes = [t for t in threading.enumerate() if t.name == "stremioguard-ip-probe"]
+        assert probes, "the hung probe thread should still be alive"
+        # A hung probe must never keep the watchdog process from exiting.
+        assert all(t.daemon for t in probes)
+    finally:
+        hang.set()
+        release.cancel()
