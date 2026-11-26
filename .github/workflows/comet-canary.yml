@@ -199,7 +199,11 @@ jobs:
   drift-issue:
     name: File a drift issue
     needs: validate
-    if: always() && needs.validate.outputs.drifted == '1' && needs.validate.outputs.failed == '1'
+    # Either the patches fail against the new image, or they pass and the test suite fails with
+    # the bumped lock. Both leave the bump unmerged, so both are reported.
+    if: >-
+      always() && needs.validate.outputs.drifted == '1'
+      && (needs.validate.outputs.failed == '1' || needs.validate.outputs.tested == 'failure')
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -212,18 +216,26 @@ jobs:
           IMAGE: ${{ needs.validate.outputs.image }}
           REMOTE_DIGEST: ${{ needs.validate.outputs.remote_digest }}
           REPORT: ${{ needs.validate.outputs.report }}
+          PATCHES_FAILED: ${{ needs.validate.outputs.failed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           printf '%s' "$REMOTE_DIGEST" | grep -Eqx 'sha256:[0-9a-f]{64}'
           SHORT_DIGEST=${REMOTE_DIGEST:7:12}
-          ISSUE_TITLE="Comet upstream drift: patches fail against $SHORT_DIGEST"
-
-          DIAGNOSTIC_DETAIL=$(printf '%s' "$REPORT" | base64 -d | jq -r '.detail // empty' 2>/dev/null || true)
-          [ -n "$DIAGNOSTIC_DETAIL" ] || DIAGNOSTIC_DETAIL="The validator crashed before producing a report; see this workflow run's log."
+          if [ "$PATCHES_FAILED" = "1" ]; then
+            ISSUE_TITLE="Comet upstream drift: patches fail against $SHORT_DIGEST"
+            SUMMARY="The daily canary failed to validate the StremioGuard patches against the newest Comet release: \`$IMAGE@$REMOTE_DIGEST\`."
+            DIAGNOSTIC_DETAIL=$(printf '%s' "$REPORT" | base64 -d | jq -r '.detail // empty' 2>/dev/null || true)
+            [ -n "$DIAGNOSTIC_DETAIL" ] || DIAGNOSTIC_DETAIL="The validator crashed before producing a report; see this workflow run's log."
+          else
+            ISSUE_TITLE="Comet upstream drift: tests fail with $SHORT_DIGEST"
+            SUMMARY="The patches validate against the newest Comet release, \`$IMAGE@$REMOTE_DIGEST\`, but the test suite fails with the lock bumped to it, so the bump was not merged."
+            DIAGNOSTIC_DETAIL="See the failing tests in the 'Run the test suite against the bumped lock' step: $RUN_URL"
+          fi
 
           {
             echo "### Comet upstream drift"
             echo
-            echo "The daily canary failed to validate the StremioGuard patches against the newest Comet release: \`$IMAGE@$REMOTE_DIGEST\`."
+            echo "$SUMMARY"
             echo
             echo "#### Diagnostic"
             echo '```'
@@ -241,5 +253,5 @@ jobs:
             gh issue create --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/issue_body.md" --label comet-canary
           fi
 
-          echo "Validation failed against candidate image: $IMAGE@$REMOTE_DIGEST"
+          echo "$ISSUE_TITLE ($IMAGE@$REMOTE_DIGEST)"
           exit 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -1572,9 +1573,10 @@ def test_ac16_vendor_retirement(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     real_lock = json.loads((repo_root / "vendor" / "comet.lock.json").read_text(encoding="utf-8"))
     assert set(real_lock.keys()) == {"image", "tested_digest"}
-    assert real_lock["tested_digest"] == (
-        "sha256:31a41fa64ed2e174fe0bae915a168a0c77ae4bca17b7efb8fa3a31d7c9f164ea"
-    )
+    assert real_lock["image"] == "g0ldyy/comet"
+    # The shape, not a particular digest: the Comet canary rewrites tested_digest on every
+    # validated upstream release and runs this suite on the result before merging it.
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", real_lock["tested_digest"])
 
     # (f) No retired identifiers in src/ outside config.py's fields/from_env
     src_root = repo_root / "src"
